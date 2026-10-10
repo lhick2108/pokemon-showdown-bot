@@ -29,7 +29,7 @@ class Capture(logging.Handler):
 logging.getLogger().addHandler(Capture())
 data = RandbatsData.load()
 rng = random.Random(0)
-stats = {"turns": 0, "samples": 0, "errors": 0, "trackers": 0, "with_moves": 0, "poke_env_moves": 0}
+stats = {"turns": 0, "samples": 0, "errors": 0, "trackers": 0, "with_moves": 0, "poke_env_moves": 0, "role_fallbacks": 0}
 
 
 class TrackedRandom(OpponentModelPlayerMixin, RandomPlayer):
@@ -40,6 +40,8 @@ class TrackedRandom(OpponentModelPlayerMixin, RandomPlayer):
             for tracker in trackers.values():
                 tracker.sample(rng)
                 stats["samples"] += 1
+                if not tracker._matching_full_sets():
+                    stats["role_fallbacks"] += 1
             for tracker in trackers.values():
                 for kind, value in tracker.provisional_observations:
                     provisional[(tracker.species, kind, to_id(value))] += 1
@@ -72,6 +74,8 @@ async def main():
     print(f"battles={p1.n_finished_battles} {stats} warnings={len(warnings)}")
     for w in sorted(set(warnings))[:15]:
         print("WARN:", w)
+    rate = stats["role_fallbacks"] / max(stats["samples"], 1)
+    print(f"role-sampler fallbacks: {stats['role_fallbacks']}/{stats['samples']} ({rate:.2%})")
     print(f"conflicting observations (species, kind, option) -> turns seen: {len(conflicts)} distinct")
     for (species, kind, option), count in conflicts.most_common(40):
         print(f"CONFLICT: {species} {kind}={option} x{count}")

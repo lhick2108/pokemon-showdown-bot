@@ -1,6 +1,7 @@
 import asyncio
 import random
 import urllib.request
+from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -154,6 +155,12 @@ def test_inconsistent_observations_keep_least_conflicting_roles_and_warn(data, c
 
 
 def test_role_sampling_uses_real_stats_and_produces_four_legal_moves(data):
+    """Exercises ``_sample_role_based`` directly: the real per-role marginal
+    fallback used when no full set matches binding evidence. ``sample()``
+    itself now prefers full joint-set sampling (589.11) whenever real full
+    data is available, which this fixture's Great Tusk has, so calling
+    ``sample()`` here would test the full-set path instead.
+    """
     tracker = SetTracker(data, "Great Tusk")
     expected = {
         role_name: role.weight
@@ -163,7 +170,7 @@ def test_role_sampling_uses_real_stats_and_produces_four_legal_moves(data):
     rng = random.Random(8128)
 
     for _ in range(5000):
-        sampled = tracker.sample(rng)
+        sampled = tracker._sample_role_based(rng)
         counts[sampled.role] += 1
         role = data.roles("Great Tusk")[sampled.role]
         move_ids = [to_id(move) for move in sampled.moves]
@@ -181,6 +188,9 @@ def test_role_sampling_uses_real_stats_and_produces_four_legal_moves(data):
 def test_move_samples_have_exact_count_with_unrevealed_and_partial_evidence(
     data, revealed_moves
 ):
+    """Exercises the ``_sample_role_based`` fallback directly; see the
+    docstring on ``test_role_sampling_uses_real_stats_and_produces_four_legal_moves``.
+    """
     tracker = SetTracker(data, "Abomasnow")
     role = data.roles("Abomasnow")["Bulky Support"]
     for move in revealed_moves:
@@ -189,7 +199,7 @@ def test_move_samples_have_exact_count_with_unrevealed_and_partial_evidence(
     mandatory = {"auroraveil", "blizzard"}
 
     for _ in range(100):
-        sampled = tracker.sample(rng)
+        sampled = tracker._sample_role_based(rng)
         sampled_ids = {to_id(move) for move in sampled.moves}
         assert len(sampled.moves) == min(4, len(role.moves))
         assert len(sampled_ids) == len(sampled.moves)
@@ -199,6 +209,9 @@ def test_move_samples_have_exact_count_with_unrevealed_and_partial_evidence(
 
 
 def test_abomasnow_move_inclusion_rates_match_stats_and_keep_mandatory_moves(data):
+    """Exercises the ``_sample_role_based`` fallback directly; see the
+    docstring on ``test_role_sampling_uses_real_stats_and_produces_four_legal_moves``.
+    """
     tracker = SetTracker(data, "Abomasnow")
     role = data.roles("Abomasnow")["Bulky Support"]
     counts = dict.fromkeys((to_id(move) for move in role.moves), 0)
@@ -206,7 +219,7 @@ def test_abomasnow_move_inclusion_rates_match_stats_and_keep_mandatory_moves(dat
     mandatory = {"auroraveil", "blizzard"}
 
     for _ in range(5000):
-        sampled = tracker.sample(rng)
+        sampled = tracker._sample_role_based(rng)
         sampled_ids = {to_id(move) for move in sampled.moves}
         assert len(sampled.moves) == 4
         assert mandatory <= sampled_ids
@@ -233,11 +246,18 @@ def test_revealed_only_sampler_mutation_breaks_the_move_count_contract(
 
     # This is the prior broken implementation expressed as a mutation. The
     # same exact-count assertion used for real samples rejects it.
+    # (Directly exercises the role-based fallback: see the docstring on
+    # test_role_sampling_uses_real_stats_and_produces_four_legal_moves.)
     with pytest.raises(AssertionError):
-        assert len(tracker.sample(random.Random(19)).moves) == min(4, len(role.moves))
+        assert len(
+            tracker._sample_role_based(random.Random(19)).moves
+        ) == min(4, len(role.moves))
 
 
 def test_nonuniform_ability_item_and_tera_sampling_matches_stats(data):
+    """Exercises the ``_sample_role_based`` fallback directly; see the
+    docstring on ``test_role_sampling_uses_real_stats_and_produces_four_legal_moves``.
+    """
     tracker = SetTracker(data, "Chandelure")
     tracker.observe_move("Calm Mind")
     role = data.roles("Chandelure")["Fast Bulky Setup"]
@@ -253,7 +273,7 @@ def test_nonuniform_ability_item_and_tera_sampling_matches_stats(data):
     rng = random.Random(50117)
 
     for _ in range(5000):
-        sampled = tracker.sample(rng)
+        sampled = tracker._sample_role_based(rng)
         assert len(sampled.moves) == min(4, len(role.moves))
         for result_field in options:
             counts[result_field][to_id(getattr(sampled, result_field))] += 1
@@ -264,6 +284,159 @@ def test_nonuniform_ability_item_and_tera_sampling_matches_stats(data):
             assert counts[result_field][to_id(option)] / 5000 == pytest.approx(
                 role.option_weight(kind, option), abs=0.03
             )
+
+
+def _full_set_identity(full_set):
+    """A hashable identity for a FullSet/SampledSet, ignoring display casing."""
+    return (
+        full_set.level,
+        to_id(full_set.item) if full_set.item else None,
+        to_id(full_set.ability),
+        frozenset(to_id(move) for move in full_set.moves),
+        to_id(full_set.tera_type),
+    )
+
+
+def test_full_set_sampling_returns_only_real_full_sets_with_binding_evidence(data):
+    """``sample()`` now draws whole sets jointly from pkmn/randbats' real
+    "full" data (589.11) instead of drawing each option independently.
+    Every sampled set must appear verbatim (as a multiset of options) in the
+    real full data for the species, and must contain all binding evidence.
+    """
+    tracker = SetTracker(data, "Great Tusk")
+    tracker.observe_move("Close Combat")
+    legal_identities = {
+        _full_set_identity(full_set)
+        for full_set in data.full_sets("Great Tusk")
+        if "closecombat" in {to_id(move) for move in full_set.moves}
+    }
+    assert legal_identities
+
+    rng = random.Random(42)
+    for _ in range(300):
+        sampled = tracker.sample(rng)
+        assert sampled.species == "Great Tusk"
+        assert "closecombat" in {to_id(move) for move in sampled.moves}
+        assert _full_set_identity(sampled) in legal_identities
+        # The full set determines a real role whenever one could have
+        # generated it (see _best_matching_role_name); it always can here.
+        assert sampled.role in data.roles("Great Tusk")
+
+
+def test_full_set_sampling_matches_real_set_frequencies_with_no_evidence(data):
+    """With no evidence, the top sets for a species must appear with their
+    real relative frequency (to within 3 percentage points over 5,000
+    samples), not the per-move independent rates the old sampler used.
+    """
+    tracker = SetTracker(data, "Abomasnow")
+    full_sets = data.full_sets("Abomasnow")
+    total = sum(full_set.count for full_set in full_sets)
+    top_three = sorted(full_sets, key=lambda fs: fs.count, reverse=True)[:3]
+    expected = {_full_set_identity(fs): fs.count / total for fs in top_three}
+
+    rng = random.Random(20261010)
+    counts = Counter(
+        _full_set_identity(tracker.sample(rng)) for _ in range(5000)
+    )
+
+    for identity, expected_fraction in expected.items():
+        assert counts[identity] / 5000 == pytest.approx(expected_fraction, abs=0.03)
+
+
+def test_full_set_sampling_with_one_revealed_move_draws_only_matching_sets(data):
+    """Evidence must restrict sampling to full sets containing it, in the
+    correct (real, renormalized) proportions -- not just any role-legal set.
+    """
+    tracker = SetTracker(data, "Abomasnow")
+    tracker.observe_move("Earthquake")
+    matching = [
+        full_set
+        for full_set in data.full_sets("Abomasnow")
+        if "earthquake" in {to_id(move) for move in full_set.moves}
+    ]
+    assert len(matching) >= 2
+    total = sum(full_set.count for full_set in matching)
+    expected = {_full_set_identity(fs): fs.count / total for fs in matching}
+
+    rng = random.Random(773)
+    counts = Counter()
+    for _ in range(5000):
+        sampled = tracker.sample(rng)
+        assert "earthquake" in {to_id(move) for move in sampled.moves}
+        identity = _full_set_identity(sampled)
+        assert identity in expected
+        counts[identity] += 1
+
+    for identity, expected_fraction in expected.items():
+        assert counts[identity] / 5000 == pytest.approx(expected_fraction, abs=0.03)
+
+
+def test_full_set_sampling_never_produces_a_move_combo_absent_from_full_data(data):
+    """Mutation check: Abomasnow's real full data always carries exactly two
+    of {Earthquake, Ice Shard, Wood Hammer}, never one and never all three.
+    A per-move independent sampler can (and did) produce both of those
+    forbidden combinations; joint full-set sampling never can, because every
+    sample is copied verbatim from a real set.
+    """
+    tracker = SetTracker(data, "Abomasnow")
+    correlated = {"earthquake", "iceshard", "woodhammer"}
+    rng = random.Random(99)
+
+    for _ in range(2000):
+        sampled = tracker.sample(rng)
+        move_ids = {to_id(move) for move in sampled.moves}
+        assert len(move_ids & correlated) == 2
+
+
+def test_full_set_sampling_mixes_hidden_forme_siblings_in_proportion(data):
+    """An unrevealed Greninja must sample from both the Greninja and
+    Greninja-Bond full sets (see ``_hidden_forme_species``), weighted by
+    their real relative counts; once Battle Bond is revealed, only
+    Greninja-Bond sets may appear.
+    """
+    tracker = SetTracker(
+        data, "Greninja", sibling_species=_hidden_forme_species(data, "greninja")
+    )
+    greninja_total = sum(fs.count for fs in data.full_sets("Greninja"))
+    bond_total = sum(fs.count for fs in data.full_sets("Greninja-Bond"))
+    expected = {
+        "Greninja": greninja_total / (greninja_total + bond_total),
+        "Greninja-Bond": bond_total / (greninja_total + bond_total),
+    }
+
+    rng = random.Random(2024)
+    species_counts = Counter(tracker.sample(rng).species for _ in range(5000))
+    for species, expected_fraction in expected.items():
+        assert species_counts[species] / 5000 == pytest.approx(
+            expected_fraction, abs=0.03
+        )
+
+    tracker.observe_ability("Battle Bond")
+    for _ in range(200):
+        sampled = tracker.sample(rng)
+        assert sampled.species == "Greninja-Bond"
+        assert to_id(sampled.ability) == "battlebond"
+
+
+def test_full_set_sampling_falls_back_to_role_based_when_no_exact_set_matches(data):
+    """Choice Scarf and Stealth Rock are each legal for Great Tusk's "Bulky
+    Support" role (so role elimination stays consistent), but no single real
+    full set pairs them -- a case 589.11 says must fall back gracefully to
+    the role-based sampler rather than crash or return illegal evidence.
+    """
+    tracker = SetTracker(data, "Great Tusk")
+    tracker.observe_item("Choice Scarf")
+    tracker.observe_move("Stealth Rock")
+    assert not tracker.inconsistent
+    assert tracker._matching_full_sets() == []
+
+    rng = random.Random(0)
+    for _ in range(50):
+        sampled = tracker.sample(rng)
+        assert sampled.role in data.roles("Great Tusk")
+        assert to_id(sampled.item) == "choicescarf"
+        assert "stealthrock" in {to_id(move) for move in sampled.moves}
+        assert len(sampled.moves) == 4
 
 
 def test_pokedex_resolves_temporary_and_preserves_selectable_forms(data):
@@ -1278,7 +1451,7 @@ def test_conflicting_tera_stays_binding_when_no_zoroark_can_be_on_the_team(data)
 
 
 @pytest.mark.network
-def test_live_randbats_data_fetches_and_parses_both_files(tmp_path, monkeypatch):
+def test_live_randbats_data_fetches_and_parses_all_files(tmp_path, monkeypatch):
     fetched_urls = []
     real_urlopen = urllib.request.urlopen
 
@@ -1293,11 +1466,17 @@ def test_live_randbats_data_fetches_and_parses_both_files(tmp_path, monkeypatch)
     stats_path = tmp_path / "stats" / "gen9randombattle.json"
     assert sets_path.is_file() and sets_path.stat().st_size > 0
     assert stats_path.is_file() and stats_path.stat().st_size > 0
+    full_path = tmp_path / "full" / "gen9randombattle.json"
+    assert full_path.is_file() and full_path.stat().st_size > 0
     assert set(fetched_urls) == {
         "https://pkmn.github.io/randbats/data/gen9randombattle.json",
         "https://pkmn.github.io/randbats/data/stats/gen9randombattle.json",
+        "https://pkmn.github.io/randbats/data/full/gen9randombattle.json",
     }
     assert len(live_data.species_ids()) >= 300
+    abomasnow_sets = live_data.full_sets("Abomasnow")
+    assert abomasnow_sets and all(fs.count > 0 for fs in abomasnow_sets)
+    assert len(live_data.full_sets("Greninja")) > 0
     assert 0 < live_data.roles("Abomasnow")["Bulky Support"].option_weight(
         "moves", "Earthquake"
     ) < 1

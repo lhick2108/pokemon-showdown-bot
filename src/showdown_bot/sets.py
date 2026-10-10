@@ -23,6 +23,14 @@ logger = logging.getLogger(__name__)
 _DATA_URL = "https://pkmn.github.io/randbats/data"
 _DEFAULT_CACHE_DIR = Path(".cache") / "randbats"
 
+_TERA_TYPE_IDS = frozenset(
+    {
+        "normal", "fire", "water", "electric", "grass", "ice", "fighting",
+        "poison", "ground", "flying", "psychic", "bug", "rock", "ghost",
+        "dragon", "dark", "steel", "fairy", "stellar",
+    }
+)
+
 
 def to_id(name: Any) -> str:
     """Return the Showdown id for a display name or enum-like value."""
@@ -165,11 +173,115 @@ class _SpeciesData:
     roles: Mapping[str, RoleData]
 
 
+@dataclass(frozen=True)
+class FullSet:
+    """One exact randbats set (level, item, ability, all moves, tera type).
+
+    Foul Play samples these jointly from pkmn/randbats' "full" data instead
+    of drawing each option independently from per-role marginals, because
+    the joint distribution has real correlations (for example Abomasnow's
+    "Bulky Support" role never actually uses all of Earthquake, Ice Shard
+    and Wood Hammer together, only two of the three) that per-move sampling
+    can't reproduce. ``count`` is the number of times this exact set
+    appeared across pkmn/randbats' 100,000 generated teams, directly
+    comparable across sets and even across sibling species (see
+    ``_hidden_forme_species``), so weighting by raw ``count`` mixes them in
+    the right proportion without renormalizing per species first.
+    """
+
+    level: int
+    item: str | None
+    ability: str
+    moves: tuple[str, ...]
+    tera_type: str
+    count: float
+
+
+def _parse_full_set_key(key: str) -> tuple[int, str, str, tuple[str, ...], str] | None:
+    """Split one ``full/<format>.json`` key into its component ids.
+
+    Keys look like ``level,item,ability,move1,move2,move3,move4[,tera]``,
+    already Showdown ids for item/ability/moves/tera (an empty item field
+    means no held item). The move count is normally four but can be fewer
+    -- Ditto's only set carries just Transform -- so the split anchors from
+    the right: the last field is always a real tera type id (every entry in
+    the real file has one), and every field between ability and tera is a
+    move. Returns ``None`` for a key this parser can't make sense of, so the
+    caller can skip it rather than crash a battle on a malformed entry.
+    """
+    parts = key.split(",")
+    if len(parts) < 5:
+        return None
+    try:
+        level = int(parts[0])
+    except ValueError:
+        return None
+    item_id = to_id(parts[1])
+    ability_id = to_id(parts[2])
+    tera_id = to_id(parts[-1])
+    if tera_id not in _TERA_TYPE_IDS:
+        return None
+    move_ids = tuple(to_id(move) for move in parts[3:-1] if to_id(move))
+    if not move_ids:
+        return None
+    return level, item_id, ability_id, move_ids, tera_id
+
+
+def _parse_full_sets(
+    full_payload: Any,
+    move_display: Mapping[str, str],
+    item_display: Mapping[str, str],
+    ability_display: Mapping[str, str],
+) -> dict[str, tuple[FullSet, ...]]:
+    """Parse a ``full/<format>.json`` payload into per-species ``FullSet``s.
+
+    The full file only gives ids; ``*_display`` map those ids back to the
+    display names already harvested from the regular sets file's role
+    options, so ``FullSet`` stays in the same display-name style as
+    ``RoleData``/``SampledSet``. An id with no known display name (full-set
+    data for an option no listed role happens to use) falls back to the bare
+    id rather than crashing.
+    """
+    if not isinstance(full_payload, Mapping):
+        return {}
+    full_sets: dict[str, tuple[FullSet, ...]] = {}
+    for species_name, species_sets in full_payload.items():
+        species_id = to_id(species_name)
+        if not species_id or not isinstance(species_sets, Mapping):
+            continue
+        parsed_sets: list[FullSet] = []
+        for raw_key, raw_count in species_sets.items():
+            parsed_key = _parse_full_set_key(str(raw_key))
+            if parsed_key is None:
+                continue
+            level, item_id, ability_id, move_ids, tera_id = parsed_key
+            parsed_sets.append(
+                FullSet(
+                    level=level,
+                    item=item_display.get(item_id, item_id) if item_id else None,
+                    ability=ability_display.get(ability_id, ability_id),
+                    moves=tuple(
+                        move_display.get(move_id, move_id) for move_id in move_ids
+                    ),
+                    tera_type=tera_id.capitalize(),
+                    count=_weight(raw_count),
+                )
+            )
+        if parsed_sets:
+            full_sets[species_id] = tuple(parsed_sets)
+    return full_sets
+
+
 class RandbatsData:
     """Parsed sets and usage stats indexed by Showdown species id."""
 
-    def __init__(self, species: Mapping[str, _SpeciesData]):
+    def __init__(
+        self,
+        species: Mapping[str, _SpeciesData],
+        full_sets: Mapping[str, tuple[FullSet, ...]] = MappingProxyType({}),
+    ):
         self._species = MappingProxyType(dict(species))
+        self._full_sets = MappingProxyType(dict(full_sets))
 
     @classmethod
     def load(
@@ -178,20 +290,43 @@ class RandbatsData:
         refresh: bool = False,
         cache_dir: str | Path = _DEFAULT_CACHE_DIR,
     ) -> RandbatsData:
-        """Load a format's sets and stats, fetching either missing cache file."""
+        """Load a format's sets and stats, fetching either missing cache file.
+
+        The full joint-set file is fetched/cached the same way, under
+        ``<cache_dir>/full/<format>.json``. Unlike the sets and stats files,
+        a missing or unparsable full file never fails the load: full-set
+        sampling simply has nothing to match and ``SetTracker.sample``
+        falls back to the role-based sampler, so loading never crashes a
+        battle for lack of (or stale/unreachable) full data.
+        """
         cache_path = Path(cache_dir)
         sets_path = cache_path / f"{format}.json"
         stats_path = cache_path / "stats" / f"{format}.json"
+        full_path = cache_path / "full" / f"{format}.json"
         sets_url = f"{_DATA_URL}/{format}.json"
         stats_url = f"{_DATA_URL}/stats/{format}.json"
+        full_url = f"{_DATA_URL}/full/{format}.json"
 
         sets_payload = _read_cached_json(sets_path, sets_url, refresh)
         stats_payload = _read_cached_json(stats_path, stats_url, refresh)
-        return cls._from_payloads(sets_payload, stats_payload)
+        try:
+            full_payload = _read_cached_json(full_path, full_url, refresh)
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "Could not load full randbats sets for %s (%s); full-set "
+                "sampling will fall back to role-based sampling",
+                format,
+                exc,
+            )
+            full_payload = {}
+        return cls._from_payloads(sets_payload, stats_payload, full_payload)
 
     @classmethod
     def _from_payloads(
-        cls, sets_payload: Any, stats_payload: Any
+        cls,
+        sets_payload: Any,
+        stats_payload: Any,
+        full_payload: Any = MappingProxyType({}),
     ) -> RandbatsData:
         if not isinstance(sets_payload, Mapping) or not isinstance(stats_payload, Mapping):
             raise ValueError("randbats sets and stats must each be JSON objects")
@@ -201,11 +336,24 @@ class RandbatsData:
             for name, value in stats_payload.items()
             if to_id(name) and isinstance(value, Mapping)
         }
+        # Harvested while walking species/role options below, so the full
+        # file's ids (moves/items/abilities only, no display names) can be
+        # mapped back to the same display-name style as RoleData/SampledSet.
+        move_display: dict[str, str] = {}
+        item_display: dict[str, str] = {}
+        ability_display: dict[str, str] = {}
+
+        def _record_display_names(target: dict[str, str], raw: Any) -> None:
+            for option in _options(raw):
+                target.setdefault(to_id(option), option)
+
         parsed: dict[str, _SpeciesData] = {}
         for species_name, species_raw in sets_payload.items():
             species_id = to_id(species_name)
             if not species_id or not isinstance(species_raw, Mapping):
                 continue
+            _record_display_names(ability_display, species_raw.get("abilities", ()))
+            _record_display_names(item_display, species_raw.get("items", ()))
             stats_raw = stats_species_by_id.get(species_id, {})
             stats_roles_raw = stats_raw.get("roles", {})
             if not isinstance(stats_roles_raw, Mapping):
@@ -223,6 +371,9 @@ class RandbatsData:
             for role_name, role_raw in role_payload.items():
                 if not isinstance(role_raw, Mapping):
                     continue
+                _record_display_names(ability_display, role_raw.get("abilities", ()))
+                _record_display_names(item_display, role_raw.get("items", ()))
+                _record_display_names(move_display, role_raw.get("moves", ()))
                 role_stats = stats_roles_by_id.get(to_id(role_name), {})
                 weights = MappingProxyType(
                     {
@@ -251,7 +402,10 @@ class RandbatsData:
                 level=level,
                 roles=MappingProxyType(roles),
             )
-        return cls(parsed)
+        full_sets = _parse_full_sets(
+            full_payload, move_display, item_display, ability_display
+        )
+        return cls(parsed, full_sets)
 
     def species_ids(self) -> tuple[str, ...]:
         """Return all indexed species ids in stable sorted order."""
@@ -259,6 +413,10 @@ class RandbatsData:
 
     def has_species(self, species: Any) -> bool:
         return to_id(species) in self._species
+
+    def full_sets(self, species: Any) -> tuple[FullSet, ...]:
+        """Return the exact randbats sets for a species, or ``()`` if none."""
+        return self._full_sets.get(to_id(species), ())
 
     def species_name(self, species: Any) -> str:
         return self._species[to_id(species)].name
@@ -302,6 +460,18 @@ def _weighted_choice(rng: Any, options: Sequence[str], weights: Sequence[float])
     if len(clean_weights) != len(options) or sum(clean_weights) <= 0:
         clean_weights = [1.0] * len(options)
     return rng.choices(list(options), weights=clean_weights, k=1)[0]
+
+
+def _weighted_index(rng: Any, weights: Sequence[float]) -> int:
+    """Pick an index into ``weights``, proportional to each entry's weight.
+
+    Used to pick among heterogeneous ``(species_id, FullSet)`` pairs that
+    ``_weighted_choice`` (string options only) can't carry directly.
+    """
+    clean_weights = [_weight(weight) for weight in weights]
+    if sum(clean_weights) <= 0:
+        clean_weights = [1.0] * len(weights)
+    return rng.choices(range(len(weights)), weights=clean_weights, k=1)[0]
 
 
 def _resolve_randbats_species(data: RandbatsData, species: Any, gen: int = 9) -> str | None:
@@ -540,6 +710,107 @@ class SetTracker:
         return dict(zip(names, normalized))
 
     def sample(self, rng: Any) -> SampledSet:
+        """Sample a whole set, preferring real joint data over role marginals.
+
+        Draws from the full randbats sets (level, item, ability, all moves
+        and tera together) of every candidate species id -- the primary
+        species plus any hidden-forme siblings (see ``_hidden_forme_species``)
+        -- restricted to sets consistent with every BINDING observation and
+        weighted by real occurrence count. Provisional observations (see
+        ``provisional_observations``) never constrain this: they may belong
+        to a disguised Zoroark, not this species. If no full set is
+        consistent with the evidence (full data missing for this species, or
+        the tracker's observations are ``inconsistent`` with the real data),
+        falls back to the role-based marginal sampler below.
+        """
+        matches = self._matching_full_sets()
+        if not matches:
+            logger.debug(
+                "No full randbats set for %s matches binding evidence; "
+                "falling back to role-based sampling",
+                self.species,
+            )
+            return self._sample_role_based(rng)
+        weights = [full_set.count for _, full_set in matches]
+        index = _weighted_index(rng, weights)
+        species_id, full_set = matches[index]
+        return SampledSet(
+            species=self.data.species_name(species_id),
+            level=full_set.level,
+            role=self._best_matching_role_name(species_id, full_set),
+            moves=full_set.moves,
+            ability=full_set.ability,
+            item=full_set.item,
+            tera_type=full_set.tera_type,
+        )
+
+    def _matching_full_sets(self) -> list[tuple[str, FullSet]]:
+        """Full sets, across every candidate species id, legal given evidence."""
+        return [
+            (species_id, full_set)
+            for species_id in self._species_ids
+            for full_set in self.data.full_sets(species_id)
+            if self._full_set_consistent(full_set)
+        ]
+
+    def _full_set_consistent(self, full_set: FullSet) -> bool:
+        move_ids = {to_id(move) for move in full_set.moves}
+        for move in self._binding_revealed_moves:
+            if to_id(move) not in move_ids:
+                return False
+        if self._revealed_item is not None:
+            have_item_id = to_id(full_set.item) if full_set.item else ""
+            if to_id(self._revealed_item) != have_item_id:
+                return False
+        if self._revealed_ability is not None:
+            if to_id(self._revealed_ability) != to_id(full_set.ability):
+                return False
+        if self._revealed_tera is not None:
+            if to_id(self._revealed_tera) != to_id(full_set.tera_type):
+                return False
+        return True
+
+    def _best_matching_role_name(self, species_id: str, full_set: FullSet) -> str:
+        """Best-effort label for which marginal role a full set resembles.
+
+        A full set is reported under a real role's name when every one of
+        its moves, its ability, its tera type, and (if it carries one) its
+        item are all legal options of that role -- i.e. the role's marginal
+        data could have generated it. The first such role wins; when none
+        of this species' roles could have generated it (full-set data can
+        be finer-grained than the role option lists it's rolled up from),
+        the set is reported as ``"full-set"`` rather than a misleading role
+        name.
+        """
+        move_ids = {to_id(move) for move in full_set.moves}
+        ability_id = to_id(full_set.ability)
+        item_id = to_id(full_set.item) if full_set.item else ""
+        tera_id = to_id(full_set.tera_type)
+        for role_name, role in self._roles.items():
+            if self._role_species[role_name] != species_id:
+                continue
+            if not move_ids <= {to_id(move) for move in role.moves}:
+                continue
+            if ability_id not in {to_id(ability) for ability in role.abilities}:
+                continue
+            if item_id and item_id not in {to_id(item) for item in role.items}:
+                continue
+            if tera_id not in {to_id(tera) for tera in role.tera_types}:
+                continue
+            return role_name
+        return "full-set"
+
+    def _sample_role_based(self, rng: Any) -> SampledSet:
+        """Fall back to drawing a role, then each option, from marginals.
+
+        Kept for when no full set is consistent with this tracker's binding
+        evidence: full data missing for this species (download failure or a
+        species the real file doesn't cover), or the tracker's own
+        observations are ``inconsistent`` with the real full data. Each
+        option is drawn independently from its per-role marginal frequency,
+        so -- unlike ``sample()`` -- the result can combine options that
+        never actually co-occur in a single real set.
+        """
         candidates = self.candidate_roles()
         if not candidates:
             raise ValueError(f"No randbats roles available for {self.species!r}")
@@ -711,15 +982,6 @@ def _protocol_slot(value: Any) -> tuple[str, str] | None:
     if match is None or not match.group(2):
         return None
     return match.group(1).lower(), match.group(2).lower()
-
-
-_TERA_TYPE_IDS = frozenset(
-    {
-        "normal", "fire", "water", "electric", "grass", "ice", "fighting",
-        "poison", "ground", "flying", "psychic", "bug", "rock", "ghost",
-        "dragon", "dark", "steel", "fairy", "stellar",
-    }
-)
 
 
 def _details_tera(details: Any) -> str | None:
