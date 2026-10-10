@@ -1,0 +1,1197 @@
+{
+  "Abomasnow": {
+    "level": 84,
+    "abilities": [
+      "Snow Warning"
+    ],
+    "items": [
+      "Light Clay"
+    ],
+    "roles": {
+      "Bulky Support": {
+        "abilities": [
+          "Snow Warning"
+        ],
+        "items": [
+          "Light Clay"
+        ],
+        "teraTypes": [
+          "Ghost",
+          "Water"
+        ],
+        "moves": [
+          "Aurora Veil",
+          "Blizzard",
+          "Earthquake",
+          "Ice Shard",
+          "Wood Hammer"
+        ],
+        "evs": {
+          "hp": 77
+        }
+      }
+    },
+    "evs": {
+      "hp": 77
+    }
+  },
+  "Azumarill": {
+    "level": 82,
+    "abilities": [
+      "Huge Power"
+    ],
+    "items": [
+      "Choice Band",
+      "Sitrus Berry"
+    ],
+    "roles": {
+      "Bulky Attacker": {
+        "abilities": [
+          "Huge Power"
+        ],
+        "items": [
+          "Choice Band",
+          "Sitrus Berry"
+        ],
+        "teraTypes": [
+          "Water"
+        ],
+        "moves": [
+          "Aqua Jet",
+          "Belly Drum",
+          "Ice Spinner",
+          "Knock Off",
+          "Liquidation",
+          "Play Rough",
+          "Superpower"
+        ]
+      }
+    }
+  },
+  "Calyrex-Ice": {
+    "level": 72,
+    "abilities": [
+      "As One (Glastrier)"
+    ],
+    "items": [
+      "Heavy-Duty Boots",
+      "Weakness Policy"
+    ],
+    "roles": {
+      "Bulky Setup": {
+        "abilities": [
+          "As One (Glastrier)"
+        ],
+        "items": [
+          "Weakness Policy"
+        ],
+        "teraTypes": [
+          "Fighting",
+          "Ground"
+        ],
+        "moves": [
+          "Agility",
+          "Close Combat",
+          "Glacial Lance",
+          "High Horsepower"
+        ]
+      }
+    }
+  },
+  "Calyrex-Shadow": {
+    "level": 64,
+    "abilities": [
+      "As One (Spectrier)"
+    ],
+    "items": [
+      "Choice Specs",
+      "Life Orb"
+    ],
+    "roles": {
+      "Fast Attacker": {
+        "abilities": [
+          "As One (Spectrier)"
+        ],
+        "items": [
+          "Choice Specs",
+          "Life Orb"
+        ],
+        "teraTypes": [
+          "Dark",
+          "Ghost"
+        ],
+        "moves": [
+          "Astral Barrage",
+          "Nasty Plot",
+          "Pollen Puff",
+          "Psyshock",
+          "Trick"
+        ]
+      }
+    }
+  },
+  "Carbink": {
+    "level": 90,
+    "abilities": [
+      "Clear Body",
+      "Sturdy"
+    ],
+    "items": [
+      "Chesto Berry",
+      "Leftovers"
+    ],
+    "roles": {
+      "Fast Bulky Setup": {
+        "abilities": [
+          "Clear Body",
+          "Sturdy"
+        ],
+        "items": [
+          "Chesto Berry",
+          "Leftovers"
+        ],
+        "teraTypes": [
+          "Fighting"
+        ],
+        "moves": [
+          "Body Press",
+          "Iron Defense",
+          "Moonblast",
+          "Rest",
+          "Rock Polish"
+        ],
+        "evs": {
+          "atk": 0
+        },
+        "ivs": {
+          "atk": 0
+        }
+      }
+    },
+    "evs": {
+      "atk": 0
+    },
+    "ivs": {
+      "atk": 0
+    }
+  },
+  "Chandelure": {
+    "level": 83,
+    "abilities": [
+      "Flame Body",
+      "Flash Fire"
+    ],
+    "items": [
+      "Choice Scarf",
+      "Heavy-Duty Boots",
+      "Leftovers"
+    ],
+    "roles": {
+      "Fast Attacker": {
+        "abilities": [
+          "Flash Fire"
+        ],
+        "items": [
+          "Choice Scarf"
+        ],
+        "teraTypes": [
+          "Fire",
+          "Ghost",
+          "Grass"
+        ],
+        "moves": [
+          "Energy Ball",
+          "Fire Blast",
+          "Shadow Ball",
+          "Trick"
+        ],
+        "evs": {
+          "atk": 0
+        },
+        "ivs": {
+          "atk": 0
+        }
+      },
+      "Fast Bulky Setup": {
+        "abilities": [
+          "Flame Body",
+          "Flash Fire"
+        ],
+        "items": [
+          "Heavy-Duty Boots",
+          "Leftovers"
+        ],
+        "teraTypes": [
+          "Fire",
+          "Ghost",
+          "Grass"
+        ],
+        "moves": [
+          "Calm Mind",
+          "Energy Ball",
+          "Fire Blast",
+          "Flame Charge",
+          "Pain Split",
+          "Shadow Ball",
+          "Substitute",
+          "Will-O-Wisp"
+        ]
+      }
+    }
+  },
+  "Ditto": {
+    "level": 87,
+    "abilities": [
+      "Imposter"
+    ],
+    "items": [
+      "Choice Scarf"
+    ],
+    "roles": {
+      "Fast Support": {
+        "abilities": [
+          "Imposter"
+        ],
+        "items": [
+          "Choice Scarf"
+        ],
+        "teraTypes": [
+          "Ghost",
+          "Steel"
+        ],
+        "moves": [
+          "Transform"
+        ]
+      }
+    }
+  },
+  "Espeon": {
+    "level": 84,
+    "abilities": [
+      "Magic Bounce"
+    ],
+    "items": [
+      "Choice Specs",
+      "Life Orb"
+    ],
+    "roles": {
+      "Fast Attacker": {
+        "abilities": [
+          "Magic Bounce"
+        ],
+        "items": [
+          "Choice Specs",
+          "Life Orb"
+        ],
+        "teraTypes": [
+          "Fairy",
+          "Psychic"
+        ],
+        "moves": [
+          "Alluring Voice",
+          "Calm Mind",
+          "Morning Sun",
+          "Psychic",
+          "Psyshock",
+          "Shadow Ball",
+          "Trick"
+        ]
+      }
+    }
+  },
+  "Gardevoir": {
+    "level": 83,
+    "abilities": [
+      "Trace"
+    ],
+    "items": [
+      "Choice Scarf",
+      "Choice Specs",
+      "Life Orb"
+    ],
+    "roles": {
+      "Fast Attacker": {
+        "abilities": [
+          "Trace"
+        ],
+        "items": [
+          "Choice Scarf",
+          "Choice Specs",
+          "Life Orb"
+        ],
+        "teraTypes": [
+          "Fairy",
+          "Fighting",
+          "Fire"
+        ],
+        "moves": [
+          "Calm Mind",
+          "Focus Blast",
+          "Healing Wish",
+          "Moonblast",
+          "Mystical Fire",
+          "Psychic",
+          "Psyshock",
+          "Trick"
+        ],
+        "evs": {
+          "atk": 0
+        },
+        "ivs": {
+          "atk": 0
+        }
+      }
+    },
+    "evs": {
+      "atk": 0
+    },
+    "ivs": {
+      "atk": 0
+    }
+  },
+  "Great Tusk": {
+    "level": 77,
+    "abilities": [
+      "Protosynthesis"
+    ],
+    "items": [
+      "Assault Vest",
+      "Booster Energy",
+      "Choice Band",
+      "Choice Scarf",
+      "Leftovers"
+    ],
+    "roles": {
+      "Bulky Setup": {
+        "abilities": [
+          "Protosynthesis"
+        ],
+        "items": [
+          "Leftovers"
+        ],
+        "teraTypes": [
+          "Ground",
+          "Steel"
+        ],
+        "moves": [
+          "Bulk Up",
+          "Close Combat",
+          "Earthquake",
+          "Rapid Spin",
+          "Stone Edge"
+        ]
+      },
+      "Bulky Support": {
+        "abilities": [
+          "Protosynthesis"
+        ],
+        "items": [
+          "Assault Vest",
+          "Choice Band",
+          "Choice Scarf",
+          "Leftovers"
+        ],
+        "teraTypes": [
+          "Ground",
+          "Steel"
+        ],
+        "moves": [
+          "Close Combat",
+          "Headlong Rush",
+          "Ice Spinner",
+          "Knock Off",
+          "Rapid Spin",
+          "Stealth Rock",
+          "Stone Edge"
+        ]
+      },
+      "Fast Bulky Setup": {
+        "abilities": [
+          "Protosynthesis"
+        ],
+        "items": [
+          "Booster Energy"
+        ],
+        "teraTypes": [
+          "Ground",
+          "Steel"
+        ],
+        "moves": [
+          "Bulk Up",
+          "Close Combat",
+          "Earthquake",
+          "Rapid Spin",
+          "Stone Edge"
+        ]
+      }
+    }
+  },
+  "Greninja": {
+    "level": 80,
+    "abilities": [
+      "Protean"
+    ],
+    "items": [
+      "Choice Specs",
+      "Life Orb"
+    ],
+    "roles": {
+      "Wallbreaker": {
+        "abilities": [
+          "Protean"
+        ],
+        "items": [
+          "Life Orb"
+        ],
+        "teraTypes": [
+          "Poison"
+        ],
+        "moves": [
+          "Grass Knot",
+          "Gunk Shot",
+          "Hydro Pump",
+          "Ice Beam",
+          "Spikes",
+          "U-turn"
+        ]
+      },
+      "Fast Attacker": {
+        "abilities": [
+          "Protean"
+        ],
+        "items": [
+          "Choice Specs",
+          "Life Orb"
+        ],
+        "teraTypes": [
+          "Dark",
+          "Poison",
+          "Water"
+        ],
+        "moves": [
+          "Dark Pulse",
+          "Grass Knot",
+          "Gunk Shot",
+          "Hydro Pump",
+          "Ice Beam",
+          "Toxic Spikes",
+          "U-turn"
+        ]
+      }
+    }
+  },
+  "Greninja-Bond": {
+    "level": 80,
+    "abilities": [
+      "Battle Bond"
+    ],
+    "items": [
+      "Life Orb"
+    ],
+    "roles": {
+      "Fast Attacker": {
+        "abilities": [
+          "Battle Bond"
+        ],
+        "items": [
+          "Life Orb"
+        ],
+        "teraTypes": [
+          "Poison",
+          "Water"
+        ],
+        "moves": [
+          "Dark Pulse",
+          "Gunk Shot",
+          "Hydro Pump",
+          "Ice Beam"
+        ]
+      }
+    }
+  },
+  "Iron Hands": {
+    "level": 79,
+    "abilities": [
+      "Quark Drive"
+    ],
+    "items": [
+      "Assault Vest",
+      "Leftovers"
+    ],
+    "roles": {
+      "AV Pivot": {
+        "abilities": [
+          "Quark Drive"
+        ],
+        "items": [
+          "Assault Vest"
+        ],
+        "teraTypes": [
+          "Electric",
+          "Fighting"
+        ],
+        "moves": [
+          "Close Combat",
+          "Drain Punch",
+          "Fake Out",
+          "Heavy Slam",
+          "Ice Punch",
+          "Thunder Punch",
+          "Volt Switch",
+          "Wild Charge"
+        ]
+      },
+      "Bulky Attacker": {
+        "abilities": [
+          "Quark Drive"
+        ],
+        "items": [
+          "Leftovers"
+        ],
+        "teraTypes": [
+          "Fighting",
+          "Flying",
+          "Steel"
+        ],
+        "moves": [
+          "Drain Punch",
+          "Ice Punch",
+          "Swords Dance",
+          "Thunder Punch",
+          "Wild Charge"
+        ]
+      }
+    }
+  },
+  "Ninetales": {
+    "level": 85,
+    "abilities": [
+      "Drought"
+    ],
+    "items": [
+      "Heavy-Duty Boots"
+    ],
+    "roles": {
+      "Setup Sweeper": {
+        "abilities": [
+          "Drought"
+        ],
+        "items": [
+          "Heavy-Duty Boots"
+        ],
+        "teraTypes": [
+          "Fire",
+          "Grass"
+        ],
+        "moves": [
+          "Fire Blast",
+          "Nasty Plot",
+          "Scorching Sands",
+          "Solar Beam"
+        ],
+        "evs": {
+          "atk": 0
+        },
+        "ivs": {
+          "atk": 0
+        }
+      }
+    },
+    "evs": {
+      "atk": 0
+    },
+    "ivs": {
+      "atk": 0
+    }
+  },
+  "Ninetales-Alola": {
+    "level": 78,
+    "abilities": [
+      "Snow Warning"
+    ],
+    "items": [
+      "Light Clay"
+    ],
+    "roles": {
+      "Fast Support": {
+        "abilities": [
+          "Snow Warning"
+        ],
+        "items": [
+          "Light Clay"
+        ],
+        "teraTypes": [
+          "Steel",
+          "Water"
+        ],
+        "moves": [
+          "Aurora Veil",
+          "Blizzard",
+          "Encore",
+          "Moonblast",
+          "Nasty Plot"
+        ],
+        "evs": {
+          "atk": 0
+        },
+        "ivs": {
+          "atk": 0
+        }
+      },
+      "Fast Attacker": {
+        "abilities": [
+          "Snow Warning"
+        ],
+        "items": [
+          "Light Clay"
+        ],
+        "teraTypes": [
+          "Steel",
+          "Water"
+        ],
+        "moves": [
+          "Aurora Veil",
+          "Blizzard",
+          "Freeze-Dry",
+          "Moonblast"
+        ],
+        "evs": {
+          "atk": 0
+        },
+        "ivs": {
+          "atk": 0
+        }
+      }
+    },
+    "evs": {
+      "atk": 0
+    },
+    "ivs": {
+      "atk": 0
+    }
+  },
+  "Ogerpon": {
+    "level": 80,
+    "abilities": [
+      "Defiant"
+    ],
+    "items": [
+      "Choice Band",
+      "Heavy-Duty Boots",
+      "Leftovers",
+      "Life Orb"
+    ],
+    "roles": {
+      "Setup Sweeper": {
+        "abilities": [
+          "Defiant"
+        ],
+        "items": [
+          "Life Orb"
+        ],
+        "teraTypes": [
+          "Grass"
+        ],
+        "moves": [
+          "Ivy Cudgel",
+          "Knock Off",
+          "Superpower",
+          "Swords Dance"
+        ]
+      },
+      "Fast Support": {
+        "abilities": [
+          "Defiant"
+        ],
+        "items": [
+          "Choice Band",
+          "Heavy-Duty Boots",
+          "Leftovers",
+          "Life Orb"
+        ],
+        "teraTypes": [
+          "Grass"
+        ],
+        "moves": [
+          "Encore",
+          "Ivy Cudgel",
+          "Knock Off",
+          "Spikes",
+          "Superpower",
+          "Synthesis",
+          "U-turn"
+        ]
+      }
+    }
+  },
+  "Ogerpon-Cornerstone": {
+    "level": 76,
+    "abilities": [
+      "Sturdy"
+    ],
+    "items": [
+      "Cornerstone Mask"
+    ],
+    "roles": {
+      "Setup Sweeper": {
+        "abilities": [
+          "Sturdy"
+        ],
+        "items": [
+          "Cornerstone Mask"
+        ],
+        "teraTypes": [
+          "Rock"
+        ],
+        "moves": [
+          "Horn Leech",
+          "Ivy Cudgel",
+          "Power Whip",
+          "Superpower",
+          "Swords Dance"
+        ]
+      },
+      "Bulky Attacker": {
+        "abilities": [
+          "Sturdy"
+        ],
+        "items": [
+          "Cornerstone Mask"
+        ],
+        "teraTypes": [
+          "Rock"
+        ],
+        "moves": [
+          "Encore",
+          "Ivy Cudgel",
+          "Power Whip",
+          "Spikes",
+          "Superpower",
+          "Synthesis"
+        ]
+      }
+    }
+  },
+  "Ogerpon-Hearthflame": {
+    "level": 74,
+    "abilities": [
+      "Mold Breaker"
+    ],
+    "items": [
+      "Hearthflame Mask"
+    ],
+    "roles": {
+      "Setup Sweeper": {
+        "abilities": [
+          "Mold Breaker"
+        ],
+        "items": [
+          "Hearthflame Mask"
+        ],
+        "teraTypes": [
+          "Fire"
+        ],
+        "moves": [
+          "Horn Leech",
+          "Ivy Cudgel",
+          "Knock Off",
+          "Power Whip",
+          "Stomping Tantrum",
+          "Swords Dance",
+          "Trailblaze"
+        ],
+        "evs": {
+          "hp": 77
+        }
+      }
+    },
+    "evs": {
+      "hp": 77
+    }
+  },
+  "Ogerpon-Wellspring": {
+    "level": 76,
+    "abilities": [
+      "Water Absorb"
+    ],
+    "items": [
+      "Wellspring Mask"
+    ],
+    "roles": {
+      "Setup Sweeper": {
+        "abilities": [
+          "Water Absorb"
+        ],
+        "items": [
+          "Wellspring Mask"
+        ],
+        "teraTypes": [
+          "Water"
+        ],
+        "moves": [
+          "Horn Leech",
+          "Ivy Cudgel",
+          "Knock Off",
+          "Play Rough",
+          "Power Whip",
+          "Swords Dance"
+        ]
+      },
+      "Bulky Attacker": {
+        "abilities": [
+          "Water Absorb"
+        ],
+        "items": [
+          "Wellspring Mask"
+        ],
+        "teraTypes": [
+          "Water"
+        ],
+        "moves": [
+          "Encore",
+          "Ivy Cudgel",
+          "Spikes",
+          "Synthesis",
+          "U-turn",
+          "Wood Hammer"
+        ]
+      }
+    }
+  },
+  "Palafin": {
+    "level": 77,
+    "abilities": [
+      "Zero to Hero"
+    ],
+    "items": [
+      "Choice Band",
+      "Leftovers"
+    ],
+    "roles": {
+      "Bulky Setup": {
+        "abilities": [
+          "Zero to Hero"
+        ],
+        "items": [
+          "Leftovers"
+        ],
+        "teraTypes": [
+          "Dragon",
+          "Steel"
+        ],
+        "moves": [
+          "Bulk Up",
+          "Drain Punch",
+          "Ice Punch",
+          "Jet Punch",
+          "Wave Crash"
+        ]
+      },
+      "Wallbreaker": {
+        "abilities": [
+          "Zero to Hero"
+        ],
+        "items": [
+          "Choice Band"
+        ],
+        "teraTypes": [
+          "Fighting",
+          "Water"
+        ],
+        "moves": [
+          "Close Combat",
+          "Flip Turn",
+          "Jet Punch",
+          "Wave Crash"
+        ]
+      }
+    }
+  },
+  "Slowbro-Galar": {
+    "level": 87,
+    "abilities": [
+      "Regenerator"
+    ],
+    "items": [
+      "Assault Vest",
+      "Leftovers",
+      "Life Orb",
+      "Rocky Helmet"
+    ],
+    "roles": {
+      "AV Pivot": {
+        "abilities": [
+          "Regenerator"
+        ],
+        "items": [
+          "Assault Vest"
+        ],
+        "teraTypes": [
+          "Dark",
+          "Ground",
+          "Poison",
+          "Water"
+        ],
+        "moves": [
+          "Earthquake",
+          "Fire Blast",
+          "Foul Play",
+          "Psychic",
+          "Shell Side Arm",
+          "Surf"
+        ]
+      },
+      "Bulky Attacker": {
+        "abilities": [
+          "Regenerator"
+        ],
+        "items": [
+          "Leftovers",
+          "Rocky Helmet"
+        ],
+        "teraTypes": [
+          "Dark",
+          "Ground",
+          "Poison"
+        ],
+        "moves": [
+          "Earthquake",
+          "Fire Blast",
+          "Haze",
+          "Psychic",
+          "Shell Side Arm",
+          "Slack Off",
+          "Thunder Wave"
+        ]
+      },
+      "Wallbreaker": {
+        "abilities": [
+          "Regenerator"
+        ],
+        "items": [
+          "Life Orb"
+        ],
+        "teraTypes": [
+          "Poison",
+          "Psychic"
+        ],
+        "moves": [
+          "Fire Blast",
+          "Psychic",
+          "Shell Side Arm",
+          "Trick Room"
+        ]
+      }
+    }
+  },
+  "Terapagos": {
+    "level": 77,
+    "abilities": [
+      "Tera Shift"
+    ],
+    "items": [
+      "Chesto Berry",
+      "Heavy-Duty Boots"
+    ],
+    "roles": {
+      "Fast Bulky Setup": {
+        "abilities": [
+          "Tera Shift"
+        ],
+        "items": [
+          "Chesto Berry",
+          "Heavy-Duty Boots"
+        ],
+        "teraTypes": [
+          "Stellar"
+        ],
+        "moves": [
+          "Calm Mind",
+          "Earth Power",
+          "Rapid Spin",
+          "Rest",
+          "Tera Starstorm"
+        ]
+      }
+    }
+  },
+  "Urshifu": {
+    "level": 74,
+    "abilities": [
+      "Unseen Fist"
+    ],
+    "items": [
+      "Choice Band",
+      "Choice Scarf",
+      "Life Orb"
+    ],
+    "roles": {
+      "Fast Attacker": {
+        "abilities": [
+          "Unseen Fist"
+        ],
+        "items": [
+          "Choice Band",
+          "Choice Scarf",
+          "Life Orb"
+        ],
+        "teraTypes": [
+          "Dark",
+          "Fighting",
+          "Poison"
+        ],
+        "moves": [
+          "Close Combat",
+          "Poison Jab",
+          "Sucker Punch",
+          "Swords Dance",
+          "U-turn",
+          "Wicked Blow"
+        ]
+      }
+    }
+  },
+  "Urshifu-Rapid-Strike": {
+    "level": 75,
+    "abilities": [
+      "Unseen Fist"
+    ],
+    "items": [
+      "Choice Band",
+      "Choice Scarf",
+      "Life Orb"
+    ],
+    "roles": {
+      "Fast Attacker": {
+        "abilities": [
+          "Unseen Fist"
+        ],
+        "items": [
+          "Choice Band",
+          "Choice Scarf",
+          "Life Orb"
+        ],
+        "teraTypes": [
+          "Water"
+        ],
+        "moves": [
+          "Aqua Jet",
+          "Close Combat",
+          "Ice Spinner",
+          "Surging Strikes",
+          "Swords Dance",
+          "U-turn"
+        ]
+      }
+    }
+  },
+  "Zoroark": {
+    "level": 83,
+    "abilities": [
+      "Illusion"
+    ],
+    "items": [
+      "Choice Specs",
+      "Life Orb"
+    ],
+    "roles": {
+      "Setup Sweeper": {
+        "abilities": [
+          "Illusion"
+        ],
+        "items": [
+          "Life Orb"
+        ],
+        "teraTypes": [
+          "Poison"
+        ],
+        "moves": [
+          "Dark Pulse",
+          "Encore",
+          "Focus Blast",
+          "Nasty Plot",
+          "Psychic",
+          "Sludge Bomb"
+        ],
+        "evs": {
+          "atk": 0
+        },
+        "ivs": {
+          "atk": 0
+        }
+      },
+      "Wallbreaker": {
+        "abilities": [
+          "Illusion"
+        ],
+        "items": [
+          "Choice Specs"
+        ],
+        "teraTypes": [
+          "Poison"
+        ],
+        "moves": [
+          "Dark Pulse",
+          "Flamethrower",
+          "Focus Blast",
+          "Psychic",
+          "Sludge Bomb",
+          "Trick",
+          "U-turn"
+        ]
+      }
+    }
+  },
+  "Zoroark-Hisui": {
+    "level": 80,
+    "abilities": [
+      "Illusion"
+    ],
+    "items": [
+      "Choice Specs",
+      "Life Orb"
+    ],
+    "roles": {
+      "Wallbreaker": {
+        "abilities": [
+          "Illusion"
+        ],
+        "items": [
+          "Choice Specs",
+          "Life Orb"
+        ],
+        "teraTypes": [
+          "Fighting",
+          "Normal"
+        ],
+        "moves": [
+          "Bitter Malice",
+          "Flamethrower",
+          "Focus Blast",
+          "Hyper Voice",
+          "Nasty Plot",
+          "Trick",
+          "U-turn"
+        ]
+      },
+      "Fast Attacker": {
+        "abilities": [
+          "Illusion"
+        ],
+        "items": [
+          "Life Orb"
+        ],
+        "teraTypes": [
+          "Fighting",
+          "Normal"
+        ],
+        "moves": [
+          "Focus Blast",
+          "Hyper Voice",
+          "Poltergeist",
+          "Will-O-Wisp"
+        ]
+      }
+    }
+  }
+}

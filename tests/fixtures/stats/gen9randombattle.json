@@ -1,0 +1,886 @@
+{
+  "Abomasnow": {
+    "level": 84,
+    "abilities": {
+      "Snow Warning": 1
+    },
+    "items": {
+      "Light Clay": 1
+    },
+    "roles": {
+      "Bulky Support": {
+        "weight": 1,
+        "abilities": {
+          "Snow Warning": 1
+        },
+        "items": {
+          "Light Clay": 1
+        },
+        "teraTypes": {
+          "Ghost": 0.5211,
+          "Water": 0.4789
+        },
+        "moves": {
+          "Aurora Veil": 1,
+          "Blizzard": 1,
+          "Earthquake": 0.6828,
+          "Ice Shard": 0.6636,
+          "Wood Hammer": 0.6536
+        },
+        "evs": {
+          "hp": 77
+        }
+      }
+    },
+    "evs": {
+      "hp": 77
+    }
+  },
+  "Azumarill": {
+    "level": 82,
+    "abilities": {
+      "Huge Power": 1
+    },
+    "items": {
+      "Choice Band": 0.7476,
+      "Sitrus Berry": 0.2524
+    },
+    "roles": {
+      "Bulky Attacker": {
+        "weight": 1,
+        "abilities": {
+          "Huge Power": 1
+        },
+        "items": {
+          "Choice Band": 0.7476,
+          "Sitrus Berry": 0.2524
+        },
+        "teraTypes": {
+          "Water": 1
+        },
+        "moves": {
+          "Aqua Jet": 1,
+          "Liquidation": 1,
+          "Play Rough": 1,
+          "Superpower": 0.2538,
+          "Belly Drum": 0.2524,
+          "Ice Spinner": 0.2524,
+          "Knock Off": 0.2413
+        }
+      }
+    }
+  },
+  "Carbink": {
+    "level": 90,
+    "abilities": {
+      "Clear Body": 0.5055,
+      "Sturdy": 0.4945
+    },
+    "items": {
+      "Leftovers": 0.5157,
+      "Chesto Berry": 0.4843
+    },
+    "roles": {
+      "Fast Bulky Setup": {
+        "weight": 1,
+        "abilities": {
+          "Clear Body": 0.5055,
+          "Sturdy": 0.4945
+        },
+        "items": {
+          "Leftovers": 0.5157,
+          "Chesto Berry": 0.4843
+        },
+        "teraTypes": {
+          "Fighting": 1
+        },
+        "moves": {
+          "Body Press": 1,
+          "Iron Defense": 1,
+          "Moonblast": 1,
+          "Rock Polish": 0.5157,
+          "Rest": 0.4843
+        },
+        "evs": {
+          "atk": 0
+        },
+        "ivs": {
+          "atk": 0
+        }
+      }
+    },
+    "evs": {
+      "atk": 0
+    },
+    "ivs": {
+      "atk": 0
+    }
+  },
+  "Chandelure": {
+    "level": 83,
+    "abilities": {
+      "Flash Fire": 0.8232,
+      "Flame Body": 0.1768
+    },
+    "items": {
+      "Choice Scarf": 0.5064,
+      "Heavy-Duty Boots": 0.4214,
+      "Leftovers": 0.0722
+    },
+    "roles": {
+      "Fast Attacker": {
+        "weight": 0.5064,
+        "abilities": {
+          "Flash Fire": 1
+        },
+        "items": {
+          "Choice Scarf": 1
+        },
+        "teraTypes": {
+          "Ghost": 0.3596,
+          "Grass": 0.321,
+          "Fire": 0.3195
+        },
+        "moves": {
+          "Energy Ball": 1,
+          "Fire Blast": 1,
+          "Shadow Ball": 1,
+          "Trick": 1
+        },
+        "evs": {
+          "atk": 0
+        },
+        "ivs": {
+          "atk": 0
+        }
+      },
+      "Fast Bulky Setup": {
+        "weight": 0.4936,
+        "abilities": {
+          "Flash Fire": 0.6418,
+          "Flame Body": 0.3582
+        },
+        "items": {
+          "Heavy-Duty Boots": 0.8537,
+          "Leftovers": 0.1463
+        },
+        "teraTypes": {
+          "Ghost": 0.3704,
+          "Grass": 0.3232,
+          "Fire": 0.3064
+        },
+        "moves": {
+          "Calm Mind": 1,
+          "Fire Blast": 1,
+          "Shadow Ball": 1,
+          "Energy Ball": 0.4787,
+          "Will-O-Wisp": 0.1585,
+          "Substitute": 0.1463,
+          "Pain Split": 0.1143,
+          "Flame Charge": 0.1021
+        }
+      }
+    }
+  },
+  "Ditto": {
+    "level": 87,
+    "abilities": {
+      "Imposter": 1
+    },
+    "items": {
+      "Choice Scarf": 1
+    },
+    "roles": {
+      "Fast Support": {
+        "weight": 1,
+        "abilities": {
+          "Imposter": 1
+        },
+        "items": {
+          "Choice Scarf": 1
+        },
+        "teraTypes": {
+          "Ghost": 0.5066,
+          "Steel": 0.4934
+        },
+        "moves": {
+          "Transform": 1
+        }
+      }
+    }
+  },
+  "Gardevoir": {
+    "level": 83,
+    "abilities": {
+      "Trace": 1
+    },
+    "items": {
+      "Choice Scarf": 0.6287,
+      "Life Orb": 0.2729,
+      "Choice Specs": 0.0984
+    },
+    "roles": {
+      "Fast Attacker": {
+        "weight": 1,
+        "abilities": {
+          "Trace": 1
+        },
+        "items": {
+          "Choice Scarf": 0.6287,
+          "Life Orb": 0.2729,
+          "Choice Specs": 0.0984
+        },
+        "teraTypes": {
+          "Fairy": 0.3457,
+          "Fire": 0.3363,
+          "Fighting": 0.3181
+        },
+        "moves": {
+          "Moonblast": 1,
+          "Focus Blast": 0.5991,
+          "Mystical Fire": 0.595,
+          "Psyshock": 0.5108,
+          "Psychic": 0.4892,
+          "Trick": 0.2871,
+          "Calm Mind": 0.2729,
+          "Healing Wish": 0.246
+        },
+        "evs": {
+          "atk": 0
+        },
+        "ivs": {
+          "atk": 0
+        }
+      }
+    },
+    "evs": {
+      "atk": 0
+    },
+    "ivs": {
+      "atk": 0
+    }
+  },
+  "Great Tusk": {
+    "level": 77,
+    "abilities": {
+      "Protosynthesis": 1
+    },
+    "items": {
+      "Leftovers": 0.4588,
+      "Booster Energy": 0.2691,
+      "Assault Vest": 0.2463,
+      "Choice Scarf": 0.014,
+      "Choice Band": 0.0118
+    },
+    "roles": {
+      "Bulky Setup": {
+        "weight": 0.3713,
+        "abilities": {
+          "Protosynthesis": 1
+        },
+        "items": {
+          "Leftovers": 1
+        },
+        "teraTypes": {
+          "Steel": 0.5327,
+          "Ground": 0.4673
+        },
+        "moves": {
+          "Bulk Up": 1,
+          "Close Combat": 1,
+          "Earthquake": 1,
+          "Stone Edge": 0.5446,
+          "Rapid Spin": 0.4554
+        }
+      },
+      "Bulky Support": {
+        "weight": 0.3596,
+        "abilities": {
+          "Protosynthesis": 1
+        },
+        "items": {
+          "Assault Vest": 0.6851,
+          "Leftovers": 0.2434,
+          "Choice Scarf": 0.0389,
+          "Choice Band": 0.0327
+        },
+        "teraTypes": {
+          "Ground": 0.544,
+          "Steel": 0.456
+        },
+        "moves": {
+          "Close Combat": 1,
+          "Headlong Rush": 1,
+          "Rapid Spin": 0.8609,
+          "Ice Spinner": 0.3292,
+          "Stone Edge": 0.2945,
+          "Knock Off": 0.272,
+          "Stealth Rock": 0.2434
+        }
+      },
+      "Fast Bulky Setup": {
+        "weight": 0.2691,
+        "abilities": {
+          "Protosynthesis": 1
+        },
+        "items": {
+          "Booster Energy": 1
+        },
+        "teraTypes": {
+          "Steel": 0.5191,
+          "Ground": 0.4809
+        },
+        "moves": {
+          "Bulk Up": 1,
+          "Close Combat": 1,
+          "Earthquake": 1,
+          "Stone Edge": 0.5847,
+          "Rapid Spin": 0.4153
+        }
+      }
+    }
+  },
+  "Iron Hands": {
+    "level": 79,
+    "abilities": {
+      "Quark Drive": 1
+    },
+    "items": {
+      "Assault Vest": 0.5044,
+      "Leftovers": 0.4956
+    },
+    "roles": {
+      "AV Pivot": {
+        "weight": 0.5044,
+        "abilities": {
+          "Quark Drive": 1
+        },
+        "items": {
+          "Assault Vest": 1
+        },
+        "teraTypes": {
+          "Fighting": 0.5073,
+          "Electric": 0.4927
+        },
+        "moves": {
+          "Volt Switch": 1,
+          "Wild Charge": 0.5291,
+          "Close Combat": 0.5276,
+          "Drain Punch": 0.4724,
+          "Thunder Punch": 0.4709,
+          "Ice Punch": 0.3794,
+          "Fake Out": 0.3154,
+          "Heavy Slam": 0.3052
+        }
+      },
+      "Bulky Attacker": {
+        "weight": 0.4956,
+        "abilities": {
+          "Quark Drive": 1
+        },
+        "items": {
+          "Leftovers": 1
+        },
+        "teraTypes": {
+          "Fighting": 0.355,
+          "Steel": 0.324,
+          "Flying": 0.321
+        },
+        "moves": {
+          "Drain Punch": 1,
+          "Ice Punch": 1,
+          "Swords Dance": 1,
+          "Thunder Punch": 0.5148,
+          "Wild Charge": 0.4852
+        }
+      }
+    }
+  },
+  "Ninetales": {
+    "level": 85,
+    "abilities": {
+      "Drought": 1
+    },
+    "items": {
+      "Heavy-Duty Boots": 1
+    },
+    "roles": {
+      "Setup Sweeper": {
+        "weight": 1,
+        "abilities": {
+          "Drought": 1
+        },
+        "items": {
+          "Heavy-Duty Boots": 1
+        },
+        "teraTypes": {
+          "Grass": 0.5049,
+          "Fire": 0.4951
+        },
+        "moves": {
+          "Fire Blast": 1,
+          "Nasty Plot": 1,
+          "Scorching Sands": 1,
+          "Solar Beam": 1
+        },
+        "evs": {
+          "atk": 0
+        },
+        "ivs": {
+          "atk": 0
+        }
+      }
+    },
+    "evs": {
+      "atk": 0
+    },
+    "ivs": {
+      "atk": 0
+    }
+  },
+  "Ninetales-Alola": {
+    "level": 78,
+    "abilities": {
+      "Snow Warning": 1
+    },
+    "items": {
+      "Light Clay": 1
+    },
+    "roles": {
+      "Fast Support": {
+        "weight": 0.5048,
+        "abilities": {
+          "Snow Warning": 1
+        },
+        "items": {
+          "Light Clay": 1
+        },
+        "teraTypes": {
+          "Steel": 0.5219,
+          "Water": 0.4781
+        },
+        "moves": {
+          "Aurora Veil": 1,
+          "Blizzard": 1,
+          "Moonblast": 1,
+          "Nasty Plot": 0.5191,
+          "Encore": 0.4809
+        },
+        "evs": {
+          "atk": 0
+        },
+        "ivs": {
+          "atk": 0
+        }
+      },
+      "Fast Attacker": {
+        "weight": 0.4952,
+        "abilities": {
+          "Snow Warning": 1
+        },
+        "items": {
+          "Light Clay": 1
+        },
+        "teraTypes": {
+          "Steel": 0.507,
+          "Water": 0.493
+        },
+        "moves": {
+          "Aurora Veil": 1,
+          "Blizzard": 1,
+          "Freeze-Dry": 1,
+          "Moonblast": 1
+        },
+        "evs": {
+          "atk": 0
+        },
+        "ivs": {
+          "atk": 0
+        }
+      }
+    },
+    "evs": {
+      "atk": 0
+    },
+    "ivs": {
+      "atk": 0
+    }
+  },
+  "Ogerpon": {
+    "level": 80,
+    "abilities": {
+      "Defiant": 1
+    },
+    "items": {
+      "Life Orb": 0.5761,
+      "Heavy-Duty Boots": 0.2111,
+      "Leftovers": 0.18,
+      "Choice Band": 0.0327
+    },
+    "roles": {
+      "Setup Sweeper": {
+        "weight": 0.5106,
+        "abilities": {
+          "Defiant": 1
+        },
+        "items": {
+          "Life Orb": 1
+        },
+        "teraTypes": {
+          "Grass": 1
+        },
+        "moves": {
+          "Ivy Cudgel": 1,
+          "Knock Off": 1,
+          "Superpower": 1,
+          "Swords Dance": 1
+        }
+      },
+      "Fast Support": {
+        "weight": 0.4894,
+        "abilities": {
+          "Defiant": 1
+        },
+        "items": {
+          "Heavy-Duty Boots": 0.4314,
+          "Leftovers": 0.3679,
+          "Life Orb": 0.1338,
+          "Choice Band": 0.0669
+        },
+        "teraTypes": {
+          "Grass": 1
+        },
+        "moves": {
+          "Ivy Cudgel": 1,
+          "Knock Off": 0.5686,
+          "Synthesis": 0.5318,
+          "U-turn": 0.4983,
+          "Encore": 0.4883,
+          "Spikes": 0.4749,
+          "Superpower": 0.4381
+        }
+      }
+    }
+  },
+  "Ogerpon-Cornerstone": {
+    "level": 76,
+    "abilities": {
+      "Sturdy": 1
+    },
+    "items": {
+      "Cornerstone Mask": 1
+    },
+    "roles": {
+      "Setup Sweeper": {
+        "weight": 0.5022,
+        "abilities": {
+          "Sturdy": 1
+        },
+        "items": {
+          "Cornerstone Mask": 1
+        },
+        "teraTypes": {
+          "Rock": 1
+        },
+        "moves": {
+          "Ivy Cudgel": 1,
+          "Superpower": 1,
+          "Swords Dance": 1,
+          "Horn Leech": 0.5203,
+          "Power Whip": 0.4797
+        }
+      },
+      "Bulky Attacker": {
+        "weight": 0.4978,
+        "abilities": {
+          "Sturdy": 1
+        },
+        "items": {
+          "Cornerstone Mask": 1
+        },
+        "teraTypes": {
+          "Rock": 1
+        },
+        "moves": {
+          "Ivy Cudgel": 1,
+          "Power Whip": 1,
+          "Synthesis": 1,
+          "Superpower": 0.3548,
+          "Spikes": 0.3255,
+          "Encore": 0.3196
+        }
+      }
+    }
+  },
+  "Ogerpon-Hearthflame": {
+    "level": 74,
+    "abilities": {
+      "Mold Breaker": 1
+    },
+    "items": {
+      "Hearthflame Mask": 1
+    },
+    "roles": {
+      "Setup Sweeper": {
+        "weight": 1,
+        "abilities": {
+          "Mold Breaker": 1
+        },
+        "items": {
+          "Hearthflame Mask": 1
+        },
+        "teraTypes": {
+          "Fire": 1
+        },
+        "moves": {
+          "Ivy Cudgel": 1,
+          "Swords Dance": 1,
+          "Horn Leech": 0.5088,
+          "Power Whip": 0.4912,
+          "Knock Off": 0.3397,
+          "Stomping Tantrum": 0.3317,
+          "Trailblaze": 0.3285
+        },
+        "evs": {
+          "hp": 77
+        }
+      }
+    },
+    "evs": {
+      "hp": 77
+    }
+  },
+  "Ogerpon-Wellspring": {
+    "level": 76,
+    "abilities": {
+      "Water Absorb": 1
+    },
+    "items": {
+      "Wellspring Mask": 1
+    },
+    "roles": {
+      "Setup Sweeper": {
+        "weight": 0.507,
+        "abilities": {
+          "Water Absorb": 1
+        },
+        "items": {
+          "Wellspring Mask": 1
+        },
+        "teraTypes": {
+          "Water": 1
+        },
+        "moves": {
+          "Ivy Cudgel": 1,
+          "Swords Dance": 1,
+          "Horn Leech": 0.558,
+          "Knock Off": 0.5138,
+          "Play Rough": 0.4862,
+          "Power Whip": 0.442
+        }
+      },
+      "Bulky Attacker": {
+        "weight": 0.493,
+        "abilities": {
+          "Water Absorb": 1
+        },
+        "items": {
+          "Wellspring Mask": 1
+        },
+        "teraTypes": {
+          "Water": 1
+        },
+        "moves": {
+          "Ivy Cudgel": 1,
+          "Synthesis": 1,
+          "Wood Hammer": 1,
+          "Encore": 0.3693,
+          "U-turn": 0.3295,
+          "Spikes": 0.3011
+        }
+      }
+    }
+  },
+  "Palafin": {
+    "level": 77,
+    "abilities": {
+      "Zero to Hero": 1
+    },
+    "items": {
+      "Leftovers": 0.5041,
+      "Choice Band": 0.4959
+    },
+    "roles": {
+      "Bulky Setup": {
+        "weight": 0.5041,
+        "abilities": {
+          "Zero to Hero": 1
+        },
+        "items": {
+          "Leftovers": 1
+        },
+        "teraTypes": {
+          "Steel": 0.5128,
+          "Dragon": 0.4872
+        },
+        "moves": {
+          "Bulk Up": 1,
+          "Jet Punch": 1,
+          "Ice Punch": 0.7544,
+          "Drain Punch": 0.7463,
+          "Wave Crash": 0.4993
+        }
+      },
+      "Wallbreaker": {
+        "weight": 0.4959,
+        "abilities": {
+          "Zero to Hero": 1
+        },
+        "items": {
+          "Choice Band": 1
+        },
+        "teraTypes": {
+          "Water": 0.5102,
+          "Fighting": 0.4898
+        },
+        "moves": {
+          "Close Combat": 1,
+          "Flip Turn": 1,
+          "Jet Punch": 1,
+          "Wave Crash": 1
+        }
+      }
+    }
+  },
+  "Urshifu": {
+    "level": 74,
+    "abilities": {
+      "Unseen Fist": 1
+    },
+    "items": {
+      "Choice Band": 0.5224,
+      "Life Orb": 0.361,
+      "Choice Scarf": 0.1166
+    },
+    "roles": {
+      "Fast Attacker": {
+        "weight": 1,
+        "abilities": {
+          "Unseen Fist": 1
+        },
+        "items": {
+          "Choice Band": 0.5224,
+          "Life Orb": 0.361,
+          "Choice Scarf": 0.1166
+        },
+        "teraTypes": {
+          "Dark": 0.3466,
+          "Poison": 0.3323,
+          "Fighting": 0.3211
+        },
+        "moves": {
+          "Close Combat": 1,
+          "Wicked Blow": 1,
+          "Poison Jab": 0.738,
+          "Sucker Punch": 0.5192,
+          "U-turn": 0.3818,
+          "Swords Dance": 0.361
+        }
+      }
+    }
+  },
+  "Urshifu-Rapid-Strike": {
+    "level": 75,
+    "abilities": {
+      "Unseen Fist": 1
+    },
+    "items": {
+      "Choice Band": 0.4793,
+      "Life Orb": 0.4051,
+      "Choice Scarf": 0.1155
+    },
+    "roles": {
+      "Fast Attacker": {
+        "weight": 1,
+        "abilities": {
+          "Unseen Fist": 1
+        },
+        "items": {
+          "Choice Band": 0.4793,
+          "Life Orb": 0.4051,
+          "Choice Scarf": 0.1155
+        },
+        "teraTypes": {
+          "Water": 1
+        },
+        "moves": {
+          "Close Combat": 1,
+          "Surging Strikes": 1,
+          "Aqua Jet": 0.5692,
+          "Ice Spinner": 0.5678,
+          "U-turn": 0.4579,
+          "Swords Dance": 0.4051
+        }
+      }
+    }
+  },
+  "Zoroark": {
+    "level": 83,
+    "abilities": {
+      "Illusion": 1
+    },
+    "items": {
+      "Life Orb": 0.5183,
+      "Choice Specs": 0.4817
+    },
+    "roles": {
+      "Setup Sweeper": {
+        "weight": 0.5183,
+        "abilities": {
+          "Illusion": 1
+        },
+        "items": {
+          "Life Orb": 1
+        },
+        "teraTypes": {
+          "Poison": 1
+        },
+        "moves": {
+          "Dark Pulse": 1,
+          "Nasty Plot": 1,
+          "Sludge Bomb": 1,
+          "Encore": 0.3365,
+          "Psychic": 0.3365,
+          "Focus Blast": 0.3269
+        },
+        "evs": {
+          "atk": 0
+        },
+        "ivs": {
+          "atk": 0
+        }
+      },
+      "Wallbreaker": {
+        "weight": 0.4817,
+        "abilities": {
+          "Illusion": 1
+        },
+        "items": {
+          "Choice Specs": 1
+        },
+        "teraTypes": {
+          "Poison": 1
+        },
+        "moves": {
+          "Dark Pulse": 1,
+          "Sludge Bomb": 1,
+          "Psychic": 0.4414,
+          "Flamethrower": 0.4345,
+          "Focus Blast": 0.4241,
+          "U-turn": 0.3552,
+          "Trick": 0.3448
+        }
+      }
+    }
+  }
+}
