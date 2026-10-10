@@ -3,7 +3,9 @@ name = "showdown-bot"
 version = "0.1.0"
 description = "Add your description here"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "poke-env>=0.16.1",
+]
 
 [project.scripts]
 showdown-bot = "showdown_bot:main"
@@ -11,3 +13,26 @@ showdown-bot = "showdown_bot:main"
 [build-system]
 requires = ["uv_build>=0.13.0,<0.14.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+addopts = "-p no:cacheprovider"
+testpaths = ["tests"]
+norecursedirs = [
+    ".*",
+    "build",
+    "dist",
+    "CVS",
+    "_darcs",
+    "{arch}",
+    "*.egg",
+    "venv",
+    "node_modules",
+    "vendor",
+    "__pycache__",
+    "pytest-cache-files-*",
+]
