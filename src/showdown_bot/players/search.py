@@ -28,6 +28,9 @@ only poke-env options), these environment variables:
     SHOWDOWN_SEARCH_WORLDS       fixed world count (default 2 x parallelism, 4x early)
     SHOWDOWN_SEARCH_THREADS      engine threads per world (default 1)
     SHOWDOWN_SEARCH_MODE         "mixed" (default) or "argmax"
+    SHOWDOWN_SEARCH_EVALUATOR    path to a learned .pev leaf evaluator (default: the
+                                 stock hand-written evaluation); see docs/training.md.
+                                 Each pool worker loads it once and reuses it.
     SHOWDOWN_RECORD_DIR          record every searched decision here (default: off;
                                  see showdown_bot.recorder / docs/selfplay-data.md)
 
@@ -40,6 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import dataclasses
 import logging
 import os
 import random
@@ -70,6 +74,7 @@ _DEFAULT_CACHE_DIR = _REPO_ROOT / ".cache" / "randbats"
 MIXED = "mixed"
 ARGMAX = "argmax"
 MIXED_THRESHOLD = 0.75
+EVALUATOR_ENV = "SHOWDOWN_SEARCH_EVALUATOR"
 
 
 def _env_int(name: str, default: int | None) -> int | None:
@@ -97,6 +102,7 @@ class SearchConfig:
     threads: int = 1
     mode: str = MIXED
     mixed_threshold: float = MIXED_THRESHOLD
+    evaluator: str | None = None  # path of a .pev file; None: stock evaluation
 
     @classmethod
     def from_env(cls) -> SearchConfig:
@@ -110,6 +116,7 @@ class SearchConfig:
             worlds=_env_int("SHOWDOWN_SEARCH_WORLDS", None),
             threads=_env_int("SHOWDOWN_SEARCH_THREADS", 1) or 1,
             mode=mode,
+            evaluator=(os.environ.get(EVALUATOR_ENV, "").strip() or None),
         )
 
     def plan(self, early: bool) -> tuple[int, int]:
@@ -130,6 +137,7 @@ class SearchStats:
     worlds_run: int = 0
     world_errors: int = 0
     iterations: int = 0
+    search_ms: int = 0  # sum over searched worlds of the per-world time budget
     unknown_ids: int = 0
     fallback_reasons: Counter = field(default_factory=Counter)
 
@@ -153,7 +161,7 @@ def total_stats() -> SearchStats:
     for stats in _ALL_STATS:
         for name in (
             "decisions", "searched", "forced", "fallbacks", "worlds_run",
-            "world_errors", "iterations", "unknown_ids",
+            "world_errors", "iterations", "search_ms", "unknown_ids",
         ):
             setattr(total, name, getattr(total, name) + getattr(stats, name))
         total.fallback_reasons.update(stats.fallback_reasons)
@@ -287,6 +295,7 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         executor: Executor | None = None,
         seed: int | None = None,
         recorder: GameRecorder | None = None,
+        evaluator: str | os.PathLike[str] | None = None,
         **kwargs: Any,
     ):
         data = data or (opponent_model.data if opponent_model else default_randbats_data())
@@ -301,6 +310,15 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         )
         self.data = data
         self.config = config or SearchConfig.from_env()
+        if evaluator is not None:
+            self.config = dataclasses.replace(self.config, evaluator=str(Path(evaluator).resolve()))
+        if self.config.evaluator is not None:
+            # Fail here rather than as a fallback on every decision.
+            if not Path(self.config.evaluator).is_file():
+                raise FileNotFoundError(f"evaluator file not found: {self.config.evaluator}")
+            self.config = dataclasses.replace(
+                self.config, evaluator=str(Path(self.config.evaluator).resolve())
+            )
         self.stats = SearchStats()
         _ALL_STATS.append(self.stats)
         self._executor = executor
@@ -426,7 +444,8 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         self._paired = []
         futures = [
             loop.run_in_executor(
-                executor, _worker.search_world, state, time_ms, self.config.threads
+                executor, _worker.search_world, state, time_ms, self.config.threads,
+                self.config.evaluator,
             )
             for state in state_strings
         ]
@@ -459,6 +478,7 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
                 continue
             self.stats.worlds_run += 1
             self.stats.iterations += outcome[0]
+            self.stats.search_ms += time_ms
             results.append(outcome)
             if self._recorder is not None:
                 self._paired.append((state_strings[index], outcome))
@@ -542,3 +562,19 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             )
         except Exception:
             logger.exception("Could not write game record for %s", battle.battle_tag)
+
+
+class SearchNetPlayer(SearchPlayer):
+    """SearchPlayer whose leaves are scored by a learned ``.pev`` evaluator.
+
+    The path comes from the ``evaluator=`` argument, ``config.evaluator`` or
+    ``SHOWDOWN_SEARCH_EVALUATOR``; one of them is required (this is the bench
+    ``search-net`` player).
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        if self.config.evaluator is None:
+            raise ValueError(
+                f"search-net needs an evaluator: pass evaluator=<path.pev> or set {EVALUATOR_ENV}"
+            )

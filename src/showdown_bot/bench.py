@@ -23,7 +23,7 @@ from poke_env.player import (
 )
 from poke_env.ps_client import AccountConfiguration, LocalhostServerConfiguration
 
-from showdown_bot.players.search import SearchPlayer
+from showdown_bot.players.search import SearchNetPlayer, SearchPlayer
 
 
 # Add new player classes here as additional bot implementations become available.
@@ -32,6 +32,10 @@ PLAYER_REGISTRY: dict[str, type[Player]] = {
     "maxpower": MaxBasePowerPlayer,
     "heuristics": SimpleHeuristicsPlayer,
     "search": SearchPlayer,
+    # Needs SHOWDOWN_SEARCH_EVALUATOR=<path.pev>. The env var is process-wide, so
+    # "search" in the same process would load it too; use scripts/duel.py for
+    # search-net vs search (per-player config).
+    "search-net": SearchNetPlayer,
 }
 
 # "foulplay" is a special opponent name: it is not a poke-env Player subclass.

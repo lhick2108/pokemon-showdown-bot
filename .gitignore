@@ -22,3 +22,6 @@ engine/target/
 
 # Self-play recordings (large, regenerable)
 data/
+
+# Trained value nets (.pev)
+models/

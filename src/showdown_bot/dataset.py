@@ -40,6 +40,7 @@ class Sample:
     side: int  # 1 or 2: whose perspective the features/value use
     battle_tag: str
     turn: int | None
+    state: str | None = None  # the engine State string the features were computed from
 
     def as_tuple(self) -> tuple[list[float], float, dict[str, float] | None]:
         return self.features, self.value, self.policy
@@ -109,6 +110,7 @@ def iter_samples(
                         side=side,
                         battle_tag=tag,
                         turn=decision.get("turn"),
+                        state=state_string,
                     )
 
 

@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-pytest.importorskip("poke_engine")
+pe = pytest.importorskip("poke_engine")
 
 from battle_helpers import event, make_battle, opp_switch, request_for  # noqa: E402
 
@@ -202,3 +202,89 @@ def test_fallback_when_policy_has_no_legal_choice(player, monkeypatch):
     assert order.message in _legal(battle)
     assert player.stats.fallbacks == 1
     assert player.stats.fallback_reasons["no-order"] == 1
+
+
+# -- learned evaluator wiring -------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def pev_path(tmp_path_factory):
+    path = tmp_path_factory.mktemp("pev") / "lin.pev"
+    pe = pytest.importorskip("poke_engine")
+    pe.write_linear(str(path), [0.0] * pe.FEATURE_LENGTH, 0.0)
+    return path
+
+
+def _spy_player(data, **kwargs):
+    calls = []
+
+    class Spy(ThreadPoolExecutor):
+        def submit(self, fn, *args, **kw):
+            calls.append(args)
+            return super().submit(fn, *args, **kw)
+
+    pool = Spy(max_workers=2)
+    cls = kwargs.pop("cls", SearchPlayer)
+    p = cls(
+        battle_format="gen9randombattle", start_listening=False, log_level=50, data=data,
+        executor=pool, seed=1, **kwargs,
+    )
+    return p, calls, pool
+
+
+def test_no_evaluator_passes_none_to_worker(data):
+    p, calls, pool = _spy_player(data, config=SearchConfig(search_time_ms=20))
+    asyncio.run(p.choose_move(_battle()))
+    pool.shutdown()
+    assert calls and all(args[-1] is None for args in calls)
+    assert p.config.evaluator is None
+
+
+def test_evaluator_path_reaches_worker(data, pev_path):
+    p, calls, pool = _spy_player(
+        data, config=SearchConfig(search_time_ms=20), evaluator=pev_path
+    )
+    order = asyncio.run(p.choose_move(_battle()))
+    pool.shutdown()
+    assert order.message in _legal(_battle())
+    assert p.stats.fallbacks == 0 and p.stats.world_errors == 0
+    assert calls and all(args[-1] == str(pev_path.resolve()) for args in calls)
+
+
+def test_evaluator_env_var_and_search_net_requirement(data, pev_path, monkeypatch):
+    monkeypatch.setenv("SHOWDOWN_SEARCH_EVALUATOR", str(pev_path))
+    p, _, pool = _spy_player(data, cls=search_module.SearchNetPlayer)
+    pool.shutdown()
+    assert p.config.evaluator == str(pev_path.resolve())
+    monkeypatch.delenv("SHOWDOWN_SEARCH_EVALUATOR")
+    with pytest.raises(ValueError):
+        _spy_player(data, cls=search_module.SearchNetPlayer)
+    with pytest.raises(FileNotFoundError):
+        _spy_player(data, evaluator=pev_path.parent / "missing.pev")
+
+
+def test_bench_registers_search_net():
+    from showdown_bot import bench
+
+    assert bench.get_player_class("search-net") is search_module.SearchNetPlayer
+
+
+def test_worker_loads_evaluator_once_per_process(tmp_path):
+    from concurrent.futures import ProcessPoolExecutor
+
+    from showdown_bot.players import _worker
+
+    pev_path = tmp_path / "fresh.pev"  # a path no earlier test has cached
+    pe.write_linear(str(pev_path), [0.0] * pe.FEATURE_LENGTH, 0.0)
+
+    state = pe.State().to_string()
+    # in this process
+    before = _worker.evaluator_loads()
+    for _ in range(3):
+        _worker.search_world(state, 10, 1, str(pev_path))
+    assert _worker.evaluator_loads() - before == 1
+    # in a real pool worker
+    with ProcessPoolExecutor(max_workers=1) as pool:
+        for _ in range(4):
+            pool.submit(_worker.search_world, state, 10, 1, str(pev_path)).result()
+        assert pool.submit(_worker.evaluator_loads).result() == 1
