@@ -21,7 +21,7 @@ from poke_env.player import (
     RandomPlayer,
     SimpleHeuristicsPlayer,
 )
-from poke_env.ps_client import LocalhostServerConfiguration
+from poke_env.ps_client import AccountConfiguration, LocalhostServerConfiguration
 
 from showdown_bot.players.search import SearchPlayer
 
@@ -41,8 +41,16 @@ PLAYER_REGISTRY: dict[str, type[Player]] = {
 FOULPLAY_NAME = "foulplay"
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-FOULPLAY_DIR = REPO_ROOT / "vendor" / "foul-play"
-FOULPLAY_LOG_DIR = REPO_ROOT / ".cache" / "bench-logs"
+# Both locations can be overridden (e.g. when running from a git worktree that
+# lacks the main checkout's vendor/ and .cache/ directories).
+FOULPLAY_DIR = Path(
+    os.environ.get("SHOWDOWN_BOT_FOULPLAY_DIR")
+    or REPO_ROOT / "vendor" / "foul-play"
+)
+FOULPLAY_LOG_DIR = Path(
+    os.environ.get("SHOWDOWN_BOT_BENCH_LOG_DIR")
+    or REPO_ROOT / ".cache" / "bench-logs"
+)
 
 
 def get_player_class(name: str) -> type[Player]:
@@ -144,6 +152,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Foul Play --search-parallelism (states searched in parallel)",
     )
     parser.add_argument(
+        "--fp-instances",
+        type=_positive_int,
+        default=1,
+        help=(
+            "Number of Foul Play subprocesses (each paired with its own bot "
+            "instance) playing in parallel; n games are split across them"
+        ),
+    )
+    parser.add_argument(
         "--fp-threads",
         type=_positive_int,
         default=1,
@@ -188,20 +205,47 @@ async def _wait_for_player_logins(players: Sequence[Player], timeout: float) -> 
         ) from exc
 
 
+async def _cancel_listener_task(ps_client, timeout: float) -> None:
+    """Cancel and await the real ``listen`` task running on ``ps_client.loop``.
+
+    ``ps_client._listening_coroutine`` is only a concurrent.futures.Future proxy
+    from run_coroutine_threadsafe: cancelling it does not wait for the actual
+    task on the client's loop. So the task is looked up on that loop, cancelled
+    and awaited there, and the wait is bounded by ``timeout`` on this side.
+    """
+
+    async def cancel_on_client_loop() -> None:
+        current = asyncio.current_task()
+        tasks = []
+        for task in asyncio.all_tasks():
+            if task is current:
+                continue
+            coro = task.get_coro()
+            frame = getattr(coro, "cr_frame", None)
+            if (
+                getattr(getattr(coro, "cr_code", None), "co_name", None) == "listen"
+                and frame is not None
+                and frame.f_locals.get("self") is ps_client
+            ):
+                tasks.append(task)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    future = asyncio.run_coroutine_threadsafe(
+        cancel_on_client_loop(), ps_client.loop
+    )
+    await asyncio.wait_for(asyncio.wrap_future(future), timeout=timeout)
+
+
 async def _disconnect_player(player: Player) -> None:
     try:
         ps_client = player.ps_client
         if hasattr(ps_client, "websocket"):
             await asyncio.wait_for(ps_client.stop_listening(), timeout=2)
         else:
-            listener = ps_client._listening_coroutine
-            listener.cancel()
-            await asyncio.wait_for(
-                asyncio.gather(
-                    asyncio.wrap_future(listener), return_exceptions=True
-                ),
-                timeout=0.5,
-            )
+            # Never connected: listen() is still pending in the handshake.
+            await _cancel_listener_task(ps_client, timeout=2)
     except Exception:
         # Cleanup errors must not replace a battle failure or timeout.
         pass
@@ -455,6 +499,67 @@ async def _wait_for_foulplay_ready(
         await asyncio.sleep(0.2)
 
 
+def split_games(n: int, instances: int) -> list[int]:
+    """Split n games across instances as evenly as possible (no empty shares)."""
+    instances = max(1, min(instances, n))
+    base, extra = divmod(n, instances)
+    return [base + (1 if i < extra else 0) for i in range(instances)]
+
+
+def _player_workers(player_name: str) -> int:
+    """CPU workers one instance of our own player uses (1 unless it declares more)."""
+    if player_name == FOULPLAY_NAME:
+        return 0
+    return int(getattr(get_player_class(player_name), "search_workers", 1))
+
+
+def compute_cores(
+    p1_name: str,
+    p2_name: str,
+    fp_instances: int,
+    fp_parallelism: int,
+    fp_threads: int,
+) -> tuple[int, int]:
+    """Return (foul_play_cores, our_cores) requested by a Foul Play benchmark."""
+    bot_name = p2_name if p1_name == FOULPLAY_NAME else p1_name
+    return (
+        fp_instances * fp_parallelism * fp_threads,
+        fp_instances * _player_workers(bot_name),
+    )
+
+
+def fairness_report(
+    p1_name: str,
+    p2_name: str,
+    fp_instances: int,
+    fp_parallelism: int,
+    fp_threads: int,
+    cpu_count: int | None = None,
+) -> tuple[list[str], str | None]:
+    """Return (info lines, optional WARNING) about cores used per side."""
+    fp_cores, our_cores = compute_cores(
+        p1_name, p2_name, fp_instances, fp_parallelism, fp_threads
+    )
+    bot_name = p2_name if p1_name == FOULPLAY_NAME else p1_name
+    available = cpu_count if cpu_count is not None else os.cpu_count()
+    lines = [
+        f"cores used: {FOULPLAY_NAME}={fp_cores} "
+        f"({fp_instances} instances x {fp_parallelism} parallelism "
+        f"x {fp_threads} threads); "
+        f"{bot_name}={our_cores} ({fp_instances} instances x "
+        f"{_player_workers(bot_name)} workers)"
+    ]
+    warning = None
+    total = fp_cores + our_cores
+    if available is not None and total > available:
+        warning = (
+            f"WARNING: requested compute ({total} cores: {FOULPLAY_NAME}="
+            f"{fp_cores}, {bot_name}={our_cores}) exceeds os.cpu_count()="
+            f"{available}; CPU contention will skew an equal-compute comparison"
+        )
+    return lines, warning
+
+
 async def _play_against_foulplay(
     p1_name: str,
     p2_name: str,
@@ -465,8 +570,54 @@ async def _play_against_foulplay(
     fp_parallelism: int,
     fp_threads: int,
     game_timeout: float = 900.0,
+    fp_instances: int = 1,
 ) -> int:
-    """Play n battles between a poke-env bot and a Foul Play subprocess.
+    """Play n battles against Foul Play using fp_instances parallel pairs.
+
+    Each pair is one Foul Play subprocess plus one bot instance, playing its
+    share of n sequentially. Returns p1's total win count over all n games.
+    If any pair fails, the others are cancelled and every instance is cleaned up.
+    """
+    shares = split_games(n, fp_instances)
+    tasks = [
+        asyncio.ensure_future(
+            _play_foulplay_pair(
+                p1_name,
+                p2_name,
+                share,
+                battle_format,
+                connect_timeout,
+                fp_search_time_ms,
+                fp_parallelism,
+                fp_threads,
+                game_timeout,
+            )
+        )
+        for share in shares
+    ]
+    try:
+        await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        # Let each pair's finally block terminate its subprocess and bot.
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+    return sum(task.result() for task in tasks)
+
+
+async def _play_foulplay_pair(
+    p1_name: str,
+    p2_name: str,
+    n: int,
+    battle_format: str,
+    connect_timeout: float,
+    fp_search_time_ms: int,
+    fp_parallelism: int,
+    fp_threads: int,
+    game_timeout: float = 900.0,
+) -> int:
+    """Play n battles between a poke-env bot and one Foul Play subprocess.
 
     Foul Play runs in accept_challenge mode and plays one battle at a time,
     so the poke-env bot challenges it sequentially. Returns p1's win count.
@@ -494,6 +645,11 @@ async def _play_against_foulplay(
             "battle_format": battle_format,
             # Foul Play plays one battle at a time in accept_challenge mode.
             "max_concurrent_battles": 1,
+            # poke-env's default names ("<Class> 1") collide across instances
+            # and processes on the shared server, so each bot gets its own.
+            "account_configuration": AccountConfiguration(
+                "bt" + secrets.token_hex(4), None
+            ),
             "server_configuration": LocalhostServerConfiguration,
             "log_level": logging.ERROR,
             "open_timeout": connect_timeout,
@@ -555,6 +711,7 @@ async def _play_battles(
     fp_parallelism: int = 1,
     fp_threads: int = 1,
     game_timeout: float = 900.0,
+    fp_instances: int = 1,
 ) -> int:
     p1_is_fp = p1_name == FOULPLAY_NAME
     p2_is_fp = p2_name == FOULPLAY_NAME
@@ -571,6 +728,7 @@ async def _play_battles(
             fp_parallelism,
             fp_threads,
             game_timeout,
+            fp_instances,
         )
 
     player_options = {
@@ -627,6 +785,7 @@ async def run_benchmark(
     fp_parallelism: int = 1,
     fp_threads: int = 1,
     game_timeout: float = 900.0,
+    fp_instances: int = 1,
 ) -> int:
     """Play N local battles and return player one's win count."""
     try:
@@ -641,6 +800,7 @@ async def run_benchmark(
             fp_parallelism,
             fp_threads,
             game_timeout,
+            fp_instances,
         )
     except Exception as exc:
         raise RuntimeError(f"Battle run failed: {exc}") from exc
@@ -648,6 +808,18 @@ async def run_benchmark(
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    if (args.p1 == FOULPLAY_NAME) != (args.p2 == FOULPLAY_NAME):
+        lines, warning = fairness_report(
+            args.p1,
+            args.p2,
+            min(args.fp_instances, args.n),
+            args.fp_parallelism,
+            args.fp_threads,
+        )
+        for line in lines:
+            print(line)
+        if warning:
+            print(warning, file=sys.stderr)
     try:
         wins = asyncio.run(
             asyncio.wait_for(
@@ -662,6 +834,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     fp_parallelism=args.fp_parallelism,
                     fp_threads=args.fp_threads,
                     game_timeout=args.game_timeout,
+                    fp_instances=args.fp_instances,
                 ),
                 timeout=args.timeout,
             )

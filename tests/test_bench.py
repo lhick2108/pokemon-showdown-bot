@@ -182,6 +182,67 @@ def test_main_stops_pending_listener_when_connection_never_completes(monkeypatch
         assert not pending.result(timeout=1)
 
 
+def test_disconnect_awaits_listener_stuck_in_handshake(monkeypatch):
+    """The real listen task must be cancelled AND awaited, not just its proxy.
+
+    A fake server accepts the TCP connection but never answers the websocket
+    handshake, so listen() is genuinely pending. Cancellation is made slow to
+    finish, so a cleanup that merely cancels the concurrent.futures proxy
+    returns before the listen task has actually ended.
+    """
+    from poke_env.ps_client import PSClient
+
+    finished = []
+    original_listen = PSClient.listen
+
+    async def listen(self):
+        try:
+            await original_listen(self)
+        finally:
+            await asyncio.sleep(0.3)
+            finished.append(self)
+
+    monkeypatch.setattr(PSClient, "listen", listen)  # keeps co_name == "listen"
+
+    async def scenario():
+        held = []
+
+        async def accept_and_stall(reader, writer):
+            held.append(writer)  # accept, read nothing, never reply
+
+        server = await asyncio.start_server(accept_and_stall, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        try:
+            player = RandomPlayer(
+                server_configuration=ServerConfiguration(
+                    websocket_url=f"ws://127.0.0.1:{port}/showdown/websocket",
+                    authentication_url="http://127.0.0.1/",
+                ),
+                log_level=50,
+                open_timeout=30,
+            )
+            player.ps_client.logger.disabled = True
+            for _ in range(100):  # wait until the server really accepted
+                if held:
+                    break
+                await asyncio.sleep(0.05)
+            assert held, "listen() never connected to the fake server"
+            assert not player.ps_client._listening_coroutine.done()
+            assert not hasattr(player.ps_client, "websocket")
+
+            await bench._disconnect_player(player)
+
+            return player, list(finished)
+        finally:
+            for writer in held:
+                writer.close()
+            server.close()
+
+    player, finished_at_return = asyncio.run(scenario())
+    assert finished_at_return == [player.ps_client]
+    assert player.ps_client._listening_coroutine.done()
+
+
 # --- Foul Play opponent: CLI/option parsing ---------------------------------
 
 
@@ -697,3 +758,157 @@ def test_game_exceeding_game_timeout_fails_clearly_and_cleans_up(
     asyncio.run(run())
 
     assert terminate_calls == [(process, log_file)]
+
+
+# --- Parallel Foul Play instances (--fp-instances) --------------------------
+
+
+@pytest.mark.parametrize(
+    ("n", "k", "expected"),
+    [
+        (40, 4, [10, 10, 10, 10]),
+        (10, 3, [4, 3, 3]),
+        (7, 4, [2, 2, 2, 1]),
+        (3, 5, [1, 1, 1]),
+        (5, 1, [5]),
+    ],
+)
+def test_split_games_distributes_n_across_instances(n, k, expected):
+    shares = bench.split_games(n, k)
+    assert shares == expected
+    assert sum(shares) == n
+
+
+def test_fp_instances_flag_defaults_to_one_and_rejects_non_positive():
+    parser = bench._build_parser()
+    base = ["--p1", "heuristics", "--p2", "foulplay", "--n", "4"]
+    assert parser.parse_args(base).fp_instances == 1
+    assert parser.parse_args([*base, "--fp-instances", "4"]).fp_instances == 4
+    with pytest.raises(SystemExit):
+        parser.parse_args([*base, "--fp-instances", "0"])
+
+
+def _patch_pair_environment(monkeypatch):
+    launched = []
+    terminated = []
+
+    def fake_launch(command, log_path):
+        process, log_file = _FakeProcess(), _FakeLogFile()
+        launched.append((list(command), process, log_file))
+        return process, log_file
+
+    monkeypatch.setattr(bench, "_launch_foulplay_process", fake_launch)
+    monkeypatch.setattr(
+        bench, "_terminate_foulplay_process", lambda p, lf: terminated.append((p, lf))
+    )
+    return launched, terminated
+
+
+def test_parallel_instances_split_games_and_sum_wins(monkeypatch):
+    launched, terminated = _patch_pair_environment(monkeypatch)
+
+    class WinningBot:
+        def __init__(self, **_kwargs):
+            self.n_finished_battles = 0
+            self.n_won_battles = 0
+
+        async def send_challenges(self, _opponent, n_challenges):
+            self.n_finished_battles += 1
+            self.n_won_battles += 1
+
+    async def instant(*_a, **_k):
+        pass
+
+    monkeypatch.setitem(bench.PLAYER_REGISTRY, "maxpower", WinningBot)
+    monkeypatch.setattr(bench, "_wait_for_player_logins", instant)
+    monkeypatch.setattr(bench, "_wait_for_foulplay_ready", instant)
+    monkeypatch.setattr(bench, "_disconnect_player", instant)
+
+    wins = asyncio.run(
+        bench._play_against_foulplay(
+            "maxpower", "foulplay", 10, "gen9randombattle", 5, 100, 1, 1,
+            fp_instances=3,
+        )
+    )
+
+    assert wins == 10  # bot won every game; accounting is total over n
+    run_counts = [cmd[cmd.index("--run-count") + 1] for cmd, _p, _l in launched]
+    assert sorted(run_counts) == ["3", "3", "4"]
+    usernames = [cmd[cmd.index("--ps-username") + 1] for cmd, _p, _l in launched]
+    assert len(set(usernames)) == 3
+    assert len(terminated) == 3
+
+
+def test_parallel_instances_clean_up_every_instance_on_failure(monkeypatch):
+    launched, terminated = _patch_pair_environment(monkeypatch)
+    disconnected = []
+
+    class FlakyBot:
+        count = 0
+
+        def __init__(self, **_kwargs):
+            FlakyBot.count += 1
+            self.fails = FlakyBot.count == 2
+            self.n_finished_battles = 0
+            self.n_won_battles = 0
+
+        async def send_challenges(self, _opponent, n_challenges):
+            if self.fails:
+                raise RuntimeError("boom")
+            await asyncio.sleep(30)  # would hang; must be cancelled
+
+    async def instant(*_a, **_k):
+        pass
+
+    async def record_disconnect(player):
+        disconnected.append(player)
+
+    monkeypatch.setitem(bench.PLAYER_REGISTRY, "maxpower", FlakyBot)
+    monkeypatch.setattr(bench, "_wait_for_player_logins", instant)
+    monkeypatch.setattr(bench, "_wait_for_foulplay_ready", instant)
+    monkeypatch.setattr(bench, "_disconnect_player", record_disconnect)
+
+    async def run():
+        with pytest.raises(RuntimeError, match="boom"):
+            await bench._play_against_foulplay(
+                "maxpower", "foulplay", 9, "gen9randombattle", 5, 100, 1, 1,
+                fp_instances=3,
+            )
+
+    asyncio.run(run())
+
+    assert len(launched) == 3
+    assert {id(p) for _c, p, _l in launched} == {id(p) for p, _lf in terminated}
+    assert len(disconnected) == 3
+
+
+def test_fairness_report_counts_cores_per_side_and_warns_when_over():
+    lines, warning = bench.fairness_report("heuristics", "foulplay", 4, 2, 3, 16)
+    assert "foulplay=24" in lines[0]
+    assert "heuristics=4" in lines[0]
+    assert warning is not None
+    assert warning.startswith("WARNING")
+    assert "28" in warning and "16" in warning
+
+
+def test_fairness_report_has_no_warning_within_cpu_count():
+    _lines, warning = bench.fairness_report("heuristics", "foulplay", 2, 1, 1, 16)
+    assert warning is None
+
+
+def test_main_prints_core_counts_and_warning_for_foulplay_runs(monkeypatch, capsys):
+    async def fake_run_benchmark(*_args, **_kwargs):
+        return 3
+
+    monkeypatch.setattr(bench, "run_benchmark", fake_run_benchmark)
+    monkeypatch.setattr(bench.os, "cpu_count", lambda: 4)
+
+    result = main(
+        ["--p1", "heuristics", "--p2", "foulplay", "--n", "8",
+         "--fp-instances", "4", "--fp-parallelism", "2"]
+    )
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert "foulplay=8" in captured.out
+    assert "WARNING" in captured.err
