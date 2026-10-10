@@ -7,8 +7,8 @@ use crate::choices::{Choice, Choices, Effect, MoveCategory, MoveTarget, Secondar
 use crate::define_enum_with_from_str;
 use crate::engine::generate_instructions::add_remove_status_instructions;
 use crate::instruction::{
-    ChangeItemInstruction, ChangeStatusInstruction, DamageInstruction, DisableMoveInstruction,
-    HealInstruction, Instruction, StateInstructions,
+    ChangeItemInstruction, ChangeStatusInstruction, DamageInstruction, DecrementPPInstruction,
+    DisableMoveInstruction, HealInstruction, Instruction, StateInstructions,
 };
 use crate::pokemon::PokemonName;
 use crate::state::{
@@ -20,7 +20,7 @@ use std::cmp;
 use super::state::PokemonVolatileStatus;
 
 define_enum_with_from_str! {
-    #[repr(u8)]
+    #[repr(u16)]
     #[derive(Debug, PartialEq, Clone, Copy)]
     Items {
         NONE,
@@ -185,6 +185,9 @@ define_enum_with_from_str! {
         RUSTEDSWORD,
         RUSTEDSHIELD,
         WHITEHERB,
+        LIGHTCLAY,
+        LEPPABERRY,
+        SCOPELENS,
 
         // mega stones
         VENUSAURITE,
@@ -410,6 +413,44 @@ fn sitrus_berry(
             new_item: Items::NONE,
         }));
     active_pkmn.item = Items::NONE;
+}
+
+// Leppa Berry: restores 10 PP to the first move slot at 0 PP, then is consumed.
+// Showdown's onEat also falls back to the first slot below max PP, but the engine
+// only tracks PP once it is below 10 and has no max PP, so only a move at exactly 0 PP
+// (the item's actual trigger) is handled. The restored PP is not capped at the max.
+fn leppa_berry(
+    side_ref: &SideReference,
+    attacking_side: &mut Side,
+    instructions: &mut StateInstructions,
+) {
+    let active_pkmn = attacking_side.get_active();
+    let mut empty_slot = None;
+    let mut iter = active_pkmn.moves.into_iter();
+    while let Some(m) = iter.next() {
+        if m.pp == 0 {
+            empty_slot = Some(iter.pokemon_move_index);
+            break;
+        }
+    }
+    if let Some(move_index) = empty_slot {
+        instructions
+            .instruction_list
+            .push(Instruction::DecrementPP(DecrementPPInstruction {
+                side_ref: *side_ref,
+                move_index,
+                amount: -10,
+            }));
+        active_pkmn.moves[&move_index].pp += 10;
+        instructions
+            .instruction_list
+            .push(Instruction::ChangeItem(ChangeItemInstruction {
+                side_ref: *side_ref,
+                current_item: Items::LEPPABERRY,
+                new_item: Items::NONE,
+            }));
+        active_pkmn.item = Items::NONE;
+    }
 }
 
 // A single-status-cure berry (Cheri/Chesto/Aspear/Pecha/Rawst): consume the berry and
@@ -933,6 +974,7 @@ pub fn item_end_of_turn(
         Items::RAWSTBERRY if active_pkmn.status == PokemonStatus::BURN => {
             status_cure_berry(Items::RAWSTBERRY, side_ref, attacking_side, instructions)
         }
+        Items::LEPPABERRY => leppa_berry(side_ref, attacking_side, instructions),
         Items::BLACKSLUDGE => {
             if active_pkmn.has_type(&PokemonType::POISON) {
                 if active_pkmn.hp < active_pkmn.maxhp {

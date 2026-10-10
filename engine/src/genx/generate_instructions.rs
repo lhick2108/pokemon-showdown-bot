@@ -37,7 +37,7 @@ use crate::instruction::{
     ChangeStatusInstruction, DamageInstruction, Instruction, StateInstructions, SwitchInstruction,
 };
 use crate::state::{
-    LastUsedMove, PokemonBoostableStat, PokemonIndex, PokemonMoveIndex, PokemonSideCondition,
+    LastUsedMove, Pokemon, PokemonBoostableStat, PokemonIndex, PokemonMoveIndex, PokemonSideCondition,
     PokemonStatus, PokemonType, Side, SideMovesFirst, SideReference, State,
 };
 use std::cmp;
@@ -148,6 +148,7 @@ pub const SALT_CURE_DAMAGE_DIVISOR: f32 = 8.0;
 pub const SALT_CURE_DAMAGE_DIVISOR: f32 = 16.0;
 
 pub const SIDE_CONDITION_DURATION: i8 = 5;
+pub const LIGHT_CLAY_DURATION: i8 = 8;
 pub const TAILWIND_DURATION: i8 = 4;
 
 const PROTECT_VOLATILES: [PokemonVolatileStatus; 6] = [
@@ -159,22 +160,51 @@ const PROTECT_VOLATILES: [PokemonVolatileStatus; 6] = [
     PokemonVolatileStatus::ENDURE,
 ];
 
+// sdb: total over every i8 value. Showdown's sleep (data/conditions.ts `slp`) picks a
+// duration of 2-4 and wakes on the attempt where the counter hits 0, so a sleeper has
+// slept `turns_asleep` failed attempts: 0 -> cannot wake, 1 -> 1/3, 2 -> 1/2, >=3 -> 1.
+// Anything at or above MAX_SLEEP_TURNS (including values the engine would never reach
+// itself) wakes for sure; negative values are treated like 0. The result is always finite
+// and in [0, 1].
 #[cfg(not(feature = "champions"))]
 fn chance_to_wake_up(turns_asleep: i8) -> f32 {
-    if turns_asleep == 0 {
+    let chance = if turns_asleep <= 0 {
         0.0
+    } else if turns_asleep >= MAX_SLEEP_TURNS {
+        1.0
     } else {
         1.0 / (1 + MAX_SLEEP_TURNS - turns_asleep) as f32
-    }
+    };
+    debug_assert!(chance.is_finite() && (0.0..=1.0).contains(&chance));
+    chance
 }
 
 #[cfg(feature = "champions")]
 fn chance_to_wake_up(turns_asleep: i8) -> f32 {
     match turns_asleep {
-        0 => 0.0,
+        i8::MIN..=0 => 0.0,
         1 => 0.333,
-        2 => 1.0,
-        _ => panic!("turns_asleep should never be above 2 when calculating wake up chance"),
+        _ => 1.0,
+    }
+}
+
+// Chance of a critical hit. Scope Lens adds one crit stage: base (1/24 in gen 7+) goes to
+// 1/8 and the increased-crit-ratio stage (1/8) goes to 1/2.
+fn crit_rate(attacker_item: Items, defender: &Pokemon, choice: &Choice) -> f32 {
+    if defender.ability == Abilities::BATTLEARMOR || defender.ability == Abilities::SHELLARMOR {
+        0.0
+    } else if choice.move_id.guaranteed_crit() {
+        1.0
+    } else if choice.move_id.increased_crit_ratio() {
+        if attacker_item == Items::SCOPELENS {
+            1.0 / 2.0
+        } else {
+            1.0 / 8.0
+        }
+    } else if attacker_item == Items::SCOPELENS {
+        1.0 / 8.0
+    } else {
+        BASE_CRIT_CHANCE
     }
 }
 
@@ -626,12 +656,27 @@ fn generate_instructions_from_side_conditions(
         | PokemonSideCondition::Reflect
         | PokemonSideCondition::Safeguard
         | PokemonSideCondition::Mist => {
+            // Light Clay extends Reflect, Light Screen and Aurora Veil (not Safeguard/Mist)
+            let light_clay = matches!(
+                side_condition.condition,
+                PokemonSideCondition::AuroraVeil
+                    | PokemonSideCondition::LightScreen
+                    | PokemonSideCondition::Reflect
+            ) && state
+                .get_side(attacking_side_reference)
+                .get_active_immutable()
+                .item
+                == Items::LIGHTCLAY;
             generate_instructions_from_duration_side_conditions(
                 state,
                 side_condition,
                 attacking_side_reference,
                 incoming_instructions,
-                SIDE_CONDITION_DURATION,
+                if light_clay {
+                    LIGHT_CLAY_DURATION
+                } else {
+                    SIDE_CONDITION_DURATION
+                },
             );
         }
         PokemonSideCondition::Tailwind => {
@@ -2087,21 +2132,23 @@ pub fn generate_instructions_from_move(
     state.apply_instructions(&incoming_instructions.instruction_list);
 
     let side = state.get_side(&attacking_side);
+    // sdb: Encore with no known last move (last_used_move is None/Switch, e.g. a state
+    // converted from a live battle) is treated as inactive instead of panicking: the
+    // choice is not rewritten and the Encore duration is not advanced. Move generation
+    // (`add_available_moves`) already assumes nothing is locked in this case.
     if side
         .volatile_statuses
         .contains(&PokemonVolatileStatus::ENCORE)
+        && matches!(side.last_used_move, LastUsedMove::Move(_))
     {
-        match side.last_used_move {
-            LastUsedMove::Move(last_used_move) => {
-                if choice.move_index != last_used_move {
-                    *choice = MOVES
-                        .get(&side.get_active_immutable().moves[&last_used_move].id)
-                        .unwrap()
-                        .clone();
-                    choice.move_index = last_used_move;
-                }
+        if let LastUsedMove::Move(last_used_move) = side.last_used_move {
+            if choice.move_index != last_used_move {
+                *choice = MOVES
+                    .get(&side.get_active_immutable().moves[&last_used_move].id)
+                    .unwrap()
+                    .clone();
+                choice.move_index = last_used_move;
             }
-            _ => panic!("Encore should not be active when last used move is not a move"),
         }
 
         // this value is incremented when an encored move has been used
@@ -2383,7 +2430,8 @@ pub fn generate_instructions_from_move(
         }
     }
 
-    let (_attacker_side, defender_side) = state.get_both_sides(&attacking_side);
+    let (attacker_side, defender_side) = state.get_both_sides(&attacking_side);
+    let attacker_item = attacker_side.get_active_immutable().item;
     let defender_active = defender_side.get_active();
     let mut does_damage = false;
     let (mut branch_damage, mut regular_damage) = (0, 0);
@@ -2399,17 +2447,7 @@ pub fn generate_instructions_from_move(
             let (average_non_kill_damage, num_kill_rolls) =
                 compare_health_with_damage_multiples(max_damage_dealt, defender_active.hp);
 
-            let crit_rate = if defender_active.ability == Abilities::BATTLEARMOR
-                || defender_active.ability == Abilities::SHELLARMOR
-            {
-                0.0
-            } else if choice.move_id.guaranteed_crit() {
-                1.0
-            } else if choice.move_id.increased_crit_ratio() {
-                1.0 / 8.0
-            } else {
-                BASE_CRIT_CHANCE
-            };
+            let crit_rate = crit_rate(attacker_item, defender_active, choice);
 
             // the chance of a branch is the chance of the roll killing + the chance of a crit
             let branch_chance = ((1.0 - crit_rate) * (num_kill_rolls as f32 / 16.0)) + crit_rate;
@@ -2422,17 +2460,7 @@ pub fn generate_instructions_from_move(
             incoming_instructions.update_percentage(1.0 - branch_chance);
             regular_damage = average_non_kill_damage;
         } else if branch_on_damage && max_damage_dealt < defender_active.hp {
-            let crit_rate = if defender_active.ability == Abilities::BATTLEARMOR
-                || defender_active.ability == Abilities::SHELLARMOR
-            {
-                0.0
-            } else if choice.move_id.guaranteed_crit() {
-                1.0
-            } else if choice.move_id.increased_crit_ratio() {
-                1.0 / 8.0
-            } else {
-                BASE_CRIT_CHANCE
-            };
+            let crit_rate = crit_rate(attacker_item, defender_active, choice);
             let mut branch_ins = incoming_instructions.clone();
             branch_ins.update_percentage(crit_rate);
             branch_instructions = Some(branch_ins);
@@ -10905,5 +10933,295 @@ mod tests {
     #[cfg(any(feature = "gen4"))]
     fn test_gen4_100_percent_to_wake_after_4_sleep_turn() {
         assert_eq!(1.0, chance_to_wake_up(4));
+    }
+
+    // ---- sdb: robustness and new-item tests ----
+
+    fn state_with_tackle() -> State {
+        let mut state = State::default();
+        for side in [&mut state.side_one, &mut state.side_two] {
+            side.get_active().moves.m0 = Move {
+                id: Choices::TACKLE,
+                disabled: false,
+                pp: 32,
+                choice: MOVES.get(&Choices::TACKLE).unwrap().clone(),
+            };
+        }
+        state
+    }
+
+    #[test]
+    fn test_chance_to_wake_up_is_finite_and_a_probability_for_every_i8() {
+        for turns in i8::MIN..=i8::MAX {
+            let chance = chance_to_wake_up(turns);
+            assert!(chance.is_finite(), "turns={turns} chance={chance}");
+            assert!((0.0..=1.0).contains(&chance), "turns={turns} chance={chance}");
+        }
+    }
+
+    #[test]
+    #[cfg(not(any(feature = "gen4", feature = "champions")))]
+    fn test_chance_to_wake_up_follows_showdown_sleep_rolls() {
+        assert_eq!(0.0, chance_to_wake_up(0));
+        assert_eq!(1.0 / 3.0, chance_to_wake_up(1));
+        assert_eq!(1.0 / 2.0, chance_to_wake_up(2));
+        for turns in MAX_SLEEP_TURNS..=10 {
+            assert_eq!(1.0, chance_to_wake_up(turns));
+        }
+    }
+
+    #[test]
+    fn test_every_sleep_turns_value_0_to_10_generates_sane_instructions() {
+        for sleep_turns in 0..=10i8 {
+            for rest_turns in [0i8, 2] {
+                let mut state = state_with_tackle();
+                state.side_one.get_active().status = PokemonStatus::SLEEP;
+                state.side_one.get_active().sleep_turns = sleep_turns;
+                state.side_one.get_active().rest_turns = rest_turns;
+                let instructions = generate_instructions_from_move_pair(
+                    &mut state,
+                    &MoveChoice::Move(PokemonMoveIndex::M0),
+                    &MoveChoice::Move(PokemonMoveIndex::M0),
+                    true,
+                );
+                assert!(!instructions.is_empty());
+                let mut total = 0.0;
+                for i in &instructions {
+                    assert!(i.percentage.is_finite() && i.percentage >= 0.0);
+                    total += i.percentage;
+                }
+                assert!(
+                    (total - 100.0).abs() < 0.01,
+                    "sleep_turns={sleep_turns} rest_turns={rest_turns} total={total}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_sleep_turns_above_max_always_wakes_up() {
+        let mut state = state_with_tackle();
+        state.side_one.get_active().status = PokemonStatus::SLEEP;
+        state.side_one.get_active().sleep_turns = 10;
+        let mut incoming = StateInstructions::default();
+        let mut frozen = vec![];
+        generate_instructions_from_existing_status_conditions(
+            &mut state,
+            &SideReference::SideOne,
+            &Choice::default(),
+            &mut incoming,
+            &mut frozen,
+        );
+        assert_eq!(100.0, incoming.percentage);
+        assert_eq!(PokemonStatus::NONE, state.side_one.get_active().status);
+        assert_eq!(0, state.side_one.get_active().sleep_turns);
+    }
+
+    #[test]
+    fn test_mcts_survives_every_sleep_turns_value() {
+        for sleep_turns in 0..=10i8 {
+            let mut state = state_with_tackle();
+            state.side_one.get_active().status = PokemonStatus::SLEEP;
+            state.side_one.get_active().sleep_turns = sleep_turns;
+            let (s1, s2) = state.root_get_all_options();
+            let result = crate::mcts::perform_mcts(
+                &mut state,
+                s1,
+                s2,
+                std::time::Duration::from_millis(5),
+                2000,
+            );
+            assert!(result.iteration_count > 0);
+        }
+    }
+
+    #[test]
+    fn test_encore_without_last_used_move_does_not_panic_and_is_inactive() {
+        for last_used in [LastUsedMove::None, LastUsedMove::Switch(PokemonIndex::P1)] {
+            let mut state = state_with_tackle();
+            state
+                .side_one
+                .volatile_statuses
+                .insert(PokemonVolatileStatus::ENCORE);
+            state.side_one.last_used_move = last_used;
+            let instructions = generate_instructions_from_move_pair(
+                &mut state,
+                &MoveChoice::Move(PokemonMoveIndex::M0),
+                &MoveChoice::Move(PokemonMoveIndex::M0),
+                false,
+            );
+            assert!(!instructions.is_empty());
+            // the encore counter must not advance when Encore is treated as inactive
+            for i in &instructions {
+                for ins in &i.instruction_list {
+                    if let Instruction::ChangeVolatileStatusDuration(d) = ins {
+                        assert_ne!(PokemonVolatileStatus::ENCORE, d.volatile_status);
+                    }
+                }
+            }
+            // and move generation offers every move
+            let (s1, _) = state.root_get_all_options();
+            assert!(s1.contains(&MoveChoice::Move(PokemonMoveIndex::M0)));
+        }
+    }
+
+    #[test]
+    fn test_encore_with_last_used_move_still_advances_counter() {
+        let mut state = state_with_tackle();
+        state
+            .side_one
+            .volatile_statuses
+            .insert(PokemonVolatileStatus::ENCORE);
+        state.side_one.last_used_move = LastUsedMove::Move(PokemonMoveIndex::M0);
+        let instructions = generate_instructions_from_move_pair(
+            &mut state,
+            &MoveChoice::Move(PokemonMoveIndex::M0),
+            &MoveChoice::Move(PokemonMoveIndex::M0),
+            false,
+        );
+        assert!(instructions.iter().any(|i| i.instruction_list.iter().any(|ins| matches!(
+            ins,
+            Instruction::ChangeVolatileStatusDuration(d)
+                if d.volatile_status == PokemonVolatileStatus::ENCORE
+        ))));
+    }
+
+    fn set_screen_duration(item: Items, choice_id: Choices, weather: Weather) -> i8 {
+        let mut state: State = State::default();
+        state.weather.weather_type = weather;
+        state.side_one.get_active().item = item;
+        let mut choice = MOVES.get(&choice_id).unwrap().to_owned();
+        let mut instructions = vec![];
+        generate_instructions_from_move(
+            &mut state,
+            &mut choice,
+            &MOVES.get(&Choices::TACKLE).unwrap(),
+            SideReference::SideOne,
+            StateInstructions::default(),
+            &mut instructions,
+            false,
+        );
+        for ins in &instructions[0].instruction_list {
+            if let Instruction::ChangeSideCondition(c) = ins {
+                return c.amount;
+            }
+        }
+        panic!("no side condition set");
+    }
+
+    #[test]
+    fn test_light_clay_extends_screens_to_8_turns() {
+        for (id, weather) in [
+            (Choices::REFLECT, Weather::NONE),
+            (Choices::LIGHTSCREEN, Weather::NONE),
+            (Choices::AURORAVEIL, Weather::HAIL),
+        ] {
+            assert_eq!(8, set_screen_duration(Items::LIGHTCLAY, id, weather));
+            assert_eq!(5, set_screen_duration(Items::NONE, id, weather));
+            assert_eq!(5, set_screen_duration(Items::LEFTOVERS, id, weather));
+        }
+    }
+
+    #[test]
+    fn test_light_clay_does_not_extend_safeguard_or_mist() {
+        for id in [Choices::SAFEGUARD, Choices::MIST] {
+            assert_eq!(5, set_screen_duration(Items::LIGHTCLAY, id, Weather::NONE));
+        }
+    }
+
+    #[test]
+    fn test_scope_lens_adds_one_crit_stage() {
+        let defender = Pokemon::default();
+        let tackle = MOVES.get(&Choices::TACKLE).unwrap();
+        let slash = MOVES.get(&Choices::SLASH).unwrap();
+        let frost_breath = MOVES.get(&Choices::FROSTBREATH).unwrap();
+        assert_eq!(BASE_CRIT_CHANCE, crit_rate(Items::NONE, &defender, tackle));
+        assert_eq!(1.0 / 8.0, crit_rate(Items::SCOPELENS, &defender, tackle));
+        assert_eq!(1.0 / 8.0, crit_rate(Items::NONE, &defender, slash));
+        assert_eq!(1.0 / 2.0, crit_rate(Items::SCOPELENS, &defender, slash));
+        assert_eq!(1.0, crit_rate(Items::SCOPELENS, &defender, frost_breath));
+        let mut armored = Pokemon::default();
+        armored.ability = Abilities::BATTLEARMOR;
+        assert_eq!(0.0, crit_rate(Items::SCOPELENS, &armored, tackle));
+    }
+
+    #[test]
+    fn test_scope_lens_changes_crit_branch_chance_in_a_full_move() {
+        let crit_branch_chance = |item: Items| {
+            let mut state = state_with_tackle();
+            state.side_one.get_active().item = item;
+            state.side_two.get_active().hp = 500;
+            state.side_two.get_active().maxhp = 500;
+            let instructions = generate_instructions_from_move_pair(
+                &mut state,
+                &MoveChoice::Move(PokemonMoveIndex::M0),
+                &MoveChoice::None,
+                true,
+            );
+            // the crit branch deals the most damage to side two
+            let mut best = (0, 0.0);
+            for i in &instructions {
+                for ins in &i.instruction_list {
+                    if let Instruction::Damage(d) = ins {
+                        if d.side_ref == SideReference::SideTwo && d.damage_amount > best.0 {
+                            best = (d.damage_amount, i.percentage);
+                        }
+                    }
+                }
+            }
+            best.1
+        };
+        let without = crit_branch_chance(Items::NONE);
+        let with = crit_branch_chance(Items::SCOPELENS);
+        assert!((without - 100.0 * BASE_CRIT_CHANCE).abs() < 0.01, "{without}");
+        assert!((with - 12.5).abs() < 0.01, "{with}");
+    }
+
+    #[test]
+    fn test_leppa_berry_restores_10_pp_to_empty_move_and_is_consumed() {
+        let mut state = state_with_tackle();
+        state.side_one.get_active().item = Items::LEPPABERRY;
+        state.side_one.get_active().moves.m0.pp = 0;
+        let mut instructions = StateInstructions::default();
+        item_end_of_turn(&mut state, &SideReference::SideOne, &mut instructions);
+        assert_eq!(10, state.side_one.get_active().moves.m0.pp);
+        assert_eq!(Items::NONE, state.side_one.get_active().item);
+        assert_eq!(
+            vec![
+                Instruction::DecrementPP(DecrementPPInstruction {
+                    side_ref: SideReference::SideOne,
+                    move_index: PokemonMoveIndex::M0,
+                    amount: -10,
+                }),
+                Instruction::ChangeItem(ChangeItemInstruction {
+                    side_ref: SideReference::SideOne,
+                    current_item: Items::LEPPABERRY,
+                    new_item: Items::NONE,
+                }),
+            ],
+            instructions.instruction_list
+        );
+        // the instructions reverse cleanly
+        state.reverse_instructions(&instructions.instruction_list);
+        assert_eq!(0, state.side_one.get_active().moves.m0.pp);
+        assert_eq!(Items::LEPPABERRY, state.side_one.get_active().item);
+    }
+
+    #[test]
+    fn test_leppa_berry_not_eaten_while_all_moves_have_pp() {
+        let mut state = state_with_tackle();
+        state.side_one.get_active().item = Items::LEPPABERRY;
+        let mut instructions = StateInstructions::default();
+        item_end_of_turn(&mut state, &SideReference::SideOne, &mut instructions);
+        assert!(instructions.instruction_list.is_empty());
+        assert_eq!(Items::LEPPABERRY, state.side_one.get_active().item);
+    }
+
+    #[test]
+    fn test_item_ids_parse() {
+        use std::str::FromStr;
+        assert_eq!(Items::LIGHTCLAY, Items::from_str("lightclay").unwrap());
+        assert_eq!(Items::LEPPABERRY, Items::from_str("leppaberry").unwrap());
+        assert_eq!(Items::SCOPELENS, Items::from_str("scopelens").unwrap());
     }
 }

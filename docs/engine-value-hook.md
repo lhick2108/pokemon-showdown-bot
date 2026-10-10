@@ -1,7 +1,7 @@
 # Learned value hook in our poke-engine fork
 
 Our fork of poke-engine lives in [`engine/`](../engine/README.md) (origin:
-upstream `c2dbbda`, v0.0.48; ours is `0.0.48+sdb.1`). It adds an optional
+upstream `c2dbbda`, v0.0.48; ours is `0.0.48+sdb.2`). It adds an optional
 learned leaf evaluator (linear or 2-layer MLP) to MCTS, and a fixed state
 encoding used by both training and inference ([`engine/FEATURES.md`](../engine/FEATURES.md)).
 

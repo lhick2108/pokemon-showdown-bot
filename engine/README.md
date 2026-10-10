@@ -8,7 +8,7 @@ hand-written `evaluate()`.
 - **Origin:** upstream commit `c2dbbda7820137f938361106c1d1e7e1922fcb64` (v0.0.48).
   The tracked files of that commit were copied here (CI config under `.github/`
   was dropped).
-- **Version:** `0.0.48+sdb.1` (Cargo crates and the Python wheel). The package
+- **Version:** `0.0.48+sdb.2` (Cargo crates and the Python wheel). The package
   name stays `poke-engine` / `import poke_engine`, so it is a drop-in for the
   upstream wheel. Check which one you have with `poke_engine.FEATURE_VERSION`
   (exists only in the fork).
@@ -30,7 +30,35 @@ hand-written `evaluate()`.
 | `poke-engine-py/src/lib.rs` | `Evaluator` class, `state_features`, `state_feature_names`, `FEATURE_VERSION`, `FEATURE_LENGTH`; `mcts(..., evaluator=None)`. |
 | `poke-engine-py/python/poke_engine/__init__.py`, `poke_engine.pyi` | `monte_carlo_tree_search(..., evaluator=None)`, `write_linear`, `write_mlp`. |
 | `Cargo.toml` | `default = ["terastallization"]` (was `[]`) so a bare `cargo test` builds the Gen 9 engine; our builds still pass `--no-default-features` explicitly. |
-| `Cargo.toml`, `poke-engine-py/Cargo.toml`, `poke-engine-py/pyproject.toml`, `Cargo.lock` | Version `0.0.48+sdb.1` (lockfile updated accordingly; dependencies unchanged). |
+| `Cargo.toml`, `poke-engine-py/Cargo.toml`, `poke-engine-py/pyproject.toml`, `Cargo.lock` | Version `0.0.48+sdb.2` (lockfile updated accordingly; dependencies unchanged). |
+
+### Robustness and item fixes (`0.0.48+sdb.2`)
+
+Found by fuzzing about 3,000 converted live states (beads `showdown-bot-3m0`).
+All three are in the genx engine.
+
+| File | Change |
+| --- | --- |
+| `src/genx/generate_instructions.rs` | **Sleep:** `chance_to_wake_up` is now total over every `i8`. `sleep_turns <= 0` never wakes, `1` wakes with 1/3, `2` with 1/2 and `>= MAX_SLEEP_TURNS` (3) always wakes, which matches Showdown's gen9 `slp` (duration rolled 2-4, wake on the attempt where the counter hits 0). Before, `sleep_turns > 3` gave 1/0 = inf and MCTS panicked with `NonFinite`. A `debug_assert!` guards that the chance is finite and in [0, 1]. |
+| `src/genx/generate_instructions.rs` | **Encore with no known last move** (`last_used_move` is `None` or a switch, which a state converted from a live battle can have) no longer panics. Encore is treated as inactive for that turn: the chosen move is not rewritten and the Encore counter does not advance. Move generation already offers every move in this case (see `add_available_moves`). With a known last move, behaviour is unchanged (locked into that move, three turns). |
+| `src/genx/items.rs`, `src/genx/generate_instructions.rs` | **New items** `LIGHTCLAY`, `LEPPABERRY`, `SCOPELENS` (ids `lightclay`, `leppaberry`, `scopelens`). The `Items` enum had reached the 256-variant limit of `repr(u8)`, so it is now `repr(u16)`. |
+| | *Light Clay:* Reflect, Light Screen and Aurora Veil last 8 turns when the user holds it (`LIGHT_CLAY_DURATION`); Safeguard and Mist stay at 5. |
+| | *Scope Lens:* +1 crit stage in the crit-branch logic (`crit_rate`): 1/24 becomes 1/8 and the high-crit-ratio stage (1/8) becomes 1/2. Guaranteed crits and Battle/Shell Armor are unchanged. |
+| | *Leppa Berry:* at end of turn, if a move is at 0 PP, restore 10 PP to the first such move and consume the berry (`DecrementPP` with `amount: -10` plus `ChangeItem`, both reversible). Differences from Showdown: the engine only tracks PP below 10 and has no max PP, so the restore is not capped at max PP, and Showdown's fallback to "first move below max PP" is not modelled. Showdown eats the berry right after the move that empties the slot; we eat at end of turn, which is the same unless the Pokemon would have to act again in between. |
+
+Side effect of `Items` becoming `repr(u16)`: `Instruction` (which embeds two
+`Items` in `ChangeItem`) grew from 6 to 8 bytes, so `instruction::test::test_instruction_size`
+now asserts 8. Stock-search throughput measured the same within noise
+(`scripts/engine_bench.py`, interleaved runs against the `sdb.1` wheel).
+`scripts/engine_fuzz.py` fuzzes random valid states (sleep 0-10, Encore with
+and without a last move, the new items) with short MCTS runs; 0 panics (the
+`sdb.1` wheel panics on about half of them).
+
+Scan of `.cache/randbats/full/gen9randombattle.json` (5,802 sets) against the
+engine's item, ability and move ids: the only unknown ids were `lightclay`
+(19 sets, summed weight 3267, 4 species), `leppaberry` (1 set, weight 344,
+1 species) and `scopelens` (9 sets, weight 173, 1 species). No unknown
+abilities or moves.
 
 With `evaluator=None` (the default) the search is the stock algorithm: the same
 `evaluate()` and the same `sigmoid(0.0125 * (eval - root_eval))` formula (the
