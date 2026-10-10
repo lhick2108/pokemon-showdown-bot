@@ -19,3 +19,6 @@ engine/target/
 
 # Agent worktrees
 .claude/worktrees/
+
+# Self-play recordings (large, regenerable)
+data/

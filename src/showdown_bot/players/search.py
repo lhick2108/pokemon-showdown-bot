@@ -28,6 +28,8 @@ only poke-env options), these environment variables:
     SHOWDOWN_SEARCH_WORLDS       fixed world count (default 2 x parallelism, 4x early)
     SHOWDOWN_SEARCH_THREADS      engine threads per world (default 1)
     SHOWDOWN_SEARCH_MODE         "mixed" (default) or "argmax"
+    SHOWDOWN_RECORD_DIR          record every searched decision here (default: off;
+                                 see showdown_bot.recorder / docs/selfplay-data.md)
 
 The player never crashes a battle: any internal error falls back to a random
 legal order and increments ``SearchStats.fallbacks`` (reasons are counted too).
@@ -46,7 +48,8 @@ import sys
 from collections import Counter
 from concurrent.futures import Executor, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
-from dataclasses import dataclass, field
+import time
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -54,8 +57,9 @@ from poke_env.player import Player
 from poke_env.ps_client import AccountConfiguration
 from poke_env.player.battle_order import BattleOrder, DefaultBattleOrder
 
-from showdown_bot import engine_state
+from showdown_bot import engine_state, recorder as recorder_module
 from showdown_bot.players import _worker
+from showdown_bot.recorder import GameRecorder
 from showdown_bot.sets import OpponentModel, OpponentModelPlayerMixin, RandbatsData
 
 logger = logging.getLogger(__name__)
@@ -282,6 +286,7 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         config: SearchConfig | None = None,
         executor: Executor | None = None,
         seed: int | None = None,
+        recorder: GameRecorder | None = None,
         **kwargs: Any,
     ):
         data = data or (opponent_model.data if opponent_model else default_randbats_data())
@@ -302,6 +307,12 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         self._rng = random.Random(seed)
         self._sampler = engine_state.TeamSampler(data)
         self.last_policy: dict[str, float] = {}
+        self.last_choice: str | None = None
+        # Recording is off unless a recorder is passed or SHOWDOWN_RECORD_DIR is set.
+        self._recorder = recorder if recorder is not None else recorder_module.from_env()
+        self._paired: list[tuple[str, WorldResult]] = []
+        if self._recorder is not None and self._recorder.truth:
+            recorder_module.register_player(self)
 
     # -- poke-env entry point ------------------------------------------------
 
@@ -349,6 +360,10 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             return None
         trackers = self.opponent_model.update(battle)
         n_worlds, time_ms = self.config.plan(self._is_early(battle))
+        recording = self._recorder is not None
+        if recording:
+            started = time.perf_counter()
+            truth_state, truth_status = self._truth_state(battle)
         built = None
         state_strings: list[str] = []
         for _ in range(n_worlds):
@@ -366,7 +381,12 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         policy = aggregate_policy(results)
         self.last_policy = policy
         assert built is not None
-        return self._order_from_policy(policy, built, battle)
+        order = self._order_from_policy(policy, built, battle)
+        if recording:
+            self._record_decision(
+                battle, order, policy, n_worlds, time_ms, started, truth_state, truth_status
+            )
+        return order
 
     def _order_from_policy(
         self, policy: dict[str, float], built: engine_state.BuiltState, battle: Any
@@ -381,6 +401,7 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         choice = select_choice(
             legal_policy, self.config.mode, self._rng, self.config.mixed_threshold
         )
+        self.last_choice = choice
         return orders[choice] if choice is not None else None
 
     async def _run_worlds(self, state_strings: list[str], time_ms: int) -> list[WorldResult]:
@@ -402,6 +423,7 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         self, executor: Executor, state_strings: list[str], time_ms: int
     ) -> list[WorldResult]:
         loop = asyncio.get_running_loop()
+        self._paired = []
         futures = [
             loop.run_in_executor(
                 executor, _worker.search_world, state, time_ms, self.config.threads
@@ -438,4 +460,85 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             self.stats.worlds_run += 1
             self.stats.iterations += outcome[0]
             results.append(outcome)
+            if self._recorder is not None:
+                self._paired.append((state_strings[index], outcome))
         return results
+
+    # -- recording (only reached when a recorder is configured) ----------------
+
+    def _truth_state(self, battle: Any) -> tuple[str | None, str]:
+        """The exact combined state when the opposing player is in this process."""
+        if not self._recorder.truth:
+            return None, "disabled"
+        try:
+            other = recorder_module.peer_battle(battle)
+            if other is None:
+                return None, "no-peer"
+            state = recorder_module.build_truth_state(battle, other)
+            return state, ("ok" if state else "turn-mismatch")
+        except Exception:
+            logger.exception("Truth state failed in %s", battle.battle_tag)
+            return None, "error"
+
+    def _record_decision(
+        self,
+        battle: Any,
+        order: BattleOrder | None,
+        policy: dict[str, float],
+        n_worlds: int,
+        time_ms: int,
+        started: float,
+        truth_state: str | None,
+        truth_status: str,
+    ) -> None:
+        try:
+            recorder = self._recorder
+            tag = battle.battle_tag
+            if not recorder.has_game(tag, self.username):
+                recorder.start_game(
+                    tag,
+                    self.username,
+                    role=getattr(battle, "player_role", None),
+                    battle_format=self.format,
+                    config=asdict(self.config),
+                )
+            worlds = [recorder_module.world_record(s, r) for s, r in self._paired]
+            recorder.add_decision(
+                tag,
+                self.username,
+                {
+                    "turn": battle.turn,
+                    "side": "one",  # our side is always engine side one in every state
+                    "worlds": worlds,
+                    "policy": policy,
+                    "chosen": self.last_choice,
+                    "order": order.message if order is not None else None,
+                    "compute": {
+                        "search_time_ms": time_ms,
+                        "worlds_requested": n_worlds,
+                        "worlds_searched": len(worlds),
+                        "parallelism": self.config.parallelism,
+                        "threads": self.config.threads,
+                        "iterations": sum(w["total_visits"] for w in worlds),
+                        "wall_ms": round((time.perf_counter() - started) * 1000, 1),
+                    },
+                    "truth": {"state": truth_state} if truth_state else None,
+                    "truth_status": truth_status,
+                },
+            )
+        except Exception:
+            logger.exception("Recording failed in %s", battle.battle_tag)
+
+    def _battle_finished_callback(self, battle: Any) -> None:
+        super()._battle_finished_callback(battle)
+        if self._recorder is None:
+            return
+        try:
+            self._recorder.end_game(
+                battle.battle_tag,
+                self.username,
+                recorder_module.result_from_battle(battle),
+                battle.turn,
+            )
+        except Exception:
+            logger.exception("Could not write game record for %s", battle.battle_tag)
