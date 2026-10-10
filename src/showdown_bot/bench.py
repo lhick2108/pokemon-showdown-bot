@@ -23,12 +23,15 @@ from poke_env.player import (
 )
 from poke_env.ps_client import LocalhostServerConfiguration
 
+from showdown_bot.players.search import SearchPlayer
+
 
 # Add new player classes here as additional bot implementations become available.
 PLAYER_REGISTRY: dict[str, type[Player]] = {
     "random": RandomPlayer,
     "maxpower": MaxBasePowerPlayer,
     "heuristics": SimpleHeuristicsPlayer,
+    "search": SearchPlayer,
 }
 
 # "foulplay" is a special opponent name: it is not a poke-env Player subclass.

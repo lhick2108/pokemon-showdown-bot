@@ -16,3 +16,6 @@ __pycache__/
 target/
 engine/target/
 *.pyd
+
+# Agent worktrees
+.claude/worktrees/
