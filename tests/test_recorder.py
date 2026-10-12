@@ -25,6 +25,20 @@ def fake_world(state: str = "STATE"):
     return recorder.world_record(state, (100, [("a", 75, 60.0), ("b", 25, 10.0)]))
 
 
+def test_truth_state_has_the_real_tera_type_of_an_untouched_pokemon():
+    """The opponent's own battle only learns its Tera type from the request (bead 589.27)."""
+    import poke_engine as pe
+
+    mine = make_battle(request_for())
+    event(mine, "start")
+    opp_switch(mine, "Gardevoir", "Gardevoir, L83")
+    theirs = make_battle(request_for(), tag=mine.battle_tag)
+    assert all(mon.tera_type is None for mon in theirs.team.values())
+    state = pe.State.from_string(recorder.build_truth_state(mine, theirs))
+    real = {m.id.lower(): m.tera_type.lower() for m in state.side_two.pokemon if m.id.lower() != "none"}
+    assert real and "typeless" not in real.values()
+
+
 def write_fake_game(rec, result="win", tag="battle-x-1", user="alice"):
     rec.start_game(tag, user, role="p1", battle_format="gen9randombattle", config={"k": 1})
     rec.add_decision(tag, user, {

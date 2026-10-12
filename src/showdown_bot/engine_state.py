@@ -875,6 +875,33 @@ def _own_pokemon(battle: Any, mon: Any, is_active: bool) -> tuple[pe.Pokemon, li
     return pokemon, moves
 
 
+_CHOICE_ITEMS = frozenset({"choiceband", "choicespecs", "choicescarf"})
+
+
+def _locked_move(mon: Any | None, item_id: str, move_ids: Sequence[str]) -> str | None:
+    """The only move a locked-in opposing Pokemon can use, else ``None``.
+
+    The engine does not restrict a side's moves for a Choice item or a locked move
+    (Outrage, Thrash, ...): it relies on the state marking the other moves disabled,
+    which our own side gets from the request. The opponent has no request, so a world
+    that gives the active Pokemon a Choice item must lock it onto the move it last used
+    (Foul Play's ``Battler.lock_moves``); otherwise the search lets it pick any move.
+    poke-env clears a Pokemon's last-used flag when it switches out, so a set flag
+    means the move was used during the current stay.
+    """
+    if mon is None or mon.fainted:
+        return None
+    last = next(
+        (to_id(move_id) for move_id, move in mon.moves.items() if getattr(move, "_is_last_used", False)),
+        None,
+    )
+    if last is None or last not in move_ids or last in ("trick", "switcheroo"):
+        return None
+    if item_id in _CHOICE_ITEMS or Effect.LOCKED_MOVE in mon.effects:
+        return last
+    return None
+
+
 def _opponent_pokemon(slot: OpponentSlot, battle: Any) -> tuple[pe.Pokemon, list[pe.Move], Any | None]:
     sampled = slot.sampled
     mon = slot.mon
@@ -915,6 +942,7 @@ def _opponent_pokemon(slot: OpponentSlot, battle: Any) -> tuple[pe.Pokemon, list
             hp = max(1, int(round(max_hp * float(mon.current_hp_fraction)))) if mon.current_hp else 0
         status = _status_of(mon)
         sleep_turns = _sleep_turns(mon, status)
+    locked_to = _locked_move(mon, item, move_ids)
     moves: list[pe.Move] = []
     for move_id in move_ids:
         pp = _max_pp(move_id)
@@ -922,7 +950,7 @@ def _opponent_pokemon(slot: OpponentSlot, battle: Any) -> tuple[pe.Pokemon, list
             known = mon.moves.get(move_id)
             if known is not None:
                 pp = known.current_pp
-        moves.append(_engine_move(move_id, pp))
+        moves.append(_engine_move(move_id, pp, disabled=locked_to is not None and move_id != locked_to))
     pokemon = pe.Pokemon(
         id=slot.species_id,
         level=level,
