@@ -31,6 +31,10 @@ only poke-env options), these environment variables:
     SHOWDOWN_SEARCH_EVALUATOR    path to a learned .pev leaf evaluator (default: the
                                  stock hand-written evaluation); see docs/training.md.
                                  Each pool worker loads it once and reuses it.
+    SHOWDOWN_SEARCH_EVALUATOR_SCALE
+                                 leaf scale k > 0 for the learned evaluator: leaf score
+                                 sigmoid(k * (z_leaf - z_root)) (default 1.0; see the
+                                 "Leaf scale" section of docs/training.md)
     SHOWDOWN_RECORD_DIR          record every searched decision here (default: off;
                                  see showdown_bot.recorder / docs/selfplay-data.md)
 
@@ -45,6 +49,7 @@ import asyncio
 import atexit
 import dataclasses
 import logging
+import math
 import os
 import random
 import secrets
@@ -75,6 +80,7 @@ MIXED = "mixed"
 ARGMAX = "argmax"
 MIXED_THRESHOLD = 0.75
 EVALUATOR_ENV = "SHOWDOWN_SEARCH_EVALUATOR"
+EVALUATOR_SCALE_ENV = "SHOWDOWN_SEARCH_EVALUATOR_SCALE"
 
 
 def _env_int(name: str, default: int | None) -> int | None:
@@ -92,6 +98,21 @@ def _env_int(name: str, default: int | None) -> int | None:
     return value
 
 
+def _env_scale(name: str, default: float = 1.0) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("Ignoring non-numeric %s=%r", name, raw)
+        return default
+    if not math.isfinite(value) or value <= 0:
+        logger.warning("Ignoring non-positive or non-finite %s=%r", name, raw)
+        return default
+    return value
+
+
 @dataclass(frozen=True)
 class SearchConfig:
     """Compute and selection settings (defaults equal Foul Play's)."""
@@ -103,6 +124,7 @@ class SearchConfig:
     mode: str = MIXED
     mixed_threshold: float = MIXED_THRESHOLD
     evaluator: str | None = None  # path of a .pev file; None: stock evaluation
+    evaluator_scale: float = 1.0  # learned leaf scale k (score = sigmoid(k * dz))
 
     @classmethod
     def from_env(cls) -> SearchConfig:
@@ -117,6 +139,7 @@ class SearchConfig:
             threads=_env_int("SHOWDOWN_SEARCH_THREADS", 1) or 1,
             mode=mode,
             evaluator=(os.environ.get(EVALUATOR_ENV, "").strip() or None),
+            evaluator_scale=_env_scale(EVALUATOR_SCALE_ENV),
         )
 
     def plan(self, early: bool) -> tuple[int, int]:
@@ -296,6 +319,7 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         seed: int | None = None,
         recorder: GameRecorder | None = None,
         evaluator: str | os.PathLike[str] | None = None,
+        evaluator_scale: float | None = None,
         **kwargs: Any,
     ):
         data = data or (opponent_model.data if opponent_model else default_randbats_data())
@@ -312,6 +336,10 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         self.config = config or SearchConfig.from_env()
         if evaluator is not None:
             self.config = dataclasses.replace(self.config, evaluator=str(Path(evaluator).resolve()))
+        if evaluator_scale is not None:
+            self.config = dataclasses.replace(self.config, evaluator_scale=float(evaluator_scale))
+        if not (math.isfinite(self.config.evaluator_scale) and self.config.evaluator_scale > 0):
+            raise ValueError(f"evaluator_scale must be finite and > 0, got {self.config.evaluator_scale}")
         if self.config.evaluator is not None:
             # Fail here rather than as a fallback on every decision.
             if not Path(self.config.evaluator).is_file():
@@ -445,7 +473,7 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         futures = [
             loop.run_in_executor(
                 executor, _worker.search_world, state, time_ms, self.config.threads,
-                self.config.evaluator,
+                self.config.evaluator, self.config.evaluator_scale,
             )
             for state in state_strings
         ]

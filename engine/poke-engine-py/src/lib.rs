@@ -946,38 +946,50 @@ fn value_err(e: String) -> PyErr {
 impl PyEvaluator {
     /// Load a weights file written by `write_linear` / `write_mlp` (or Rust `Evaluator::save`).
     #[staticmethod]
-    #[pyo3(signature = (path, relative_to_root=true))]
-    fn load(path: &str, relative_to_root: bool) -> PyResult<PyEvaluator> {
+    #[pyo3(signature = (path, relative_to_root=true, leaf_scale=1.0))]
+    fn load(path: &str, relative_to_root: bool, leaf_scale: f32) -> PyResult<PyEvaluator> {
         let ev = Evaluator::load(path)
             .map_err(value_err)?
-            .with_relative_to_root(relative_to_root);
+            .with_relative_to_root(relative_to_root)
+            .with_leaf_scale(leaf_scale)
+            .map_err(value_err)?;
         Ok(PyEvaluator { inner: Arc::new(ev) })
     }
 
     /// value = weights . state_features + bias
     #[staticmethod]
-    #[pyo3(signature = (weights, bias=0.0, relative_to_root=true))]
-    fn linear(weights: Vec<f32>, bias: f32, relative_to_root: bool) -> PyResult<PyEvaluator> {
+    #[pyo3(signature = (weights, bias=0.0, relative_to_root=true, leaf_scale=1.0))]
+    fn linear(
+        weights: Vec<f32>,
+        bias: f32,
+        relative_to_root: bool,
+        leaf_scale: f32,
+    ) -> PyResult<PyEvaluator> {
         let ev = Evaluator::linear(weights, bias)
             .map_err(value_err)?
-            .with_relative_to_root(relative_to_root);
+            .with_relative_to_root(relative_to_root)
+            .with_leaf_scale(leaf_scale)
+            .map_err(value_err)?;
         Ok(PyEvaluator { inner: Arc::new(ev) })
     }
 
     /// value = w2 . relu(W1 x + b1) + b2; `w1` is flat row-major [hidden][FEATURE_LENGTH].
     #[staticmethod]
-    #[pyo3(signature = (w1, b1, w2, b2=0.0, relative_to_root=true))]
+    #[pyo3(signature = (w1, b1, w2, b2=0.0, relative_to_root=true, leaf_scale=1.0))]
     fn mlp(
         w1: Vec<f32>,
         b1: Vec<f32>,
         w2: Vec<f32>,
         b2: f32,
         relative_to_root: bool,
+        leaf_scale: f32,
     ) -> PyResult<PyEvaluator> {
         let hidden = b1.len();
         let ev = Evaluator::mlp(hidden, w1, b1, w2, b2)
             .map_err(value_err)?
-            .with_relative_to_root(relative_to_root);
+            .with_relative_to_root(relative_to_root)
+            .with_leaf_scale(leaf_scale)
+            .map_err(value_err)?;
         Ok(PyEvaluator { inner: Arc::new(ev) })
     }
 
@@ -990,6 +1002,16 @@ impl PyEvaluator {
         let state: State = py_state.into();
         let mut scratch = Scratch::new();
         self.inner.logit(&state, &mut scratch)
+    }
+
+    /// Alias of `evaluate`: the model logit of P(side one wins) at `state`.
+    fn logit(&self, py_state: PyState) -> f32 {
+        self.evaluate(py_state)
+    }
+
+    #[getter]
+    fn leaf_scale(&self) -> f32 {
+        self.inner.leaf_scale
     }
 
     #[getter]
@@ -1006,6 +1028,13 @@ impl PyEvaluator {
     fn relative_to_root(&self) -> bool {
         self.inner.relative_to_root
     }
+}
+
+/// The stock hand-written evaluation of `state` (eval points, side one's view).
+#[pyfunction(name = "evaluate")]
+fn stock_evaluate(py_state: PyState) -> f32 {
+    let state: State = py_state.into();
+    poke_engine::engine::evaluate::evaluate(&state)
 }
 
 /// The fixed-length feature vector of `state` from `side`'s perspective (1 or 2).
@@ -1247,6 +1276,7 @@ fn py_poke_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(generate_instructions, m)?)?;
     m.add_function(wrap_pyfunction!(id, m)?)?;
     m.add_function(wrap_pyfunction!(mcts, m)?)?;
+    m.add_function(wrap_pyfunction!(stock_evaluate, m)?)?;
     m.add_function(wrap_pyfunction!(state_features, m)?)?;
     m.add_function(wrap_pyfunction!(state_feature_names, m)?)?;
     m.add("FEATURE_VERSION", FEATURE_VERSION)?;

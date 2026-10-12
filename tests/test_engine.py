@@ -5,6 +5,8 @@ Requires the fork to be installed in the project venv (scripts/build_engine.ps1)
 
 from __future__ import annotations
 
+import math
+
 import pytest
 
 poke_engine = pytest.importorskip("poke_engine")
@@ -173,3 +175,37 @@ def test_multithreaded_search_accepts_evaluator():
     )
     assert result.total_visits >= 3000
     assert _closecombat_share(result) > 0.5
+
+
+def test_leaf_scale_default_getter_and_validation(tmp_path):
+    assert Evaluator.linear(_opp_hp_weights(-3.0)).leaf_scale == 1.0
+    assert Evaluator.linear(_opp_hp_weights(-3.0), leaf_scale=2.5).leaf_scale == 2.5
+    path = tmp_path / "s.pev"
+    poke_engine.write_linear(str(path), _opp_hp_weights(-3.0), 0.0)
+    assert Evaluator.load(str(path), leaf_scale=4.0).leaf_scale == 4.0
+    mlp = Evaluator.mlp([0.0] * FEATURE_LENGTH, [0.0], [0.0], leaf_scale=0.5)
+    assert mlp.leaf_scale == 0.5
+    for bad in (0.0, -1.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError):
+            Evaluator.linear(_opp_hp_weights(-3.0), leaf_scale=bad)
+        with pytest.raises(ValueError):
+            Evaluator.load(str(path), leaf_scale=bad)
+        with pytest.raises(ValueError):
+            Evaluator.mlp([0.0] * FEATURE_LENGTH, [0.0], [0.0], leaf_scale=bad)
+
+
+def test_logit_and_stock_evaluate_bindings():
+    ev = Evaluator.linear(_opp_hp_weights(-3.0), bias=0.5)
+    state = make_state()
+    assert ev.logit(state) == ev.evaluate(state)
+    assert isinstance(poke_engine.evaluate(state), float)
+    assert math.isfinite(poke_engine.evaluate(state))
+    assert poke_engine.evaluate(state) == poke_engine.evaluate(make_state())
+
+
+def test_leaf_scale_does_not_change_logit():
+    state = make_state()
+    a = Evaluator.linear(_opp_hp_weights(-3.0))
+    b = Evaluator.linear(_opp_hp_weights(-3.0), leaf_scale=3.0)
+    assert a.logit(state) == b.logit(state)
+    assert monte_carlo_tree_search(state, iterations=200, evaluator=b).total_visits > 0

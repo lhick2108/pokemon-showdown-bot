@@ -440,10 +440,15 @@ class Evaluator:
     """Learned leaf evaluator for MCTS (linear or 2-layer MLP). Output is a logit of P(side one wins)."""
 
     @staticmethod
-    def load(path: str, relative_to_root: bool = True) -> "Evaluator": ...
+    def load(
+        path: str, relative_to_root: bool = True, leaf_scale: float = 1.0
+    ) -> "Evaluator": ...
     @staticmethod
     def linear(
-        weights: List[float], bias: float = 0.0, relative_to_root: bool = True
+        weights: List[float],
+        bias: float = 0.0,
+        relative_to_root: bool = True,
+        leaf_scale: float = 1.0,
     ) -> "Evaluator": ...
     @staticmethod
     def mlp(
@@ -452,15 +457,25 @@ class Evaluator:
         w2: List[float],
         b2: float = 0.0,
         relative_to_root: bool = True,
+        leaf_scale: float = 1.0,
     ) -> "Evaluator": ...
     def save(self, path: str) -> None: ...
     def evaluate(self, py_state: State) -> float: ...
+    def logit(self, py_state: State) -> float:
+        """Model logit of P(side one wins); same as ``evaluate``."""
+        ...
+    @property
+    def leaf_scale(self) -> float: ...
     @property
     def kind(self) -> str: ...
     @property
     def hidden_size(self) -> int: ...
     @property
     def relative_to_root(self) -> bool: ...
+
+def evaluate(py_state: State) -> float:
+    """Stock hand-written evaluation (eval points) of the state."""
+    ...
 
 def state_features(py_state: State, side: int = 1) -> List[float]:
     """Fixed-length feature vector (length FEATURE_LENGTH) from side's perspective."""

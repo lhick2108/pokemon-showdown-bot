@@ -8,6 +8,11 @@
 //!   log-odds so no 0.0125 scale), or
 //! * absolute: `sigmoid(z_leaf)` (AlphaZero style).
 //!
+//! Both are multiplied by a runtime `leaf_scale` k (default 1.0, not stored in
+//! the weights file): `sigmoid(k * (z_leaf - z_root))` / `sigmoid(k * z_leaf)`.
+//! A net trained on noisy outcomes has logits that barely move between root
+//! and leaf, so k > 1 spreads the scores the way the stock 0.0125 * dEval does.
+//!
 //! Terminal states keep their exact 0 / 1 value, as in stock.
 //!
 //! Weights file format (little endian, see `README.md`):
@@ -54,6 +59,8 @@ pub struct Evaluator {
     model: Model,
     /// If true the leaf score is `sigmoid(z_leaf - z_root)`, else `sigmoid(z_leaf)`.
     pub relative_to_root: bool,
+    /// Multiplies the logit (gap) before the sigmoid. Default 1.0.
+    pub leaf_scale: f32,
 }
 
 /// Per-worker scratch buffers so evaluation does not allocate.
@@ -95,6 +102,7 @@ impl Evaluator {
         Ok(Evaluator {
             model: Model::Linear { w, b },
             relative_to_root: true,
+            leaf_scale: 1.0,
         })
     }
 
@@ -139,12 +147,22 @@ impl Evaluator {
                 b2,
             },
             relative_to_root: true,
+            leaf_scale: 1.0,
         })
     }
 
     pub fn with_relative_to_root(mut self, relative: bool) -> Evaluator {
         self.relative_to_root = relative;
         self
+    }
+
+    /// Set the leaf scale; must be finite and > 0.
+    pub fn with_leaf_scale(mut self, scale: f32) -> Result<Evaluator, String> {
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(format!("leaf_scale must be finite and > 0, got {scale}"));
+        }
+        self.leaf_scale = scale;
+        Ok(self)
     }
 
     pub fn kind_name(&self) -> &'static str {
@@ -212,9 +230,9 @@ impl Evaluator {
     #[inline]
     pub fn score(&self, leaf_logit: f32, root_logit: f32) -> f32 {
         if self.relative_to_root {
-            logistic(leaf_logit - root_logit)
+            logistic(self.leaf_scale * (leaf_logit - root_logit))
         } else {
-            logistic(leaf_logit)
+            logistic(self.leaf_scale * leaf_logit)
         }
     }
 
@@ -488,5 +506,25 @@ mod tests {
         let mut bad = bytes.clone();
         bad[8] = 99; // feature version
         assert!(Evaluator::from_bytes(&bad).is_err());
+    }
+
+    #[test]
+    fn leaf_scale_scales_the_logit_gap() {
+        let ev = Evaluator::linear(vec![0.0; FEATURE_LEN], 0.0).unwrap();
+        assert_eq!(ev.leaf_scale, 1.0);
+        let base = ev.score(0.7, 0.2);
+        assert!((base - logistic(0.5)).abs() < 1e-6);
+        let ev2 = ev.clone().with_leaf_scale(2.0).unwrap();
+        assert!((ev2.score(0.7, 0.2) - logistic(1.0)).abs() < 1e-6);
+        let abs = ev.clone().with_relative_to_root(false).with_leaf_scale(3.0).unwrap();
+        assert!((abs.score(0.5, 99.0) - logistic(1.5)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn leaf_scale_rejects_bad_values() {
+        let ev = Evaluator::linear(vec![0.0; FEATURE_LEN], 0.0).unwrap();
+        for bad in [0.0f32, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(ev.clone().with_leaf_scale(bad).is_err(), "{bad}");
+        }
     }
 }

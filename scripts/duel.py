@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import math
 import os
 import secrets
 import sys
@@ -31,6 +32,8 @@ from showdown_bot.players.search import SearchConfig, SearchNetPlayer, SearchPla
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     p.add_argument("--evaluator", type=Path, required=True, help="learned .pev file")
+    p.add_argument("--leaf-scale", type=float, default=1.0,
+                   help="learned leaf scale k: score = sigmoid(k * dz); net side only")
     p.add_argument("--games", type=bench._positive_int, default=100)
     p.add_argument("--pairs", type=bench._positive_int, default=4, help="parallel pairs")
     p.add_argument("--format", default="gen9randombattle")
@@ -60,7 +63,8 @@ async def _duel_pair(args, share: int, pool):
     )
     net = SearchNetPlayer(
         account_configuration=AccountConfiguration("dn" + secrets.token_hex(5), None),
-        config=SearchConfig(**{**base.__dict__, "evaluator": str(args.evaluator.resolve())}),
+        config=SearchConfig(**{**base.__dict__, "evaluator": str(args.evaluator.resolve()),
+                          "evaluator_scale": args.leaf_scale}),
         executor=pool, **options,
     )
     stock = SearchPlayer(
@@ -92,6 +96,9 @@ async def _run(args):
 
 def main(argv=None) -> int:
     args = _parser().parse_args(argv)
+    if not (math.isfinite(args.leaf_scale) and args.leaf_scale > 0):
+        print(f"--leaf-scale must be finite and > 0, got {args.leaf_scale}", file=sys.stderr)
+        return 2
     if not args.evaluator.is_file():
         print(f"no such evaluator: {args.evaluator}", file=sys.stderr)
         return 2
@@ -109,7 +116,7 @@ def main(argv=None) -> int:
     wins = sum(net.n_won_battles for net, _ in pairs)
     lo, hi = bench.wilson_interval(wins, n)
     print("\n=== duel: search-net vs search ===")
-    print(f"evaluator: {args.evaluator}")
+    print(f"evaluator: {args.evaluator} (leaf scale {args.leaf_scale:g}, net side only)")
     print(f"compute (both sides): {args.search_time_ms} ms/world, parallelism {args.parallelism}, "
           f"worlds {args.worlds or '2 x parallelism (4x early)'}, threads {args.threads}; "
           f"{len(pairs)} parallel pairs, pool of {args.workers}")

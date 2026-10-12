@@ -236,7 +236,7 @@ def test_no_evaluator_passes_none_to_worker(data):
     p, calls, pool = _spy_player(data, config=SearchConfig(search_time_ms=20))
     asyncio.run(p.choose_move(_battle()))
     pool.shutdown()
-    assert calls and all(args[-1] is None for args in calls)
+    assert calls and all(args[3] is None for args in calls)
     assert p.config.evaluator is None
 
 
@@ -248,7 +248,7 @@ def test_evaluator_path_reaches_worker(data, pev_path):
     pool.shutdown()
     assert order.message in _legal(_battle())
     assert p.stats.fallbacks == 0 and p.stats.world_errors == 0
-    assert calls and all(args[-1] == str(pev_path.resolve()) for args in calls)
+    assert calls and all(args[3] == str(pev_path.resolve()) for args in calls)
 
 
 def test_evaluator_env_var_and_search_net_requirement(data, pev_path, monkeypatch):
@@ -288,3 +288,33 @@ def test_worker_loads_evaluator_once_per_process(tmp_path):
         for _ in range(4):
             pool.submit(_worker.search_world, state, 10, 1, str(pev_path)).result()
         assert pool.submit(_worker.evaluator_loads).result() == 1
+
+
+def test_evaluator_scale_config_env_and_worker(data, pev_path, monkeypatch):
+    assert SearchConfig().evaluator_scale == 1.0
+    monkeypatch.setenv("SHOWDOWN_SEARCH_EVALUATOR_SCALE", "2.5")
+    assert SearchConfig.from_env().evaluator_scale == 2.5
+    for bad in ("0", "-1", "nan", "inf", "abc"):
+        monkeypatch.setenv("SHOWDOWN_SEARCH_EVALUATOR_SCALE", bad)
+        assert SearchConfig.from_env().evaluator_scale == 1.0
+    monkeypatch.delenv("SHOWDOWN_SEARCH_EVALUATOR_SCALE")
+    p, calls, pool = _spy_player(
+        data, config=SearchConfig(search_time_ms=20), evaluator=pev_path, evaluator_scale=3.0
+    )
+    asyncio.run(p.choose_move(_battle()))
+    pool.shutdown()
+    assert p.stats.fallbacks == 0 and p.stats.world_errors == 0
+    assert calls and all(args[4] == 3.0 for args in calls)
+    with pytest.raises(ValueError):
+        _spy_player(data, evaluator=pev_path, evaluator_scale=0.0)
+
+
+def test_worker_evaluator_cache_keys_on_scale(tmp_path):
+    from showdown_bot.players import _worker
+
+    path = tmp_path / "scaled.pev"
+    pe.write_linear(str(path), [0.0] * pe.FEATURE_LENGTH, 0.0)
+    a = _worker.get_evaluator(str(path), 1.0)
+    assert _worker.get_evaluator(str(path), 1.0) is a
+    b = _worker.get_evaluator(str(path), 2.0)
+    assert b is not a and b.leaf_scale == 2.0 and a.leaf_scale == 1.0
