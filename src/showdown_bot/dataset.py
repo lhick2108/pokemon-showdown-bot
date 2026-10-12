@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from showdown_bot import recorder
 
 VALUE_BY_RESULT = {recorder.RESULT_WIN: 1.0, recorder.RESULT_TIE: 0.5, recorder.RESULT_LOSS: 0.0}
@@ -52,6 +54,16 @@ class Sample:
     # q_abs = sigmoid(scale * evaluate(state) + logit(avg_score)) (see absolute_search_value).
     search_value_abs: float | None = None
     stock_eval: float | None = None  # poke_engine.evaluate(state), side one's view, not flipped for side two
+    # Position in the recording: ``game_id`` identifies one recording file (one side's
+    # view of one battle), ``decision_idx`` the decision's order in it (0-based, counting
+    # every stored decision). ``decision_q_abs`` / ``decision_q`` are the decision-level
+    # search values (side one's view, never flipped; truth-state absolute q when the
+    # decision has a truth state, else the mean over worlds) shared by all samples of the
+    # decision; used for bootstrapped (TD / n-step) targets.
+    game_id: str = ""
+    decision_idx: int = 0
+    decision_q_abs: float | None = None
+    decision_q: float | None = None
 
     def as_tuple(self) -> tuple[list[float], float, dict[str, float] | None]:
         return self.features, self.value, self.policy
@@ -136,7 +148,7 @@ def iter_samples(
         stats.games += 1
         stats.results[result] += 1
         tag = game["header"].get("battle_tag", "")
-        for decision in game["decisions"]:
+        for decision_idx, decision in enumerate(game["decisions"]):
             policy = decision.get("policy") or None
             q_mean = decision_search_value(decision)
             parsed: dict[str, Any] = {}
@@ -177,6 +189,10 @@ def iter_samples(
                     else absolute_search_value(poke_engine.evaluate(tstate), q_mean, q_eval_scale)
                 )
                 states.append((KIND_TRUTH, tstring, q_mean, t_abs))
+            # decision-level absolute q: the truth state's if there is one, else the world mean
+            dec_abs = abs_mean
+            if truth and decision.get("truth") and states and states[-1][0] == KIND_TRUTH                     and states[-1][3] is not None:
+                dec_abs = states[-1][3]
             for kind, state_string, q, q_abs in states:
                 state = parse(state_string)
                 if state is None:
@@ -195,10 +211,99 @@ def iter_samples(
                         state=state_string,
                         search_value=None if q is None else (q if side == 1 else 1.0 - q),
                         stock_eval=stock_eval,
+                        game_id=str(path),
+                        decision_idx=decision_idx,
+                        decision_q_abs=dec_abs,
+                        decision_q=q_mean,
                         search_value_abs=(
                             None if q_abs is None else (q_abs if side == 1 else 1.0 - q_abs)
                         ),
                     )
+
+
+def _fill_gaps(q: np.ndarray, z: float) -> tuple[np.ndarray, int]:
+    """Replace NaN entries of a decision chain by the next available q, or ``z`` if none."""
+    out = q.astype(np.float64).copy()
+    nxt = z
+    n_gap = 0
+    for t in range(len(out) - 1, -1, -1):
+        if np.isnan(out[t]):
+            out[t] = nxt
+            n_gap += 1
+        else:
+            nxt = out[t]
+    return out, n_gap
+
+
+def td_lambda_returns(q: Sequence[float], z: float, lam: float) -> np.ndarray:
+    """lambda-returns of one recording's decision chain (backward recursion).
+
+    ``q[t]`` is decision t's search value (NaN = missing), t = 0..T-1, and the step
+    after the last decision is the outcome ``z``: ``G[T-1] = z``,
+    ``G[t] = (1-lam) * q[t+1] + lam * G[t+1]``, i.e. the usual
+    ``(1-lam) * sum_n lam^(n-1) q[t+n] + lam^(T-t-1) z``. ``lam=1`` gives ``z``,
+    ``lam=0`` gives ``q[t+1]`` (``z`` for the last decision). Missing q is a gap:
+    it is replaced by the next available q (or z) before the recursion.
+    """
+    qf, _ = _fill_gaps(np.asarray(q, dtype=np.float64), z)
+    g = np.empty_like(qf)
+    if len(qf) == 0:
+        return g
+    g[-1] = z
+    for t in range(len(qf) - 2, -1, -1):
+        g[t] = (1.0 - lam) * qf[t + 1] + lam * g[t + 1]
+    return g
+
+
+def nstep_returns(q: Sequence[float], z: float, n: int) -> np.ndarray:
+    """``G[t] = q[t+n]`` if ``t+n < T`` else ``z`` (gaps filled as in ``td_lambda_returns``)."""
+    qf, _ = _fill_gaps(np.asarray(q, dtype=np.float64), z)
+    T = len(qf)
+    idx = np.arange(T) + n
+    return np.where(idx < T, qf[np.minimum(idx, max(T - 1, 0))] if T else qf, z)
+
+
+def bootstrapped_targets(
+    game_ids: Sequence[str],
+    decision_idx: Sequence[int],
+    decision_q: Sequence[float],
+    z: Sequence[float],
+    mode: str,
+    lam: float = 0.7,
+    n: int = 1,
+    mu: float = 0.0,
+) -> tuple[np.ndarray, dict[str, int]]:
+    """Per-sample TD / n-step targets looking ahead within each recording.
+
+    Samples are grouped by ``game_id`` and ordered by ``decision_idx``; all samples of
+    a decision (world and truth) share its ``decision_q`` (NaN = missing) and get the
+    same target. ``mode`` is ``td`` (lambda-return, ``lam``) or ``nstep`` (``n``);
+    ``mu`` blends the decision's own q: ``(1-mu) * G + mu * q_t`` (own q missing -> G).
+    ``z`` is the outcome per sample (constant within a recording). Returns
+    ``(targets float32, stats)`` with ``stats['gaps']`` missing-q decisions and
+    ``stats['decisions']`` total decisions.
+    """
+    if mode not in ("td", "nstep"):
+        raise ValueError(f"unknown bootstrap mode {mode!r}")
+    gid = np.asarray(game_ids)
+    didx = np.asarray(decision_idx, dtype=np.int64)
+    q = np.asarray(decision_q, dtype=np.float64)
+    zz = np.asarray(z, dtype=np.float64)
+    out = np.empty(len(gid), dtype=np.float32)
+    stats = {"gaps": 0, "decisions": 0}
+    order = np.lexsort((didx, gid))
+    bounds = np.flatnonzero(np.r_[True, gid[order][1:] != gid[order][:-1], True])
+    for a, b in zip(bounds[:-1], bounds[1:]):
+        rows = order[a:b]
+        decs, first, inv = np.unique(didx[rows], return_index=True, return_inverse=True)
+        qd, zg = q[rows][first], float(zz[rows][0])
+        stats["decisions"] += len(decs)
+        stats["gaps"] += int(np.isnan(qd).sum())
+        g = td_lambda_returns(qd, zg, lam) if mode == "td" else nstep_returns(qd, zg, n)
+        if mu:
+            g = np.where(np.isnan(qd), g, (1 - mu) * g + mu * np.nan_to_num(qd))
+        out[rows] = g[inv.ravel()]
+    return out, stats
 
 
 def iter_triples(
@@ -317,3 +422,4 @@ def main(argv: Iterable[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

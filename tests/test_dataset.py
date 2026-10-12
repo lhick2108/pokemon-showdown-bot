@@ -137,3 +137,61 @@ def test_search_value_abs_in_samples(tmp_path, state_string):
     assert s1.stock_eval == ev
     truth = [s for s in dataset.iter_samples(tmp_path) if s.kind == "truth"][0]
     assert abs(truth.search_value_abs - expect) < 1e-9
+
+
+# --- bootstrapped (TD / n-step) targets (589.21) ---------------------------------------
+
+import numpy as np  # noqa: E402
+
+
+def _brute_td(q, z, lam):
+    T = len(q)
+    out = []
+    for t in range(T):
+        g = sum((1 - lam) * lam ** (n - 1) * q[t + n] for n in range(1, T - t))
+        out.append(g + lam ** (T - t - 1) * z)
+    return np.array(out)
+
+
+def test_td_recursion_matches_brute_force():
+    rng = np.random.default_rng(0)
+    for _ in range(20):
+        T = int(rng.integers(1, 12))
+        q, z, lam = rng.random(T), float(rng.choice([0.0, 0.5, 1.0])), float(rng.random())
+        np.testing.assert_allclose(
+            dataset.td_lambda_returns(q, z, lam), _brute_td(q, z, lam), atol=1e-12)
+
+
+def test_td_limits_and_nstep():
+    q = np.array([0.2, 0.4, 0.6, 0.8])
+    np.testing.assert_allclose(dataset.td_lambda_returns(q, 1.0, 1.0), 1.0)
+    np.testing.assert_allclose(dataset.td_lambda_returns(q, 0.0, 0.0), [0.4, 0.6, 0.8, 0.0])
+    np.testing.assert_allclose(dataset.nstep_returns(q, 1.0, 1), [0.4, 0.6, 0.8, 1.0])
+    np.testing.assert_allclose(dataset.nstep_returns(q, 1.0, 3), [0.8, 1.0, 1.0, 1.0])
+    np.testing.assert_allclose(dataset.nstep_returns(q, 0.5, 0 + 2), [0.6, 0.8, 0.5, 0.5])
+
+
+def test_gap_falls_back_to_next_available_q_or_z():
+    nan = float("nan")
+    q = np.array([0.2, nan, nan, 0.8, nan])
+    np.testing.assert_allclose(dataset.nstep_returns(q, 1.0, 1), [0.8, 0.8, 0.8, 1.0, 1.0])
+    np.testing.assert_allclose(dataset.td_lambda_returns(q, 1.0, 0.0), [0.8, 0.8, 0.8, 1.0, 1.0])
+    _, st = dataset.bootstrapped_targets(["a"] * 5, range(5), q, [1.0] * 5, "td")
+    assert st == {"gaps": 3, "decisions": 5}
+
+
+def test_grouping_shares_target_across_world_and_truth_samples():
+    # two recordings, shuffled sample order; decision 1 of game "a" has 3 samples
+    gid = ["b", "a", "a", "a", "a", "b", "a"]
+    didx = [0, 1, 1, 0, 1, 1, 2]
+    dq = {("a", 0): 0.3, ("a", 1): 0.5, ("a", 2): 0.9, ("b", 0): 0.1, ("b", 1): 0.2}
+    q = [dq[(g, d)] for g, d in zip(gid, didx)]
+    z = [0.0 if g == "b" else 1.0 for g in gid]
+    out, st = dataset.bootstrapped_targets(gid, didx, q, z, "nstep", n=1)
+    expect = {("a", 0): 0.5, ("a", 1): 0.9, ("a", 2): 1.0, ("b", 0): 0.2, ("b", 1): 0.0}
+    for g, d, o in zip(gid, didx, out):
+        assert o == pytest.approx(expect[(g, d)])
+    out, _ = dataset.bootstrapped_targets(gid, didx, q, z, "nstep", n=1, mu=0.5)
+    for g, d, o in zip(gid, didx, out):
+        assert o == pytest.approx(0.5 * expect[(g, d)] + 0.5 * dq[(g, d)])
+    assert st["decisions"] == 5
