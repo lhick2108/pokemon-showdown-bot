@@ -506,17 +506,25 @@ class Tracker:
         return bad
 
 
-def _make_player(spec: BotSpec, cfg: LeagueConfig, recorder, concurrency: int, salt: int) -> Player:
+def _make_player(spec: BotSpec, cfg: LeagueConfig, recorder, concurrency: int, salt: int,
+                 *, account=None, server=None, wrap=None, extra: dict | None = None) -> Player:
+    """Build a spec's player. The keyword-only hooks serve scripts/ladder.py: a given
+    account/server replaces the local throwaway ones, ``wrap(cls)`` may return a subclass,
+    ``extra`` adds constructor keywords."""
     cls = bench.get_player_class(spec.type)
+    if wrap is not None:
+        cls = wrap(cls)
     kwargs = dict(
         battle_format=cfg.battle_format,
         max_concurrent_battles=concurrency,
-        account_configuration=AccountConfiguration("lg" + secrets.token_hex(5), None),
-        server_configuration=LocalhostServerConfiguration,
+        account_configuration=account
+        or AccountConfiguration("lg" + secrets.token_hex(5), None),
+        server_configuration=server or LocalhostServerConfiguration,
         log_level=logging.ERROR,
         open_timeout=cfg.connect_timeout,
         save_replays=str(cfg.out / "replays"),
     )
+    kwargs.update(extra or {})
     if spec.type in SEARCH_BOTS:
         from showdown_bot.players.search import SearchConfig, get_pool
 
