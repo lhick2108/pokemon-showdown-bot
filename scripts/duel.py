@@ -51,6 +51,14 @@ def _parser() -> argparse.ArgumentParser:
                    help="final move rule of the net side (default mixed; nash needs --threads 1)")
     p.add_argument("--stock-mode", choices=MODES, default="mixed",
                    help="final move rule of the stock side (default mixed)")
+    p.add_argument("--net-inference", choices=("on", "off"), default="on",
+                   help="589.28 opponent set inference on the net side (default on)")
+    p.add_argument("--stock-inference", choices=("on", "off"), default="on",
+                   help="589.28 opponent set inference on the stock side (default on)")
+    p.add_argument("--net-damage-inference", choices=("on", "off"), default="on",
+                   help="damage-roll part of the net side's inference (default on)")
+    p.add_argument("--stock-damage-inference", choices=("on", "off"), default="on",
+                   help="damage-roll part of the stock side's inference (default on)")
     p.add_argument("--selection-gamma", type=float, default=0.1,
                    help="exploration rate in (0, 1] for exp3/rm sides")
     p.add_argument("--stock-uses-evaluator", action="store_true",
@@ -89,6 +97,8 @@ async def _duel_pair(args, share: int, pool):
         account_configuration=AccountConfiguration("dn" + secrets.token_hex(5), None),
         config=SearchConfig(**{**base.__dict__, **evaluator_fields,
                           "selection": args.net_selection,
+                          "inference": args.net_inference == "on",
+                          "damage_inference": args.net_damage_inference == "on",
                           "mode": args.net_mode}),
         executor=pool, **options,
     )
@@ -98,6 +108,8 @@ async def _duel_pair(args, share: int, pool):
         config=SearchConfig(**{
             **base.__dict__, **(evaluator_fields if args.stock_uses_evaluator and args.evaluator else {}),
             "selection": args.stock_selection,
+            "inference": args.stock_inference == "on",
+            "damage_inference": args.stock_damage_inference == "on",
             "mode": args.stock_mode,
         }),
         executor=pool, **options,

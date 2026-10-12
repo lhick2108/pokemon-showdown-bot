@@ -177,6 +177,8 @@ class SearchConfig:
     selection_gamma: float = 0.1  # exploration rate for exp3 / rm
     nash_pseudocount: float = nash_module.DEFAULT_PSEUDOCOUNT  # mode="nash": cell shrinkage c
     nash_floor: float = DEFAULT_NASH_FLOOR  # mode="nash": drop actions below this share
+    inference: bool = True  # 589.28 opponent set inference (False: pre-589.28 sampling)
+    damage_inference: bool = True  # ...of which: damage-roll inference (needs inference)
 
     @classmethod
     def from_env(cls) -> SearchConfig:
@@ -202,6 +204,10 @@ class SearchConfig:
                 NASH_PSEUDOCOUNT_ENV, nash_module.DEFAULT_PSEUDOCOUNT, 0.0, math.inf
             ),
             nash_floor=_env_float(NASH_FLOOR_ENV, DEFAULT_NASH_FLOOR, 0.0, 1.0),
+            inference=os.environ.get("SHOWDOWN_INFERENCE", "1").strip().lower()
+            not in ("0", "off", "false", "no"),
+            damage_inference=os.environ.get("SHOWDOWN_INFERENCE_DAMAGE", "1").strip().lower()
+            not in ("0", "off", "false", "no"),
         )
 
     def plan(self, early: bool) -> tuple[int, int]:
@@ -255,9 +261,20 @@ def total_stats() -> SearchStats:
     return total
 
 
+def inference_summary() -> str:
+    """One line on the 589.28 opponent-set inference cost and effect."""
+    from showdown_bot import damage_infer, sets
+
+    return (
+        f"event_inference_seconds={sets.INFERENCE_SECONDS[0]:.2f} "
+        f"damage[{damage_infer.total_damage_stats().summary()}]"
+    )
+
+
 def _print_total_stats() -> None:
     if _ALL_STATS and any(stats.decisions for stats in _ALL_STATS):
         print(f"search player stats: {total_stats().summary()}", file=sys.stderr, flush=True)
+        print(f"inference stats: {inference_summary()}", file=sys.stderr, flush=True)
 
 
 atexit.register(_print_total_stats)
@@ -478,6 +495,10 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             self.config = dataclasses.replace(self.config, nash_pseudocount=float(nash_pseudocount))
         if nash_floor is not None:
             self.config = dataclasses.replace(self.config, nash_floor=float(nash_floor))
+        if not self.config.inference:
+            self.opponent_model.inference_enabled = False
+        if not self.config.damage_inference:
+            self.opponent_model.damage_enabled = False
         if self.config.mode not in MODES:
             raise ValueError(f"mode must be one of {MODES}, got {self.config.mode!r}")
         if self.config.mode == NASH and self.config.threads > 1:

@@ -1054,7 +1054,12 @@ def build_state(
         opp_entries, opp_active_mon, battle, battle.opponent_side_conditions, is_ours=False
     )
 
-    # --- field ---
+    raw_state = pe.State(side_one=side_one, side_two=side_two, **field_kwargs(battle))
+    return _normalise_state(raw_state, our_entries)
+
+
+def field_kwargs(battle: Any) -> dict[str, Any]:
+    """Weather / terrain / Trick Room keyword arguments of ``pe.State``."""
     weather_id, weather_turns = "none", 0
     for weather, start_turn in battle.weather.items():
         mapped = _WEATHER_IDS.get(weather)
@@ -1074,9 +1079,7 @@ def build_state(
             trick_room = True
             trick_room_turns = _remaining_turns(start_turn, battle.turn, 5)
 
-    raw_state = pe.State(
-        side_one=side_one,
-        side_two=side_two,
+    return dict(
         weather=weather_id,
         weather_turns_remaining=weather_turns,
         terrain=terrain_id,
@@ -1084,6 +1087,9 @@ def build_state(
         trick_room=trick_room,
         trick_room_turns_remaining=trick_room_turns,
     )
+
+
+def _normalise_state(raw_state: Any, our_entries: Sequence[Any]) -> BuiltState:
     # Round trip through the engine's own serialisation: this validates every
     # id (unknown species/moves/abilities/items decay to "none") and gives us
     # the engine-normalised names used by ``choice_to_order``.
