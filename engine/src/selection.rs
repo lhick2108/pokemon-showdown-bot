@@ -51,95 +51,143 @@ impl Default for SelectionConfig {
     }
 }
 
-/// Exp3 mixed strategy from cumulative importance-weighted rewards `g`.
-pub fn exp3_sigma(g: &[f64], gamma: f64, out: &mut [f64]) {
-    let k = g.len() as f64;
-    let eta = gamma / k;
-    let max = g.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let mut sum = 0.0;
-    for (o, &gi) in out.iter_mut().zip(g) {
-        *o = (eta * (gi - max)).exp();
-        sum += *o;
-    }
-    for o in out.iter_mut() {
-        *o = (1.0 - gamma) * (*o / sum) + gamma / k;
-    }
-}
+/// Largest number of options per side the inline arrays hold (4 moves + 4 tera
+/// moves + 5 switches = 13 at most).
+pub const MAX_OPTIONS: usize = 16;
 
-/// Regret-matching mixed strategy (with uniform exploration) from regrets `r`.
-pub fn rm_sigma(r: &[f64], gamma: f64, out: &mut [f64]) {
-    let k = r.len() as f64;
-    let pos_sum: f64 = r.iter().map(|x| x.max(0.0)).sum();
-    for (o, &ri) in out.iter_mut().zip(r) {
-        let base = if pos_sum > 0.0 {
-            ri.max(0.0) / pos_sum
-        } else {
-            1.0 / k
-        };
-        *o = (1.0 - gamma) * base + gamma / k;
-    }
-}
+/// Exp3 weights are renormalised when one exceeds this, and floored (relative to
+/// the new maximum) so that an arm never underflows to a permanent zero.
+const EXP3_RENORM_AT: f32 = 1e20;
+const EXP3_RENORM_SCALE: f32 = 1e-20;
 
-/// Per-node, per-side state for Exp3 / RM.
+/// Per-node, per-side state for Exp3 / RM. Fixed-size inline arrays (no heap
+/// allocation of its own); `NodeStats` boxes both sides once per node.
+///
+/// * Exp3 keeps `acc[i] = exp(eta * (G_i - shift))` incrementally (only the
+///   updated arm changes), so `select` needs one multiply per arm and no `exp`.
+/// * RM keeps `acc[i] = R_i` and `pos_sum = sum R^+`, refreshed in `update`.
 #[derive(Debug)]
 pub struct SideStats {
     mode: SelectionMode,
-    gamma: f64,
-    /// cumulative importance-weighted reward (Exp3) or regret (RM)
-    acc: Vec<f64>,
+    k: usize,
+    gamma: f32,
+    eta: f32,
+    pos_sum: f32,
+    acc: [f32; MAX_OPTIONS],
     /// the strategy used at the most recent selection
-    sigma: Vec<f64>,
-    /// cumulative strategy S
-    avg: Vec<f64>,
+    sigma: [f32; MAX_OPTIONS],
+    /// cumulative strategy S (f64: millions of small additions)
+    avg: [f64; MAX_OPTIONS],
 }
 
 impl SideStats {
     pub fn new(cfg: &SelectionConfig, k: usize) -> SideStats {
+        assert!(
+            k > 0 && k <= MAX_OPTIONS,
+            "selection supports at most {} options per side (got {})", MAX_OPTIONS, k
+        );
+        let mut acc = [0.0; MAX_OPTIONS];
+        if cfg.mode == SelectionMode::Exp3 {
+            acc[..k].fill(1.0);
+        }
         SideStats {
             mode: cfg.mode,
-            gamma: cfg.gamma,
-            acc: vec![0.0; k],
-            sigma: vec![1.0 / k as f64; k],
-            avg: vec![0.0; k],
+            k,
+            gamma: cfg.gamma as f32,
+            eta: (cfg.gamma / k as f64) as f32,
+            pos_sum: 0.0,
+            acc,
+            sigma: [1.0 / k as f32; MAX_OPTIONS],
+            avg: [0.0; MAX_OPTIONS],
         }
     }
 
     /// Compute sigma, add it to the average strategy, and sample an action.
     pub fn select(&mut self, rng: &mut impl Rng) -> usize {
+        let k = self.k;
+        let explore = self.gamma / k as f32;
         match self.mode {
-            SelectionMode::Exp3 => exp3_sigma(&self.acc, self.gamma, &mut self.sigma),
-            SelectionMode::Rm => rm_sigma(&self.acc, self.gamma, &mut self.sigma),
+            SelectionMode::Exp3 => {
+                let sum: f32 = self.acc[..k].iter().sum();
+                let scale = (1.0 - self.gamma) / sum;
+                for (s, &w) in self.sigma[..k].iter_mut().zip(&self.acc[..k]) {
+                    *s = w * scale + explore;
+                }
+            }
+            SelectionMode::Rm => {
+                if self.pos_sum > 0.0 {
+                    let scale = (1.0 - self.gamma) / self.pos_sum;
+                    for (s, &r) in self.sigma[..k].iter_mut().zip(&self.acc[..k]) {
+                        *s = r.max(0.0) * scale + explore;
+                    }
+                } else {
+                    self.sigma[..k].fill((1.0 - self.gamma) / k as f32 + explore);
+                }
+            }
             SelectionMode::Ucb1 => unreachable!("SideStats is not used for ucb1"),
         }
-        for (a, s) in self.avg.iter_mut().zip(&self.sigma) {
-            *a += *s;
-        }
-        let mut threshold: f64 = rng.random_range(0.0..1.0);
-        for (i, s) in self.sigma.iter().enumerate() {
-            threshold -= *s;
-            if threshold < 0.0 {
-                return i;
+        let mut threshold: f32 = rng.random::<f32>();
+        let mut pick = k - 1;
+        let mut found = false;
+        for i in 0..k {
+            let s = self.sigma[i];
+            self.avg[i] += s as f64;
+            if !found {
+                if threshold < s {
+                    pick = i;
+                    found = true;
+                } else {
+                    threshold -= s;
+                }
             }
         }
-        self.sigma.len() - 1
+        pick
     }
 
     /// Update after action `chosen` (selected with the current `sigma`) earned `reward`.
-    pub fn update(&mut self, chosen: usize, reward: f64) {
+    pub fn update(&mut self, chosen: usize, reward: f32) {
         let est = reward / self.sigma[chosen];
         match self.mode {
-            SelectionMode::Exp3 => self.acc[chosen] += est,
-            SelectionMode::Rm => {
-                for (j, r) in self.acc.iter_mut().enumerate() {
-                    *r += if j == chosen { est } else { 0.0 } - reward;
+            SelectionMode::Exp3 => {
+                let w = self.acc[chosen] * (self.eta * est).exp();
+                self.acc[chosen] = w;
+                if w > EXP3_RENORM_AT {
+                    for x in self.acc[..self.k].iter_mut() {
+                        *x = (*x * EXP3_RENORM_SCALE).max(EXP3_RENORM_SCALE);
+                    }
                 }
+            }
+            SelectionMode::Rm => {
+                self.acc[chosen] += est;
+                let mut pos = 0.0;
+                for r in self.acc[..self.k].iter_mut() {
+                    *r -= reward;
+                    pos += r.max(0.0);
+                }
+                self.pos_sum = pos;
             }
             SelectionMode::Ucb1 => {}
         }
     }
 
     pub fn avg_strategy(&self) -> &[f64] {
-        &self.avg
+        &self.avg[..self.k]
+    }
+}
+
+/// Both sides' state for one node, allocated once at first selection.
+#[derive(Debug)]
+pub struct NodeStats {
+    pub s1: SideStats,
+    pub s2: SideStats,
+}
+
+impl NodeStats {
+    pub fn new(cfg: &SelectionConfig, k1: usize, k2: usize) -> NodeStats {
+        NodeStats {
+            s1: SideStats::new(cfg, k1),
+            s2: SideStats::new(cfg, k2),
+        }
     }
 }
 
@@ -155,26 +203,45 @@ mod tests {
 
     #[test]
     fn sigma_sums_to_one_with_gamma_floor() {
-        let mut out = [0.0; 4];
-        for g in [[0.0; 4], [5.0, -3.0, 1e4, 0.2], [-1e6, -1e6, -1e6, 0.0]] {
-            exp3_sigma(&g, 0.1, &mut out);
-            assert!((out.iter().sum::<f64>() - 1.0).abs() < 1e-9);
-            assert!(out.iter().all(|&s| s >= 0.1 / 4.0 - 1e-12 && s.is_finite()));
-            rm_sigma(&g, 0.1, &mut out);
-            assert!((out.iter().sum::<f64>() - 1.0).abs() < 1e-9);
-            assert!(out.iter().all(|&s| s >= 0.1 / 4.0 - 1e-12));
+        for mode in [SelectionMode::Exp3, SelectionMode::Rm] {
+            let mut rng = StdRng::seed_from_u64(3);
+            let mut st = SideStats::new(&cfg(mode, 0.1), 4);
+            for n in 0..5000 {
+                let i = st.select(&mut rng);
+                let sum: f32 = st.sigma[..4].iter().sum();
+                assert!((sum - 1.0).abs() < 1e-4, "{mode:?} {n}: {:?}", st.sigma);
+                assert!(st.sigma[..4].iter().all(|&s| s >= 0.1 / 4.0 - 1e-6 && s.is_finite()));
+                st.update(i, if i == 2 { 1.0 } else { 0.0 });
+            }
         }
     }
 
     #[test]
-    fn rm_uniform_when_no_positive_regret_and_proportional_otherwise() {
-        let mut out = [0.0; 3];
-        rm_sigma(&[-1.0, -2.0, 0.0], 0.1, &mut out);
-        for s in out {
-            assert!((s - 1.0 / 3.0).abs() < 1e-12);
+    fn exp3_weights_stay_finite_under_extreme_gaps() {
+        let mut rng = StdRng::seed_from_u64(5);
+        let mut st = SideStats::new(&cfg(SelectionMode::Exp3, 0.1), 3);
+        for _ in 0..2_000_000 {
+            let i = st.select(&mut rng);
+            st.update(i, if i == 0 { 1.0 } else { 0.0 });
         }
-        rm_sigma(&[3.0, 1.0, -5.0], 0.0, &mut out);
-        assert!((out[0] - 0.75).abs() < 1e-12 && (out[1] - 0.25).abs() < 1e-12 && out[2] == 0.0);
+        assert!(st.acc[..3].iter().all(|w| w.is_finite() && *w > 0.0));
+        assert!(st.sigma[0] > 0.85, "{:?}", st.sigma);
+    }
+
+    #[test]
+    fn rm_uniform_when_no_positive_regret_and_proportional_otherwise() {
+        let mut rng = StdRng::seed_from_u64(1);
+        let mut st = SideStats::new(&cfg(SelectionMode::Rm, 0.1), 3);
+        st.select(&mut rng);
+        for s in &st.sigma[..3] {
+            assert!((s - 1.0 / 3.0).abs() < 1e-6);
+        }
+        let mut st = SideStats::new(&cfg(SelectionMode::Rm, 0.0), 3);
+        st.acc[..3].copy_from_slice(&[3.0, 1.0, -5.0]);
+        st.pos_sum = 4.0;
+        st.select(&mut rng);
+        assert!((st.sigma[0] - 0.75).abs() < 1e-6 && (st.sigma[1] - 0.25).abs() < 1e-6);
+        assert_eq!(st.sigma[2], 0.0);
     }
 
     #[test]
@@ -184,17 +251,21 @@ mod tests {
         let i = e.select(&mut rng);
         let s = e.sigma[i];
         e.update(i, 0.6);
-        assert!((e.acc[i] - 0.6 / s).abs() < 1e-12 && e.acc[1 - i] == 0.0);
+        let eta = 0.1f32 / 2.0;
+        assert!((e.acc[i] - (eta * 0.6 / s).exp()).abs() < 1e-5 && e.acc[1 - i] == 1.0);
 
         let mut m = SideStats::new(&cfg(SelectionMode::Rm, 0.1), 3);
         let i = m.select(&mut rng);
         let s = m.sigma[i];
         m.update(i, 0.5);
+        let mut pos = 0.0;
         for j in 0..3 {
             let want = if j == i { 0.5 / s - 0.5 } else { -0.5 };
-            assert!((m.acc[j] - want).abs() < 1e-12);
+            assert!((m.acc[j] - want).abs() < 1e-5);
+            pos += want.max(0.0);
         }
-        assert!((m.avg_strategy().iter().sum::<f64>() - 1.0).abs() < 1e-9);
+        assert!((m.pos_sum - pos).abs() < 1e-5);
+        assert!((m.avg_strategy().iter().sum::<f64>() - 1.0).abs() < 1e-6);
     }
 
     /// Self-play on a zero-sum matrix game (row player payoff in [0,1]).
@@ -207,8 +278,8 @@ mod tests {
             let i = a.select(&mut rng);
             let j = b.select(&mut rng);
             let r = payoff[i][j];
-            a.update(i, r);
-            b.update(j, 1.0 - r);
+            a.update(i, r as f32);
+            b.update(j, 1.0 - r as f32);
         }
         let norm = |v: &[f64]| {
             let t: f64 = v.iter().sum();

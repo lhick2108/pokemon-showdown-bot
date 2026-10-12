@@ -12,9 +12,9 @@ exploitable strategies. A runtime mode selects the tree policy:
 
 K is the side's option count at that node, rewards are in [0, 1] from that
 side's view (side two uses `1 - r`), the action is *sampled* from sigma, and
-the average strategy S_i += sigma_i is accumulated per visit. The softmax uses
-max-subtraction; G, R and S are `f64`. Per-node stats are allocated lazily and
-only when the mode needs them (`Node.s1_stats/s2_stats` are `None` under
+the average strategy S_i += sigma_i is accumulated per visit. Exp3 keeps exponentiated weights incrementally (renormalised, floored); G, R are `f32` inline arrays (max 16 options), S is `f64`. (was: The softmax uses
+max-subtraction). Per-node stats are allocated lazily and
+only when the mode needs them (`Node.stats` (one inline-array `NodeStats` box for both sides) is `None` under
 ucb1), so the ucb1 path only pays one enum compare per node.
 
 ## Final move
