@@ -429,6 +429,9 @@ class OpponentSlot:
     species_id: str
     sampled: SampledSet
     mon: Any | None = None  # poke-env Pokemon if this slot has been revealed
+    # A Zoroark wearing ``mon``'s Illusion: ``mon`` carries the HP/status/boosts
+    # but its species, types and set are the Zoroark's (task 589.9).
+    disguised: bool = False
 
 
 def sample_opponent_team(
@@ -438,11 +441,18 @@ def sample_opponent_team(
     rng: random.Random,
     *,
     team_size: int = TEAM_SIZE,
+    illusion: Any | None = None,
+    illusion_rng: random.Random | None = None,
 ) -> list[OpponentSlot]:
     """Build one determinized opponent team for ``battle``.
 
     The active Pokemon (if any) comes first, then the other revealed Pokemon in
     battle order, then sampled unrevealed slots up to ``team_size``.
+
+    ``illusion`` (an ``IllusionEstimate``) makes the world sample the active
+    Pokemon as a disguised Zoroark with the estimated probability, drawn from
+    ``illusion_rng`` (a separate stream, so the world sampling is unchanged
+    whenever the probability is zero): see ``_apply_illusion``.
     """
     revealed = list(battle.opponent_team.items())
     active = battle.opponent_active_pokemon
@@ -458,6 +468,8 @@ def sample_opponent_team(
             sampled = tracker.sample(rng)
             slot = OpponentSlot(to_id(sampled.species), sampled, mon)
         slots.append(slot)
+    if illusion is not None and illusion_rng is not None and slots:
+        _apply_illusion(slots, active, illusion, sampler, illusion_rng)
     team = [info for info in (sampler.info(s.species_id) for s in slots) if info]
     while len(slots) < team_size:
         species_id = sampler.sample_species(team, rng, team_size=team_size)
@@ -469,6 +481,54 @@ def sample_opponent_team(
         if info:
             team.append(info)
     return slots
+
+
+def _apply_illusion(
+    slots: list[OpponentSlot],
+    active: Any,
+    illusion: Any,
+    sampler: TeamSampler,
+    illusion_rng: random.Random,
+) -> bool:
+    """With the estimated probability make ``slots[0]`` a disguised Zoroark.
+
+    The roll walks the per-form probabilities cumulatively (they sum to at
+    most one, forms are exclusive by Species Clause). The Zoroark takes over
+    the active ``mon`` (its HP, status, boosts and volatile state are real);
+    the shown species becomes a full-health unrevealed bench member, the
+    Pokemon the Zoroark is copying. A revealed living Zoroark is reused as the
+    active one. Returns whether the world was converted.
+    """
+    probabilities = getattr(illusion, "probabilities", {})
+    if not probabilities or slots[0].mon is not active or active is None:
+        return False
+    roll = illusion_rng.random()
+    chosen = None
+    cumulative = 0.0
+    for form, probability in probabilities.items():
+        cumulative += probability
+        if probability > 0 and roll < cumulative:
+            chosen = form
+            break
+    if chosen is None:
+        return False
+    shown = slots[0]
+    existing = next(
+        (i for i, slot in enumerate(slots) if slot.species_id == chosen and i > 0), None
+    )
+    if existing is not None:
+        zoroark = slots.pop(existing)
+        zoroark = OpponentSlot(zoroark.species_id, zoroark.sampled, active, True)
+    else:
+        tracker = getattr(illusion, "trackers", {}).get(chosen)
+        sampled = (
+            tracker.sample(illusion_rng) if tracker is not None
+            else sampler.sample_set(chosen, illusion_rng)
+        )
+        zoroark = OpponentSlot(chosen, sampled, active, True)
+    slots[0] = zoroark
+    slots.append(OpponentSlot(shown.species_id, shown.sampled, None))
+    return True
 
 
 def _slot_without_tracker(mon: Any, sampler: TeamSampler, rng: random.Random) -> OpponentSlot | None:
@@ -835,7 +895,7 @@ def _opponent_pokemon(slot: OpponentSlot, battle: Any) -> tuple[pe.Pokemon, list
     if entry is not None:
         evs, ivs = randbats_evs_ivs(slot.species_id, level, move_ids, ability, item)
         stats = compute_stats(entry["baseStats"], level, evs, ivs)
-        types = _types_pair(mon.base_types) if mon is not None else _types_pair(
+        types = _types_pair(mon.base_types) if mon is not None and not slot.disguised else _types_pair(
             [t.lower() for t in entry["types"]]
         )
         weight = float(entry["weightkg"])

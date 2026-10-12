@@ -162,6 +162,7 @@ class SearchStats:
     iterations: int = 0
     search_ms: int = 0  # sum over searched worlds of the per-world time budget
     unknown_ids: int = 0
+    illusion_worlds: int = 0  # worlds whose active opponent was sampled as Zoroark
     fallback_reasons: Counter = field(default_factory=Counter)
 
     def summary(self) -> str:
@@ -171,7 +172,8 @@ class SearchStats:
             f"fallbacks={self.fallbacks}"
             + (f" ({reasons})" if reasons else "")
             + f" worlds={self.worlds_run} world_errors={self.world_errors} "
-            f"iterations={self.iterations} engine_unknown_ids={self.unknown_ids}"
+            f"iterations={self.iterations} engine_unknown_ids={self.unknown_ids} "
+            f"illusion_worlds={self.illusion_worlds}"
         )
 
 
@@ -184,7 +186,7 @@ def total_stats() -> SearchStats:
     for stats in _ALL_STATS:
         for name in (
             "decisions", "searched", "forced", "fallbacks", "worlds_run",
-            "world_errors", "iterations", "search_ms", "unknown_ids",
+            "world_errors", "iterations", "search_ms", "unknown_ids", "illusion_worlds",
         ):
             setattr(total, name, getattr(total, name) + getattr(stats, name))
         total.fallback_reasons.update(stats.fallback_reasons)
@@ -351,6 +353,8 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         _ALL_STATS.append(self.stats)
         self._executor = executor
         self._rng = random.Random(seed)
+        # Separate stream for the Illusion roll so worlds are unchanged at P = 0.
+        self._illusion_rng = random.Random(None if seed is None else f"illusion-{seed}")
         self._sampler = engine_state.TeamSampler(data)
         self.last_policy: dict[str, float] = {}
         self.last_choice: str | None = None
@@ -412,10 +416,20 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             truth_state, truth_status = self._truth_state(battle)
         built = None
         state_strings: list[str] = []
+        try:
+            illusion = self.opponent_model.illusion_estimate(battle)
+        except Exception:  # a suspicion bug must never cost the decision
+            logger.exception("Illusion estimate failed in %s", battle.battle_tag)
+            illusion = None
+        if illusion is not None and illusion.total <= 0:
+            illusion = None
         for _ in range(n_worlds):
             slots = engine_state.sample_opponent_team(
-                battle, trackers, self._sampler, self._rng
+                battle, trackers, self._sampler, self._rng,
+                illusion=illusion, illusion_rng=self._illusion_rng,
             )
+            if slots and slots[0].disguised:
+                self.stats.illusion_worlds += 1
             world = engine_state.build_state(battle, slots)
             built = built or world
             self.stats.unknown_ids += len(world.unknown_ids)

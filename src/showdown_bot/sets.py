@@ -924,12 +924,22 @@ class _ProtocolSession:
     received_abilities: set[str] = field(default_factory=set)
     transformed: bool = False
     mimicked: bool = False
+    # Illusion tells (task 589.9): damaging moves aimed at this Pokemon that
+    # showed ``-immune`` as (move id, attacker identity), moves that dealt
+    # direct damage, whether it Terastallized, and a duplicate-species flag.
+    immune_events: list[tuple[str, tuple[str, str]]] = field(default_factory=list)
+    hit_moves: list[str] = field(default_factory=list)
+    terastallized: bool = False
+    duplicate: str | None = None  # "hp" | "fainted"
 
 
 @dataclass
 class _ProtocolPokemon:
     sessions: list[_ProtocolSession] = field(default_factory=list)
     current: _ProtocolSession | None = None
+    hp: float | None = None  # last HP fraction seen under this name
+    session_start_hp: float | None = None  # ``hp`` when the current session began
+    fainted: bool = False
 
     def begin_session(self) -> _ProtocolSession:
         # A received item remains non-original after switching out and back in.
@@ -952,6 +962,9 @@ class _BattleOpponentState:
     pokemon: dict[tuple[str, str], _ProtocolPokemon] = field(default_factory=dict)
     active_by_slot: dict[tuple[str, str], tuple[str, str]] = field(default_factory=dict)
     pending_item_transfer: _PendingItemTransfer | None = None
+    # (target slot, move id, attacker identity) of the last move aimed at the
+    # other side, until its outcome (-immune/-damage/...) is seen.
+    pending_hit: tuple[tuple[str, str], str, tuple[str, str]] | None = None
 
 
 def _protocol_name(value: Any) -> tuple[str, str] | None:
@@ -1060,6 +1073,124 @@ def _record_protocol_observation(
     observation = (kind, display)
     if observation not in session.observations:
         session.observations.append(observation)
+
+
+def _parse_hp_fraction(value: Any) -> float | None:
+    """HP fraction from a protocol condition such as ``45/100 par`` or ``0 fnt``."""
+    text = str(value).strip().split(" ")[0]
+    if not text or text.startswith("["):
+        return None
+    if "/" in text:
+        current, _, maximum = text.partition("/")
+        try:
+            return max(0.0, min(1.0, float(current) / float(maximum)))
+        except (ValueError, ZeroDivisionError):
+            return None
+    return 0.0 if text == "0" else None
+
+
+# Moves that stop a move from damaging its target (so no direct hit follows).
+_BLOCKING_EFFECTS = frozenset(
+    {
+        "substitute", "protect", "detect", "banefulbunker", "kingsshield",
+        "spikyshield", "silktrap", "burningbulwark", "obstruct", "maxguard",
+    }
+)
+_HP_SLACK = 0.0049  # opponent HP arrives as whole percent
+
+
+def _current_session(
+    state: _BattleOpponentState, identity: tuple[str, str]
+) -> _ProtocolSession:
+    pokemon = state.pokemon.setdefault(identity, _ProtocolPokemon())
+    return pokemon.current or pokemon.begin_session()
+
+
+def _track_illusion(
+    state: _BattleOpponentState, event_type: str, event: Sequence[str]
+) -> None:
+    """Record the protocol facts the Illusion tells need (task 589.9).
+
+    Tracks, per Pokémon name: HP fraction and fainting (for the
+    Species-Clause duplicate tell), type-immunity outcomes and direct hits
+    of the last move aimed at it, and Terastallization. It never changes the
+    set-evidence bookkeeping.
+    """
+    if event_type == "move":
+        state.pending_hit = None
+        actor = _protocol_slot(event[2]) if len(event) > 2 else None
+        target = _protocol_slot(event[4]) if len(event) > 4 else None
+        attacker = _protocol_identity(event[2]) if len(event) > 2 else None
+        if (
+            actor is not None
+            and target is not None
+            and attacker is not None
+            and actor[0] != target[0]
+            and not any(
+                str(part).lower().startswith(("[miss]", "[notarget]"))
+                for part in event[5:]
+            )
+        ):
+            state.pending_hit = (target, to_id(event[3]), attacker)
+        return
+
+    if event_type in {"turn", "switch", "drag", "-miss", "-fail", "-notarget", "cant"}:
+        state.pending_hit = None
+
+    if event_type == "-activate" and len(event) > 3:
+        if _effect_id(event[3]) in _BLOCKING_EFFECTS:
+            state.pending_hit = None
+        return
+
+    if event_type == "faint" and len(event) > 2:
+        identity = _protocol_identity(event[2])
+        if identity is not None:
+            pokemon = state.pokemon.setdefault(identity, _ProtocolPokemon())
+            pokemon.fainted = True
+            pokemon.hp = 0.0
+        return
+
+    if event_type == "-terastallize" and len(event) > 2:
+        identity = _protocol_identity(event[2])
+        if identity is not None:
+            _current_session(state, identity).terastallized = True
+        return
+
+    if event_type == "-immune" and len(event) > 2:
+        pending = state.pending_hit
+        slot = _protocol_slot(event[2])
+        has_cause = any(str(part).strip().startswith("[from]") for part in event[3:])
+        if pending is not None and slot == pending[0] and not has_cause:
+            identity = state.active_by_slot.get(slot) or _protocol_identity(event[2])
+            if identity is not None:
+                session = _current_session(state, identity)
+                if not session.terastallized:
+                    session.immune_events.append((pending[1], pending[2]))
+        if pending is not None and slot == pending[0]:
+            state.pending_hit = None
+        return
+
+    if event_type in {"-damage", "-heal", "-sethp"} and len(event) > 3:
+        identity = _protocol_identity(event[2])
+        if identity is None:
+            return
+        pokemon = state.pokemon.setdefault(identity, _ProtocolPokemon())
+        tags = " ".join(str(part).lower() for part in event[4:])
+        if event_type == "-heal" and "revivalblessing" in to_id(tags):
+            pokemon.fainted = False
+        hp = _parse_hp_fraction(event[3])
+        if hp is not None:
+            pokemon.hp = hp
+        if event_type == "-damage":
+            pending = state.pending_hit
+            slot = _protocol_slot(event[2])
+            if (
+                pending is not None
+                and slot == pending[0]
+                and "[from]" not in tags
+            ):
+                _current_session(state, identity).hit_moves.append(pending[1])
+                state.pending_hit = None
 
 
 def _record_ability_if_original(
@@ -1187,6 +1318,24 @@ def _zoroark_could_be_on_team(team: Mapping[Any, Any]) -> bool:
     return len(team) < 6
 
 
+@dataclass(frozen=True)
+class IllusionEstimate:
+    """``OpponentModel.illusion_estimate`` result.
+
+    ``probabilities`` maps a Zoroark form id to P(the active opponent is that
+    form, disguised). ``trackers`` holds, per form with non-zero probability,
+    a ``SetTracker`` already fed this switch-in's Zoroark-legal observations,
+    for sampling the form's set.
+    """
+
+    probabilities: Mapping[str, float]
+    trackers: Mapping[str, SetTracker]
+
+    @property
+    def total(self) -> float:
+        return sum(self.probabilities.values())
+
+
 class OpponentModel:
     """Persistent opponent-set trackers keyed by battle tag and team id.
 
@@ -1214,8 +1363,9 @@ class OpponentModel:
     switch-in is held on ``SetTracker.provisional_observations`` and never
     narrows roles or feeds ``sample()``. Limitation: a disguised Zoroark
     that only shows things the disguise could also have is indistinguishable
-    from the real Pokémon here; task 589.9 handles that with damage and
-    immunity tells.
+    from the real Pokémon here; ``illusion_probability`` / ``illusion_estimate``
+    (task 589.9, see ``showdown_bot.illusion``) add immunity, duplicate-species
+    and other tells and give P(active opponent is a disguised Zoroark).
     """
 
     def __init__(self, data: RandbatsData):
@@ -1241,6 +1391,7 @@ class OpponentModel:
         try:
             event_type = str(event[1]).lower()
             state = self._battles.setdefault(str(battle_tag), _BattleOpponentState())
+            _track_illusion(state, event_type, event)
 
             if event_type in {"switch", "drag"}:
                 if len(event) < 3:
@@ -1256,9 +1407,25 @@ class OpponentModel:
                     if previous_pokemon is not None:
                         previous_pokemon.current = None
                 pokemon = state.pokemon.setdefault(identity, _ProtocolPokemon())
-                pokemon.begin_session()
+                hp = _parse_hp_fraction(event[4]) if len(event) > 4 else None
+                # Species Clause: a name that comes back alive after fainting,
+                # or with less HP than it left with (nothing damages the
+                # bench), is two different Pokémon, one of them a Zoroark.
+                duplicate = None
+                if pokemon.sessions and hp is not None and hp > 0:
+                    if pokemon.fainted:
+                        duplicate = "fainted"
+                    elif pokemon.hp is not None and hp < pokemon.hp - _HP_SLACK:
+                        duplicate = "hp"
+                session = pokemon.begin_session()
+                session.duplicate = duplicate
+                pokemon.session_start_hp = pokemon.hp
+                if hp is not None:
+                    pokemon.hp = hp
+                    pokemon.fainted = hp <= 0
                 tera = _details_tera(event[3]) if len(event) > 3 else None
                 if tera:
+                    session.terastallized = True
                     _record_protocol_observation(pokemon, "teraTypes", tera)
                 state.active_by_slot[slot] = identity
                 state.pending_item_transfer = None
@@ -1280,6 +1447,10 @@ class OpponentModel:
                 if old_identity != new_identity:
                     old_pokemon = state.pokemon.get(old_identity)
                     new_pokemon = state.pokemon.setdefault(new_identity, _ProtocolPokemon())
+                    # The HP seen under the disguise name was the Zoroark's.
+                    new_pokemon.hp = _parse_hp_fraction(event[4]) if len(event) > 4 else None
+                    if old_pokemon is not None:
+                        old_pokemon.hp = old_pokemon.session_start_hp
                     if old_pokemon is not None and old_pokemon.current is not None:
                         session = old_pokemon.current
                         old_pokemon.sessions.remove(session)
@@ -1618,16 +1789,7 @@ class OpponentModel:
             )
             observations: list[tuple[str, str, bool]] = []
             for session in protocol_pokemon.sessions if protocol_pokemon else ():
-                resolved: list[tuple[str, str]] = []
-                for kind, value in session.observations:
-                    if kind == "abilities":
-                        ability = _resolve_forme_change_ability(
-                            tracker._species_ids, to_id(value)
-                        )
-                        if ability is None:
-                            continue
-                        value = ability
-                    resolved.append((kind, value))
+                resolved = self._resolved_observations(tracker, session)
                 suspect = can_be_disguise and any(
                     to_id(value) not in self._own_option_ids(tracker, kind)
                     and to_id(value) in _zoroark_option_ids(self.data, kind)
@@ -1641,6 +1803,209 @@ class OpponentModel:
             tracker._replace_observations(observations)
 
         return dict(state.trackers)
+
+    @staticmethod
+    def _resolved_observations(
+        tracker: SetTracker, session: _ProtocolSession
+    ) -> list[tuple[str, str]]:
+        resolved: list[tuple[str, str]] = []
+        for kind, value in session.observations:
+            if kind == "abilities":
+                ability = _resolve_forme_change_ability(
+                    tracker._species_ids, to_id(value)
+                )
+                if ability is None:
+                    continue
+                value = ability
+            resolved.append((kind, value))
+        return resolved
+
+    # -- Illusion suspicion (task 589.9) --------------------------------------
+
+    def illusion_probability(self, battle: Any) -> dict[str, float]:
+        """``{zoroark_form_id: P(active opponent is that disguised form)}``.
+
+        Empty when no Zoroark form can be the active one. See
+        ``showdown_bot.illusion`` for the tells and constants.
+        """
+        return dict(self.illusion_estimate(battle).probabilities)
+
+    def illusion_estimate(self, battle: Any) -> IllusionEstimate:
+        """Probabilities plus per-form trackers conditioned on this switch-in."""
+        from showdown_bot import illusion
+
+        empty = IllusionEstimate({}, {})
+        battle_tag = str(
+            getattr(battle, "battle_tag", None) or f"<battle:{id(battle)}>"
+        )
+        state = self._battles.get(battle_tag)
+        team = getattr(battle, "opponent_team", None)
+        active = getattr(battle, "opponent_active_pokemon", None)
+        if state is None or not isinstance(team, Mapping) or active is None:
+            return empty
+        if getattr(active, "fainted", False):
+            return empty
+        key = next((str(k) for k, v in team.items() if v is active), None)
+        identity = _protocol_identity(key) if key is not None else None
+        shown_id = to_id(getattr(active, "species", ""))
+        if key is None or identity is None or not shown_id:
+            return empty
+        tracker = state.trackers.get(key)
+        protocol_pokemon = state.pokemon.get(identity)
+        session = protocol_pokemon.current if protocol_pokemon else None
+
+        data = self.data
+        forms_present = [f for f in _ZOROARK_SPECIES_IDS if data.has_species(f)]
+        if shown_id in _ZOROARK_SPECIES_IDS or not forms_present:
+            return empty
+        revealed = {to_id(getattr(mon, "species", "")): mon for mon in team.values()}
+        revealed_forms = [f for f in _ZOROARK_SPECIES_IDS if f in revealed]
+        revealed_alive = None
+        if revealed_forms:
+            # Species Clause: one Zoroark per team, so a revealed form is it.
+            form = revealed_forms[0]
+            if getattr(revealed[form], "fainted", False):
+                return empty
+            revealed_alive = form
+            weights = {form: 1.0}
+        else:
+            if len(team) >= 6:
+                return empty
+            weights = {
+                f: float(sum(fs.count for fs in data.full_sets(f)))
+                for f in forms_present
+            }
+            if not any(weights.values()):
+                weights = {f: 1.0 for f in forms_present}
+        total_count = float(
+            sum(fs.count for sid in data.species_ids() for fs in data.full_sets(sid))
+        )
+        form_counts = {
+            f: float(sum(fs.count for fs in data.full_sets(f))) for f in weights
+        }
+        unrevealed = max(0, 6 - len(team))
+        alive = unrevealed + sum(
+            1 for mon in team.values() if not getattr(mon, "fainted", False)
+        )
+        prior = illusion.base_rate(
+            form_counts, total_count, unrevealed, alive, revealed_alive
+        )
+
+        immune_types: list[str] = []
+        direct_hit = False
+        kit_suspect = False
+        kit_forms: set[str] | None = None
+        kit_real = False
+        duplicate = None
+        if session is not None:
+            our_team = getattr(battle, "team", None) or {}
+            for move_id, attacker in session.immune_events:
+                move_type = illusion.damaging_move_type(move_id)
+                if move_type is None:
+                    continue
+                attacker_mon = next(
+                    (
+                        mon
+                        for k, mon in our_team.items()
+                        if _protocol_identity(str(k)) == attacker
+                    ),
+                    None,
+                )
+                ability = to_id(getattr(attacker_mon, "ability", "") or "")
+                if ability in illusion.TYPE_CHANGING_ABILITIES:
+                    continue
+                immune_types.append(move_type)
+            direct_hit = any(illusion.is_damaging_move(m) for m in session.hit_moves)
+            if tracker is not None and not (
+                set(tracker._species_ids) & set(_ZOROARK_SPECIES_IDS)
+            ):
+                own_cache: dict[str, set[str]] = {}
+                form_opts = {
+                    (f, kind): self._form_option_ids(f, kind)
+                    for f in weights
+                    for kind in ("moves", "items", "abilities", "teraTypes")
+                }
+                for kind, value in self._resolved_observations(tracker, session):
+                    value_id = to_id(value)
+                    own = own_cache.setdefault(kind, self._own_option_ids(tracker, kind))
+                    in_forms = {f for f in weights if value_id in form_opts[(f, kind)]}
+                    has_data = any(form_opts[(f, kind)] for f in weights)
+                    if value_id not in own:
+                        if in_forms:
+                            kit_suspect = True
+                            kit_forms = (
+                                set(in_forms) if kit_forms is None else kit_forms & in_forms
+                            )
+                    elif has_data and not in_forms:
+                        kit_real = True
+                if kit_suspect and not kit_forms:
+                    kit_suspect, kit_forms = False, None
+            if session.duplicate == "fainted":
+                duplicate = "fainted"
+            elif session.duplicate == "hp" and protocol_pokemon is not None:
+                duplicate = self._classify_duplicate(protocol_pokemon, session, weights)
+
+        evidence = illusion.IllusionEvidence(
+            shown_species=shown_id,
+            form_weights=weights,
+            prior=prior,
+            shown_types=illusion.species_types(shown_id),
+            immune_types=tuple(immune_types),
+            kit_suspect=kit_suspect,
+            kit_forms=kit_forms,
+            kit_real=kit_real,
+            duplicate=duplicate,
+            direct_hit=direct_hit,
+        )
+        probabilities = illusion.estimate(evidence)
+        form_trackers: dict[str, SetTracker] = {}
+        for form, probability in probabilities.items():
+            if probability <= 0:
+                continue
+            form_tracker = SetTracker(data, form)
+            if session is not None and tracker is not None:
+                for kind, value in self._resolved_observations(tracker, session):
+                    if to_id(value) in self._form_option_ids(form, kind):
+                        form_tracker._observe(kind, value)
+            form_trackers[form] = form_tracker
+        return IllusionEstimate(probabilities, form_trackers)
+
+    def _form_option_ids(self, form: str, kind: str) -> set[str]:
+        return {
+            to_id(option)
+            for role in self.data.roles(form).values()
+            for option in role.options(kind)
+        }
+
+    def _classify_duplicate(
+        self,
+        pokemon: _ProtocolPokemon,
+        session: _ProtocolSession,
+        weights: Mapping[str, float],
+    ) -> str:
+        """Which of two Pokémon sharing a name is the Zoroark, if decidable."""
+
+        def zoroark_cannot_have(observations: Sequence[tuple[str, str]]) -> bool:
+            for kind, value in observations:
+                options = [self._form_option_ids(f, kind) for f in weights]
+                if any(options) and all(to_id(value) not in o for o in options):
+                    return True
+            return False
+
+        if zoroark_cannot_have(
+            [obs for obs in session.observations if obs[0] != "abilities"]
+        ):
+            return "current_real"
+        earlier = [
+            obs
+            for other in pokemon.sessions
+            if other is not session
+            for obs in other.observations
+            if obs[0] != "abilities"
+        ]
+        if zoroark_cannot_have(earlier):
+            return "earlier_real"
+        return "ambiguous"
 
     def _own_option_ids(self, tracker: SetTracker, kind: str) -> set[str]:
         return {
