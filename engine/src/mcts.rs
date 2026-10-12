@@ -2,6 +2,7 @@ use crate::engine::generate_instructions::generate_instructions_from_move_pair;
 use crate::engine::state::MoveChoice;
 use crate::instruction::StateInstructions;
 use crate::learned::{Evaluator, LeafEval};
+use crate::selection::{SelectionConfig, SelectionMode, SideStats};
 use crate::state::State;
 use rand::prelude::*;
 use rand::rng;
@@ -23,6 +24,10 @@ pub struct Node {
     // de-coupled for s1 and s2
     pub s1_options: Option<Vec<MoveNode>>,
     pub s2_options: Option<Vec<MoveNode>>,
+
+    // Exp3 / regret-matching state; always None under ucb1
+    pub s1_stats: Option<Box<SideStats>>,
+    pub s2_stats: Option<Box<SideStats>>,
 }
 
 impl Node {
@@ -36,6 +41,8 @@ impl Node {
             s2_choice: 0,
             s1_options: None,
             s2_options: None,
+            s1_stats: None,
+            s2_stats: None,
         }
     }
     unsafe fn populate(&mut self, s1_options: Vec<MoveChoice>, s2_options: Vec<MoveChoice>) {
@@ -78,21 +85,37 @@ impl Node {
         state: &mut State,
         children: &mut HashMap<(usize, usize, usize), Box<[Node]>>,
         rng: &mut impl Rng,
+        sel: &SelectionConfig,
     ) -> (*mut Node, usize, usize) {
         if self.s1_options.is_none() {
             let (s1_options, s2_options) = state.get_all_options();
             self.populate(s1_options, s2_options);
         }
 
-        let s1_mc_index = self.maximize_ucb_for_side(self.s1_options.as_ref().unwrap());
-        let s2_mc_index = self.maximize_ucb_for_side(self.s2_options.as_ref().unwrap());
+        let (s1_mc_index, s2_mc_index) = if sel.mode == SelectionMode::Ucb1 {
+            (
+                self.maximize_ucb_for_side(self.s1_options.as_ref().unwrap()),
+                self.maximize_ucb_for_side(self.s2_options.as_ref().unwrap()),
+            )
+        } else {
+            if self.s1_stats.is_none() {
+                let k1 = self.s1_options.as_ref().unwrap().len();
+                let k2 = self.s2_options.as_ref().unwrap().len();
+                self.s1_stats = Some(Box::new(SideStats::new(sel, k1)));
+                self.s2_stats = Some(Box::new(SideStats::new(sel, k2)));
+            }
+            (
+                self.s1_stats.as_mut().unwrap().select(rng),
+                self.s2_stats.as_mut().unwrap().select(rng),
+            )
+        };
         let key = (self as *mut Node as usize, s1_mc_index, s2_mc_index);
         match children.get_mut(&key) {
             Some(child_vector) => {
                 let child_vec_ptr = child_vector as *mut Box<[Node]>;
                 let chosen_child = self.sample_node(child_vec_ptr, rng);
                 state.apply_instructions(&(*chosen_child).instructions.instruction_list);
-                (*chosen_child).selection(state, children, rng)
+                (*chosen_child).selection(state, children, rng, sel)
             }
             None => (self as *mut Node, s1_mc_index, s2_mc_index),
         }
@@ -172,11 +195,17 @@ impl Node {
             &mut (*self.parent).s1_options.as_mut().unwrap()[self.s1_choice as usize];
         parent_s1_movenode.total_score += score;
         parent_s1_movenode.visits += 1;
+        if let Some(stats) = (*self.parent).s1_stats.as_mut() {
+            stats.update(self.s1_choice as usize, score as f64);
+        }
 
         let parent_s2_movenode =
             &mut (*self.parent).s2_options.as_mut().unwrap()[self.s2_choice as usize];
         parent_s2_movenode.total_score += 1.0 - score;
         parent_s2_movenode.visits += 1;
+        if let Some(stats) = (*self.parent).s2_stats.as_mut() {
+            stats.update(self.s2_choice as usize, (1.0 - score) as f64);
+        }
 
         state.reverse_instructions(&self.instructions.instruction_list);
         (*self.parent).backpropagate(score, state);
@@ -224,6 +253,8 @@ pub struct MctsSideResult {
     pub move_choice: MoveChoice,
     pub total_score: f32,
     pub visits: u32,
+    /// share of the root's average strategy (Exp3 / RM); the visit share under ucb1
+    pub avg_strategy: f32,
 }
 
 impl MctsSideResult {
@@ -249,8 +280,10 @@ fn mcts_iteration(
     children: &mut HashMap<(usize, usize, usize), Box<[Node]>>,
     rng: &mut impl Rng,
     leaf_eval: &mut LeafEval,
+    sel: &SelectionConfig,
 ) {
-    let (mut new_node, s1_move, s2_move) = unsafe { root_node.selection(state, children, rng) };
+    let (mut new_node, s1_move, s2_move) =
+        unsafe { root_node.selection(state, children, rng, sel) };
     new_node = unsafe { (*new_node).expand(state, s1_move, s2_move, children, rng) };
     let rollout_result = unsafe { (*new_node).rollout(state, root_eval, leaf_eval) };
     unsafe { (*new_node).backpropagate(rollout_result, state) }
@@ -268,12 +301,13 @@ fn run_mcts_loop(
     children: &mut HashMap<(usize, usize, usize), Box<[Node]>>,
     limit: SearchLimit,
     leaf_eval: &mut LeafEval,
+    sel: &SelectionConfig,
 ) {
     let mut rng = rng();
     let start_time = std::time::Instant::now();
     loop {
         for _ in 0..1000 {
-            mcts_iteration(root_node, state, root_eval, children, &mut rng, leaf_eval);
+            mcts_iteration(root_node, state, root_eval, children, &mut rng, leaf_eval, sel);
         }
         if root_node.times_visited >= 10_000_000 {
             break;
@@ -320,6 +354,28 @@ pub fn perform_mcts_with(
     max_iterations: u32,
     evaluator: Option<&Evaluator>,
 ) -> MctsResult {
+    perform_mcts_selecting(
+        state,
+        side_one_options,
+        side_two_options,
+        max_time,
+        max_iterations,
+        evaluator,
+        &SelectionConfig::default(),
+    )
+}
+
+/// Like `perform_mcts_with`, with a runtime selection mode (ucb1 / exp3 / rm).
+/// `SelectionConfig::default()` is exactly the stock decoupled-UCB1 search.
+pub fn perform_mcts_selecting(
+    state: &mut State,
+    side_one_options: Vec<MoveChoice>,
+    side_two_options: Vec<MoveChoice>,
+    max_time: Duration,
+    max_iterations: u32,
+    evaluator: Option<&Evaluator>,
+    sel: &SelectionConfig,
+) -> MctsResult {
     let mut leaf_eval = LeafEval::new(evaluator);
     let mut root_node = Node::new();
     unsafe {
@@ -341,33 +397,45 @@ pub fn perform_mcts_with(
         &mut children,
         search_limit,
         &mut leaf_eval,
+        sel,
     );
 
-    let result = MctsResult {
-        s1: root_node
-            .s1_options
-            .as_ref()
-            .unwrap()
+    let side_results = |options: &[MoveNode], stats: &Option<Box<SideStats>>| -> Vec<MctsSideResult> {
+        let total_visits: f32 = options.iter().map(|v| v.visits as f32).sum();
+        let strategy: Vec<f32> = match stats {
+            Some(st) => {
+                let a = st.avg_strategy();
+                let t: f64 = a.iter().sum();
+                a.iter()
+                    .map(|x| if t > 0.0 { (x / t) as f32 } else { 0.0 })
+                    .collect()
+            }
+            None => options
+                .iter()
+                .map(|v| {
+                    if total_visits > 0.0 {
+                        v.visits as f32 / total_visits
+                    } else {
+                        0.0
+                    }
+                })
+                .collect(),
+        };
+        options
             .iter()
-            .map(|v| MctsSideResult {
+            .zip(strategy)
+            .map(|(v, avg_strategy)| MctsSideResult {
                 move_choice: v.move_choice.clone(),
                 total_score: v.total_score,
                 visits: v.visits,
+                avg_strategy,
             })
-            .collect(),
-        s2: root_node
-            .s2_options
-            .as_ref()
-            .unwrap()
-            .iter()
-            .map(|v| MctsSideResult {
-                move_choice: v.move_choice.clone(),
-                total_score: v.total_score,
-                visits: v.visits,
-            })
-            .collect(),
-        iteration_count: root_node.times_visited,
+            .collect()
     };
 
-    result
+    MctsResult {
+        s1: side_results(root_node.s1_options.as_ref().unwrap(), &root_node.s1_stats),
+        s2: side_results(root_node.s2_options.as_ref().unwrap(), &root_node.s2_stats),
+        iteration_count: root_node.times_visited,
+    }
 }

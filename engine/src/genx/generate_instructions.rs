@@ -11036,6 +11036,35 @@ mod tests {
     }
 
     #[test]
+    fn test_mcts_selection_modes_run_and_report_strategies() {
+        use crate::selection::{SelectionConfig, SelectionMode};
+        for mode in [SelectionMode::Ucb1, SelectionMode::Exp3, SelectionMode::Rm] {
+            let mut state = state_with_tackle();
+            let before = state.serialize();
+            let (s1, s2) = state.root_get_all_options();
+            let result = crate::mcts::perform_mcts_selecting(
+                &mut state,
+                s1,
+                s2,
+                std::time::Duration::from_millis(5),
+                3000,
+                None,
+                &SelectionConfig { mode, gamma: 0.1 },
+            );
+            assert!(result.iteration_count >= 3000);
+            assert_eq!(state.serialize(), before, "{:?} must restore the state", mode);
+            for side in [&result.s1, &result.s2] {
+                let total: f32 = side.iter().map(|r| r.avg_strategy).sum();
+                assert!((total - 1.0).abs() < 1e-3, "{:?} strategy sums to {}", mode, total);
+                assert_eq!(
+                    side.iter().map(|r| r.visits).sum::<u32>(),
+                    result.iteration_count
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_encore_without_last_used_move_does_not_panic_and_is_inactive() {
         for last_used in [LastUsedMove::None, LastUsedMove::Switch(PokemonIndex::P1)] {
             let mut state = state_with_tackle();

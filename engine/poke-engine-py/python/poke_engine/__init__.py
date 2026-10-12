@@ -99,11 +99,15 @@ class MctsSideResult:
     :type total_score: float
     :param visits: The number of times the move was chosen
     :type visits: int
+    :param avg_strategy: share of the root's average strategy (the Nash-converging
+        quantity under selection="exp3"/"rm"; equals the visit share under "ucb1")
+    :type avg_strategy: float
     """
 
     move_choice: str
     total_score: float
     visits: int
+    avg_strategy: float = 0.0
 
 
 @dataclass
@@ -131,6 +135,7 @@ class MctsResult:
                     move_choice=i.move_choice,
                     total_score=i.total_score,
                     visits=i.visits,
+                    avg_strategy=i.avg_strategy,
                 )
                 for i in rust_result.s1
             ],
@@ -139,6 +144,7 @@ class MctsResult:
                     move_choice=i.move_choice,
                     total_score=i.total_score,
                     visits=i.visits,
+                    avg_strategy=i.avg_strategy,
                 )
                 for i in rust_result.s2
             ],
@@ -152,6 +158,8 @@ def monte_carlo_tree_search(
     iterations: int = 0,
     threads: int = 1,
     evaluator: "Evaluator | None" = None,
+    selection: str = "ucb1",
+    gamma: float = 0.1,
 ) -> MctsResult:
     """
     Perform monte-carlo-tree-search on the given state and for the given duration
@@ -167,11 +175,16 @@ def monte_carlo_tree_search(
     :param evaluator: None (stock hand-written leaf evaluation, unchanged) or a
         loaded ``Evaluator`` (see ``Evaluator.load``) used to score MCTS leaves
     :type evaluator: Evaluator | None
+    :param selection: "ucb1" (default, decoupled UCB1), "exp3" or "rm" (regret matching
+        with exploration). exp3/rm are single-threaded only (threads > 1 raises ValueError)
+    :type selection: str
+    :param gamma: exploration rate in (0, 1] for exp3/rm; ignored by ucb1
+    :type gamma: float
     :return: the result of the search
     :rtype: MctsResult
     """
     return MctsResult._from_rust(
-        mcts(state, duration_ms, iterations, threads, evaluator)
+        mcts(state, duration_ms, iterations, threads, evaluator, selection, gamma)
     )
 
 
