@@ -40,12 +40,16 @@ def search_world(
     evaluator_scale: float = 1.0,
     selection: str = "ucb1",
     selection_gamma: float = 0.1,
+    joint: bool = False,
 ) -> tuple:
     """Run MCTS on one serialised world.
 
     Returns ``(total_visits, [(our_choice, visits, total_score), ...])``; for
     ``selection`` other than ucb1 a third element is appended: our average-strategy
     share per option (aligned with the list).
+    With ``joint`` (Nash mode) the result is always a 4-tuple: the third element is the
+    strategy list or ``None`` (ucb1), the fourth ``(k2, [(i, j, visits, mean), ...])``,
+    the root joint-action matrix (``k2`` = the opponent's option count).
     Plain tuples keep the result cheap to pickle. A Rust panic surfaces in
     Python as ``pyo3_runtime.PanicException`` (a ``BaseException``), so it is
     converted to an ordinary ``RuntimeError`` here.
@@ -60,11 +64,21 @@ def search_world(
         if selection != "ucb1":
             kwargs["selection"] = selection
             kwargs["gamma"] = float(selection_gamma)
+        if joint:
+            kwargs["return_joint"] = True
         result = monte_carlo_tree_search(state, search_time_ms, threads=threads, **kwargs)
         options = [
             (option.move_choice, int(option.visits), float(option.total_score))
             for option in result.side_one
         ]
+        if joint:
+            cells = [(int(i), int(j), int(v), float(m)) for i, j, v, m in result.joint]
+            strategies = (
+                [float(option.avg_strategy) for option in result.side_one]
+                if selection != "ucb1"
+                else None
+            )
+            return (int(result.total_visits), options, strategies, (len(result.side_two), cells))
         if selection != "ucb1":
             return (
                 int(result.total_visits),

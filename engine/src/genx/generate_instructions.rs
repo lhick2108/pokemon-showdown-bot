@@ -11065,6 +11065,41 @@ mod tests {
     }
 
     #[test]
+    fn test_mcts_joint_matrix_is_consistent() {
+        use crate::selection::{SelectionConfig, SelectionMode};
+        for mode in [SelectionMode::Ucb1, SelectionMode::Exp3, SelectionMode::Rm] {
+            let mut state = state_with_tackle();
+            let (s1, s2) = state.root_get_all_options();
+            let (k1, k2) = (s1.len(), s2.len());
+            let sel = SelectionConfig { mode, gamma: 0.1 };
+            let plain = crate::mcts::perform_mcts_selecting(
+                &mut state, s1.clone(), s2.clone(),
+                std::time::Duration::from_millis(5), 500, None, &sel,
+            );
+            assert!(plain.joint.is_none());
+            let result = crate::mcts::perform_mcts_joint(
+                &mut state, s1, s2,
+                std::time::Duration::from_millis(5), 4000, None, &sel, true,
+            );
+            let joint = result.joint.as_ref().expect("joint requested");
+            assert!(!joint.is_empty());
+            let total: u32 = joint.iter().map(|c| c.visits).sum();
+            assert!(total <= result.iteration_count);
+            // only the unexpanded-root iterations (terminal / both-None) are missing
+            assert!(result.iteration_count - total <= 1, "{:?}", mode);
+            for c in joint {
+                assert!(c.s1 < k1 && c.s2 < k2);
+                assert!((0.0..=1.0).contains(&c.mean), "mean {}", c.mean);
+            }
+            // row sums of joint visits equal the side-one option visits
+            for (i, opt) in result.s1.iter().enumerate() {
+                let row: u32 = joint.iter().filter(|c| c.s1 == i).map(|c| c.visits).sum();
+                assert_eq!(row, opt.visits);
+            }
+        }
+    }
+
+    #[test]
     fn test_encore_without_last_used_move_does_not_panic_and_is_inactive() {
         for last_used in [LastUsedMove::None, LastUsedMove::Switch(PokemonIndex::P1)] {
             let mut state = state_with_tackle();

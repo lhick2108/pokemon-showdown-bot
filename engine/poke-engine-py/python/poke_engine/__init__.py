@@ -121,11 +121,16 @@ class MctsResult:
     :type side_two: list[MctsSideResult]
     :param total_visits: Total number of monte carlo iterations
     :type total_visits: int
+    :param joint: root joint-action matrix, only with ``return_joint=True``: a list of
+        ``(i, j, visits, mean)`` for every expanded cell, i indexing ``side_one`` and j
+        ``side_two``; ``mean`` is side one's mean score in [0, 1]
+    :type joint: list[tuple[int, int, int, float]] | None
     """
 
     side_one: list[MctsSideResult]
     side_two: list[MctsSideResult]
     total_visits: int
+    joint: "list[tuple[int, int, int, float]] | None" = None
 
     @classmethod
     def _from_rust(cls, rust_result):
@@ -149,6 +154,7 @@ class MctsResult:
                 for i in rust_result.s2
             ],
             total_visits=rust_result.iteration_count,
+            joint=(None if rust_result.joint is None else list(rust_result.joint)),
         )
 
 
@@ -160,6 +166,7 @@ def monte_carlo_tree_search(
     evaluator: "Evaluator | None" = None,
     selection: str = "ucb1",
     gamma: float = 0.1,
+    return_joint: bool = False,
 ) -> MctsResult:
     """
     Perform monte-carlo-tree-search on the given state and for the given duration
@@ -180,11 +187,16 @@ def monte_carlo_tree_search(
     :type selection: str
     :param gamma: exploration rate in (0, 1] for exp3/rm; ignored by ucb1
     :type gamma: float
+    :param return_joint: also return the root joint-action matrix (``MctsResult.joint``);
+        single-threaded only (threads > 1 raises ValueError)
+    :type return_joint: bool
     :return: the result of the search
     :rtype: MctsResult
     """
     return MctsResult._from_rust(
-        mcts(state, duration_ms, iterations, threads, evaluator, selection, gamma)
+        mcts(
+            state, duration_ms, iterations, threads, evaluator, selection, gamma, return_joint
+        )
     )
 
 
