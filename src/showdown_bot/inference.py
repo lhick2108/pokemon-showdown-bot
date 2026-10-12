@@ -102,7 +102,8 @@ _DIRTYING = frozenset(
     {"-boost", "-unboost", "-setboost", "-clearallboost", "-clearboost",
      "-clearnegativeboost", "-invertboost", "-swapboost", "-copyboost", "-restoreboost",
      "-status", "-curestatus", "-cureteam", "-weather", "-fieldstart", "-fieldend",
-     "-sidestart", "-sideend", "-start", "-end", "-ability", "-item", "-enditem",
+     "-sidestart", "-sideend", "-start", "-end", "-singleturn", "-singlemove",
+     "-ability", "-item", "-enditem",
      "-transform", "-terastallize", "-formechange", "-detailschange", "-mega",
      "switch", "drag", "replace", "-sethp", "-activate", "-block", "-swapsideconditions"}
 )
@@ -266,6 +267,9 @@ class DamageObs:
     move_id: str
     hp_before: float
     hp_after: float
+    # The attacker's HP fraction when it moved (earlier hits this turn change it;
+    # Blaze/Overgrow/Torrent/Swarm and Eruption-like effects read it).
+    attacker_hp: float | None = None
 
 
 def set_key(species_id: str, full_set: Any) -> tuple:
@@ -492,6 +496,7 @@ class InferenceTracker:
         self.cur = {
             "attacker": attacker, "move": move_id, "target_side": target[0],
             "clean": not self.dirty, "spoiled": False, "hit": None, "defender": None,
+            "attacker_hp": getattr(self.mons.get(attacker), "hp", None),
         }
 
     def _damage_event(self, event: Sequence[str], cur: dict) -> None:
@@ -524,7 +529,10 @@ class InferenceTracker:
         out.append(
             (
                 cur["attacker"],
-                DamageObs(cur["attacker"], cur["defender"], cur["move"], before, after),
+                DamageObs(
+                    cur["attacker"], cur["defender"], cur["move"], before, after,
+                    cur["attacker_hp"],
+                ),
             )
         )
 

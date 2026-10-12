@@ -35,9 +35,14 @@ from showdown_bot.inference import Constraint, DamageObs, set_key, to_id
 logger = logging.getLogger(__name__)
 
 MIN_ROLL = 0.85
-REL_MARGIN = 0.04  # of the engine's min/max
-ABS_HP_MARGIN = 2  # HP points (our exact HP)
-ABS_PCT_MARGIN = 1.6  # percentage points (opponent HP is rounded twice)
+# Margins measured with TRUE sets over ~2,700 clean hits (scripts/damage_calib.py,
+# bead 589.29): the engine's floor-per-step arithmetic lands the ratio to the max
+# roll within [0.79, 1.00]; widening [0.85, 1.0] by 3% + 1 HP (we are hit) or
+# 3% + 1.0 percentage points (opponent HP is rounded twice) leaves no false
+# rejection except unmodelled cases (a disguised Zoroark).
+REL_MARGIN = 0.03  # of the engine's min/max
+ABS_HP_MARGIN = 1  # HP points (our exact HP)
+ABS_PCT_MARGIN = 1.0  # percentage points
 MAX_GROUPS = 160
 _FILLER_MOVE = "splash"
 
@@ -83,6 +88,13 @@ class DamageStats:
 
 ALL_STATS: list[DamageStats] = []
 
+# Calibration hook (scripts/damage_calib.py): called as
+# ``hook(battle, obs, opp_attacks, predict, illusion_p)`` for every evaluated observation, where
+# ``predict(species_id, full_set) -> (high, maxhp)`` is the engine's max roll
+# (HP points of the defender when we are hit, of the opponent when we attack) for
+# any candidate set in this exact state.
+CALIB_HOOK: Any = None
+
 
 def total_damage_stats() -> DamageStats:
     """Sum of every ``DamageInferer``'s stats in this process."""
@@ -104,12 +116,15 @@ class DamageInferer:
         self.stats = DamageStats()
         ALL_STATS.append(self.stats)
         self._bad_moves: set[str] = set()
+        self._illusion_p = 0.0  # P(the active opponent is a disguised Zoroark)
 
     def evaluate_all(
-        self, battle: Any, trackers: dict[str, Any], observations: list[DamageObs]
+        self, battle: Any, trackers: dict[str, Any], observations: list[DamageObs],
+        illusion_p: float = 0.0,
     ) -> list[tuple[DamageObs, str, Constraint]]:
         """Return ``(obs, tracker_key, constraint)`` for every informative observation."""
         results: list[tuple[DamageObs, str, Constraint]] = []
+        self._illusion_p = illusion_p
         started = time.perf_counter()
         try:
             for obs in observations:
@@ -158,6 +173,16 @@ class DamageInferer:
             return None
         if obs.move_id in self._bad_moves:
             return None
+        if self._illusion_p > 0.0:
+            # The shown species may be a disguised Zoroark: its set is not in the pool.
+            self.stats.skip("illusion")
+            return None
+        if not opp_attacks and to_id(our_mon.ability) in _UNRELIABLE_ABILITIES:
+            self.stats.skip("our-ability")
+            return None
+        if _unmodelled_forme(opp_mon) or _unmodelled_forme(our_mon):
+            self.stats.skip("forme")
+            return None
         pool = tracker._matching_full_sets()
         if len(pool) < 2:
             self.stats.skip("pool<2")
@@ -182,16 +207,18 @@ class DamageInferer:
             if obs.hp_after * 100.0 <= 1.5:
                 self.stats.skip("their-after<=1")
                 return None
+            if obs.attacker_hp is not None:
+                our_poke = _clone(our_poke, hp=max(1, round(obs.attacker_hp * our_poke.maxhp)))
         side_one = engine_state._make_side(
             [(our_poke, our_moves, our_mon)], our_mon, battle, battle.side_conditions, is_ours=True
         )
 
-        rejected: set[tuple] = set()
-        for members in groups.values():
-            species_id, sample = members[0]
+        def predict(species_id, sample):
             pokemon, moves = self._candidate(battle, opp_mon, species_id, sample)
             if not opp_attacks:
                 pokemon = _clone(pokemon, hp=max(1, round(pokemon.maxhp * obs.hp_before)))
+            elif obs.attacker_hp is not None:
+                pokemon = _clone(pokemon, hp=max(1, round(pokemon.maxhp * obs.attacker_hp)))
             side_two = engine_state._make_side(
                 [(pokemon, moves, opp_mon)], opp_mon, battle, battle.opponent_side_conditions,
                 is_ours=False,
@@ -199,29 +226,32 @@ class DamageInferer:
             state = pe.State(side_one=side_one, side_two=side_two, **fields)
             if opp_attacks:
                 result = self._calc(state, _FILLER_MOVE, obs.move_id)
-                if not result:
-                    return None
-                high = float(result[1][0])
-                low = high * MIN_ROLL
-                ok = (
-                    low * (1 - REL_MARGIN) - ABS_HP_MARGIN
-                    <= observed
-                    <= high * (1 + REL_MARGIN) + ABS_HP_MARGIN
-                )
+                return (float(result[1][0]), our_poke.maxhp) if result else None
+            result = self._calc(state, obs.move_id, _FILLER_MOVE)
+            return (float(result[0][0]), pokemon.maxhp) if result else None
+
+        rejected: set[tuple] = set()
+        for members in groups.values():
+            species_id, sample = members[0]
+            if opp_attacks and to_id(sample.ability) in _UNRELIABLE_ABILITIES:
+                continue
+            predicted = predict(species_id, sample)
+            if predicted is None:
+                return None
+            high, maxhp = predicted
+            if opp_attacks:
+                ok = roll_consistent(high, observed, True, our_poke.hp)
             else:
-                result = self._calc(state, obs.move_id, _FILLER_MOVE)
-                if not result:
-                    return None
-                high = float(result[0][0])
-                low = high * MIN_ROLL
-                scale = 100.0 / max(1, pokemon.maxhp)
-                ok = (
-                    low * scale * (1 - REL_MARGIN) - ABS_PCT_MARGIN
-                    <= observed_pct
-                    <= high * scale * (1 + REL_MARGIN) + ABS_PCT_MARGIN
-                )
+                scale = 100.0 / max(1, maxhp)
+                ok = roll_consistent(high * scale, observed_pct, False, obs.hp_before * 100.0)
             if not ok:
                 rejected.update(set_key(sid, fs) for sid, fs in members)
+
+        if CALIB_HOOK is not None:
+            try:
+                CALIB_HOOK(battle, obs, opp_attacks, predict, self._illusion_p)
+            except Exception as exc:
+                logger.debug("calib hook failed: %r", exc)
 
         self.stats.evaluated += 1
         self.stats.candidates += len(pool)
@@ -256,6 +286,42 @@ class DamageInferer:
                 raise
             self._bad_moves.add(their_move if our_move == _FILLER_MOVE else our_move)
             return None
+
+
+# Species whose stats the engine cannot know mid-battle: Minior (Shields Down:
+# Meteor form above half HP, Core form below) and Ditto (Transform copies the
+# target's stats and moves; the engine would calculate with Ditto's own); Meloetta,
+# Aegislash and Palafin change stats with a persistent forme change.
+_FORME_SHIFTERS = ("minior", "ditto", "meloetta", "aegislash", "palafin")
+
+# Abilities whose damage effect the engine applies differently from Showdown (it
+# retypes the user on EVERY move; Showdown only on the first move after switching
+# in; Analytic needs the move order, which is not observed; Supreme Overlord
+# needs the count of fainted allies, which is not passed), so a candidate
+# holding one cannot be ruled out by a damage roll.
+_UNRELIABLE_ABILITIES = frozenset({"protean", "libero", "analytic", "supremeoverlord"})
+
+
+def _unmodelled_forme(mon: Any) -> bool:
+    return to_id(getattr(mon, "species", "") or "").startswith(_FORME_SHIFTERS)
+
+
+def roll_consistent(high: float, observed: float, exact_hp: bool, defender_hp: float) -> bool:
+    """Could ``observed`` damage come from a hit whose maximum roll is ``high``?
+
+    Units are HP points when ``exact_hp`` (we were hit) else percent of the
+    defender's max HP; ``defender_hp`` is the defender's HP before the hit in
+    the same units.  Showdown's rolls span [85%, 100%] of ``high``; the window
+    is widened by the relative and absolute margins (measured with true sets,
+    scripts/damage_calib.py).  A hit that should have knocked the defender out
+    but did not was cut short (Focus Sash, Sturdy, Endure, False Swipe...), so
+    it says nothing about the roll.
+    """
+    low = high * MIN_ROLL
+    pad = ABS_HP_MARGIN if exact_hp else ABS_PCT_MARGIN
+    if low * (1 - REL_MARGIN) - pad >= defender_hp:
+        return True
+    return low * (1 - REL_MARGIN) - pad <= observed <= high * (1 + REL_MARGIN) + pad
 
 
 def _damage_key(species_id: str, full_set: Any) -> tuple:
