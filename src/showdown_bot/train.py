@@ -191,7 +191,7 @@ def load_data(
             truth=states in ("both", "truth"), stats=load, q_source=q_source,
             q_eval_scale=q_eval_scale,
         ):
-            feats.append(s.features)
+            feats.append(np.asarray(s.features, dtype=np.float32))  # a list of Python floats costs ~8x the memory
             ys.append(s.value)
             q = s.search_value_abs if q_kind == "absolute" else s.search_value
             qs.append(np.nan if q is None else q)
@@ -206,7 +206,8 @@ def load_data(
         print(f"warning: {load.bad_states} unparsable states skipped", file=sys.stderr)
     if not feats:
         raise SystemExit("no samples found in " + ", ".join(map(str, paths)))
-    x = np.asarray(feats, dtype=np.float32)
+    x = np.stack(feats)
+    del feats
     if residual:
         x = np.concatenate([x, np.asarray(evals, dtype=np.float32)[:, None]], axis=1)
     y = np.asarray(ys, dtype=np.float32)
