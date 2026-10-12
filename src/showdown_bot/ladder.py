@@ -1,0 +1,300 @@
+﻿"""Public-ladder helpers (credentials, per-decision time cap, game records, summary).
+
+The runner lives in ``scripts/ladder.py``; see ``docs/ladder.md``. Credentials come
+only from the environment (``SHOWDOWN_USERNAME`` / ``SHOWDOWN_PASSWORD``), optionally
+read from a gitignored ``.env``; the password is never part of any repr, log line or
+record written here.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import math
+import os
+import re
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any
+
+from showdown_bot import bench
+
+logger = logging.getLogger(__name__)
+
+USER_ENV = "SHOWDOWN_USERNAME"
+PASS_ENV = "SHOWDOWN_PASSWORD"
+DEFAULT_MOVE_CAP_S = 5.0
+
+
+# ---------------------------------------------------------------------------
+# Credentials
+# ---------------------------------------------------------------------------
+
+def parse_env_text(text: str) -> dict[str, str]:
+    """Parse KEY=VALUE lines: '#' comments, optional 'export', optional quotes."""
+    out: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        key, eq, value = line.partition("=")
+        key = key.strip()
+        if not eq or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            continue
+        value = value.strip()
+        if value[:1] in ("'", '"'):
+            end = value.find(value[0], 1)
+            value = value[1:end] if end > 0 else value[1:]
+        else:
+            value = re.sub(r"\s+#.*$", "", value).strip()  # inline comment
+        out[key] = value
+    return out
+
+
+def parse_env_file(path: Path) -> dict[str, str]:
+    try:
+        return parse_env_text(Path(path).read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return {}
+
+
+@dataclass(frozen=True)
+class Credentials:
+    username: str
+    password: str = field(repr=False)
+
+    def __str__(self) -> str:
+        return f"Credentials(username={self.username!r}, password=<hidden>)"
+
+    def __reduce__(self):  # never pickled/copied with the secret by accident
+        raise TypeError("Credentials must not be serialized")
+
+    def account(self):
+        from poke_env.ps_client import AccountConfiguration
+
+        return AccountConfiguration(self.username, self.password)
+
+
+def load_credentials(
+    environ: Mapping[str, str] | None = None, env_file: Path | None = None
+) -> Credentials:
+    """Environment variables win over the .env file; both values are required."""
+    environ = os.environ if environ is None else environ
+    file_vars = parse_env_file(env_file) if env_file else {}
+
+    def get(name: str) -> str:
+        return (environ.get(name) or file_vars.get(name) or "").strip()
+
+    user, password = get(USER_ENV), get(PASS_ENV)
+    missing = [n for n, v in ((USER_ENV, user), (PASS_ENV, password)) if not v]
+    if missing:
+        raise ValueError(
+            f"missing {' and '.join(missing)}: set the environment variable(s) or put them "
+            "in the gitignored .env file (see docs/ladder.md)"
+        )
+    return Credentials(user, password)
+
+
+class RedactFilter(logging.Filter):
+    """Belt and braces: scrub the secret from any log record that somehow carries it."""
+
+    def __init__(self, secrets_: Sequence[str]):
+        super().__init__()
+        self._secrets = [s for s in secrets_ if len(s) >= 4]
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not self._secrets:
+            return True
+        try:
+            text = record.getMessage()
+        except Exception:
+            return True
+        if any(s in text for s in self._secrets):
+            for s in self._secrets:
+                text = text.replace(s, "<hidden>")
+            record.msg, record.args = text, None
+        return True
+
+
+def install_redaction(creds: Credentials) -> RedactFilter:
+    flt = RedactFilter([creds.password])
+    root = logging.getLogger()
+    root.addFilter(flt)
+    for handler in root.handlers:
+        handler.addFilter(flt)
+    return flt
+
+
+# ---------------------------------------------------------------------------
+# Time cap
+# ---------------------------------------------------------------------------
+
+def heuristic_order(player: Any, battle: Any):
+    """Cheap fallback: the strongest damaging move by base power x type effectiveness."""
+    try:
+        opp = battle.opponent_active_pokemon
+        best, best_score = None, 0.0
+        for move in battle.available_moves:
+            score = float(move.base_power or 0)
+            if opp is not None and move.type is not None:
+                score *= opp.damage_multiplier(move)
+            if score > best_score:
+                best, best_score = move, score
+        if best is not None:
+            return player.create_order(best)
+    except Exception:
+        logger.exception("heuristic fallback failed; choosing at random")
+    return player.choose_random_move(battle)
+
+
+def with_ladder_hooks(
+    cls: type,
+    *,
+    move_cap_s: float = DEFAULT_MOVE_CAP_S,
+    on_finish: Callable[[Any, Any], None] | None = None,
+    save_server_replay: bool = False,
+) -> type:
+    """Subclass of ``cls`` with a hard per-decision cap and a battle-finished hook."""
+
+    class LadderPlayer(cls):  # type: ignore[valid-type, misc]
+        cap_s = move_cap_s
+        cap_hits = 0
+
+        async def choose_move(self, battle):
+            try:
+                return await asyncio.wait_for(super().choose_move(battle), self.cap_s)
+            except asyncio.TimeoutError:
+                type(self).cap_hits += 1
+                logger.warning(
+                    "decision exceeded %.2fs cap in %s turn %s; heuristic move",
+                    self.cap_s, battle.battle_tag, battle.turn,
+                )
+                return heuristic_order(self, battle)
+
+        def _battle_finished_callback(self, battle):
+            super()._battle_finished_callback(battle)
+            if save_server_replay:
+                try:
+                    asyncio.ensure_future(
+                        self.ps_client.send_message("/savereplay", battle.battle_tag)
+                    )
+                except Exception:
+                    logger.exception("could not request server replay")
+            if on_finish is not None:
+                try:
+                    on_finish(self, battle)
+                except Exception:
+                    logger.exception("could not record %s", battle.battle_tag)
+
+    LadderPlayer.__name__ = f"Ladder{cls.__name__}"
+    return LadderPlayer
+
+
+# ---------------------------------------------------------------------------
+# Records and summary
+# ---------------------------------------------------------------------------
+
+@dataclass
+class LadderGame:
+    battle_tag: str
+    opponent: str
+    result: str  # win | loss | tie
+    turns: int
+    rating_before: int | None = None
+    rating_after: int | None = None
+    opponent_rating: int | None = None
+    log_file: str | None = None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+def _as_int(value: Any) -> int | None:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+_RATING_RE = re.compile(
+    r"^(?P<name>.+?)'s rating: (?P<old>\d+)\s*(?:&rarr;|->|→)\s*(?:<strong>)?(?P<new>\d+)"
+)
+
+
+def rating_after_from_log(replay_data: Sequence[Sequence[str]], username: str) -> int | None:
+    """New rating from the server's ``|raw|NAME's rating: OLD &rarr; <strong>NEW</strong>`` line.
+
+    (poke-env's own ``battle.rating`` reads the first four digits, i.e. the OLD rating.)
+    """
+    for event in replay_data or []:
+        if len(event) >= 3 and event[1] == "raw":
+            m = _RATING_RE.match(event[2].strip())
+            if m and m.group("name").lower().replace("<strong>", "") == username.lower():
+                return int(m.group("new"))
+    return None
+
+
+def game_from_battle(battle: Any, username: str) -> LadderGame:
+    """Record of a finished poke-env battle (ratings only if the server sent them)."""
+    from showdown_bot.recorder import result_from_battle
+
+    before = None
+    for entry in getattr(battle, "_players", None) or []:
+        if str(entry.get("username", "")).lower() == username.lower():
+            before = _as_int(entry.get("rating"))
+    return LadderGame(
+        battle_tag=battle.battle_tag,
+        opponent=getattr(battle, "opponent_username", None) or "?",
+        result=result_from_battle(battle),
+        turns=int(battle.turn),
+        rating_before=before,
+        rating_after=rating_after_from_log(getattr(battle, "_replay_data", None), username),
+        opponent_rating=_as_int(getattr(battle, "opponent_rating", None)),
+    )
+
+
+def summarize(games: Sequence[LadderGame]) -> str:
+    wins = sum(g.result == "win" for g in games)
+    losses = sum(g.result == "loss" for g in games)
+    ties = sum(g.result == "tie" for g in games)
+    n = len(games)
+    lines = [f"Ladder games: {n}  W-L-T {wins}-{losses}-{ties}"]
+    if n:
+        lo, hi = bench.wilson_interval(wins, n)
+        lines.append(f"Win rate {wins / n:.1%}  Wilson 95% CI [{lo:.1%}, {hi:.1%}]")
+        traj: list[int] = []
+        for g in games:  # a game's "after" is also the next game's "before"
+            for r in (g.rating_before, g.rating_after):
+                if r is not None and (not traj or traj[-1] != r):
+                    traj.append(r)
+        if traj:
+            lines.append(
+                "Rating: " + " -> ".join(str(r) for r in traj)
+                + f"  (net {traj[-1] - traj[0]:+d})"
+            )
+        else:
+            lines.append("Rating: not reported by the server")
+    return "\n".join(lines)
+
+
+def append_game(path: Path, game: LadderGame) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(game.to_dict()) + "\n")
+
+
+def safe_filename(text: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", text).strip("_") or "battle"
+
+
+def max_decision_estimate_s(search_time_ms: int, worlds: int | None, parallelism: int = 1) -> float:
+    """Rough worst-case wall time of one search (waves of per-world budgets)."""
+    n = worlds if worlds is not None else 4 * parallelism
+    waves = math.ceil(n / max(1, parallelism))
+    return waves * search_time_ms / 1000.0
+
+
