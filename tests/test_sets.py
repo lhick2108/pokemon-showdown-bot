@@ -1481,3 +1481,53 @@ def test_live_randbats_data_fetches_and_parses_all_files(tmp_path, monkeypatch):
         "moves", "Earthquake"
     ) < 1
 
+
+
+def test_failed_dancer_copy_without_from_tag_is_not_the_dancers_own_move(data):
+    """589.26: Gardevoir Traces Dancer; a Choice-locked copy of Oricorio's
+    Quiver Dance fails its pre-checks, so the server logs a bare
+    ``|move|X|Quiver Dance||[still]`` with no ``[from] ability: Dancer`` tag.
+    Only the preceding ``-activate ... ability: Dancer`` marks it as foreign;
+    recording it left Gardevoir's single role in conflict.
+    """
+    battle = _battle("battle-dancer-still")
+    model = OpponentModel(data)
+    trackers = _replay(
+        battle,
+        model,
+        ("switch", "p1a: Oricorio", "Oricorio-Pa'u, L80, M", "100/100"),
+        ("switch", "p2a: Gardevoir", "Gardevoir, L83, M", "100/100"),
+        ("-ability", "p2a: Gardevoir", "Dancer", "Trace", "[from] ability: Trace", "[of] p1a: Oricorio"),
+        ("move", "p1a: Oricorio", "Quiver Dance", "p1a: Oricorio"),
+        ("-activate", "p2a: Gardevoir", "ability: Dancer"),
+        ("move", "p2a: Gardevoir", "Quiver Dance", "", "[still]"),
+        ("-fail", "p2a: Gardevoir"),
+        ("move", "p2a: Gardevoir", "Moonblast", "p1a: Oricorio"),
+    )
+
+    tracker = trackers["p2: Gardevoir"]
+    assert not tracker.inconsistent
+    assert "quiverdance" not in {to_id(move) for move in tracker.revealed_moves}
+    assert "moonblast" in {to_id(move) for move in tracker.revealed_moves}
+
+
+def test_one_switch_in_with_moves_from_two_roles_is_provisional_zoroark_evidence(data):
+    """589.26: Chandelure's Trick (Fast Attacker) and Will-O-Wisp (Fast Bulky
+    Setup) are each legal, but no one Chandelure role has both while a
+    Zoroark-Hisui does; with an unrevealed slot, hold them as provisional
+    instead of declaring every role in conflict.
+    """
+    battle = _battle("battle-joint-two-roles")
+    model = OpponentModel(data)
+    trackers = _replay(
+        battle,
+        model,
+        ("switch", "p1a: Arcanine", "Arcanine, L80", "100/100"),
+        ("switch", "p2a: Chandelure", "Chandelure, L83", "100/100"),
+        ("move", "p2a: Chandelure", "Trick", "p1a: Arcanine"),
+        ("move", "p2a: Chandelure", "Will-O-Wisp", "p1a: Arcanine"),
+    )
+
+    tracker = trackers["p2: Chandelure"]
+    assert not tracker.inconsistent
+    assert {to_id(move) for move in tracker.provisional_moves} == {"trick", "willowisp"}

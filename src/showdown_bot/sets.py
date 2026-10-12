@@ -965,6 +965,10 @@ class _BattleOpponentState:
     # (target slot, move id, attacker identity) of the last move aimed at the
     # other side, until its outcome (-immune/-damage/...) is seen.
     pending_hit: tuple[tuple[str, str], str, tuple[str, str]] | None = None
+    # Dancers whose ``-activate|...|ability: Dancer`` has been seen but whose
+    # copied ``|move|`` event has not: that move is the dancer's copy of
+    # someone else's move, even when the server leaves off its ``[from]`` tag.
+    dancer_pending: set[tuple[str, str]] = field(default_factory=set)
 
 
 def _protocol_name(value: Any) -> tuple[str, str] | None:
@@ -1392,6 +1396,10 @@ class OpponentModel:
             event_type = str(event[1]).lower()
             state = self._battles.setdefault(str(battle_tag), _BattleOpponentState())
             _track_illusion(state, event_type, event)
+            if event_type in {"turn", "cant", "switch", "drag", "replace", "faint"}:
+                # A Dancer that never reached its |move| event (e.g. it was
+                # stopped by paralysis) must not tag a later, real move.
+                state.dancer_pending.clear()
 
             if event_type in {"switch", "drag"}:
                 if len(event) < 3:
@@ -1474,6 +1482,13 @@ class OpponentModel:
                 identity = _attributed_identity(event, event[2], label="move")
                 if identity is None:
                     return
+                # battle.ts runMove() only tags a Dancer copy "[from] ability:
+                # Dancer" when the move actually runs; one that fails its
+                # pre-checks (Choice lock, Disable, Taunt, ...) is logged as a
+                # bare "|move|X|Move||[still]" right after the Dancer
+                # "-activate", so that activation is the only tell.
+                dancer_copy = identity in state.dancer_pending
+                state.dancer_pending.discard(identity)
                 pokemon = state.pokemon.setdefault(identity, _ProtocolPokemon())
                 session = pokemon.current or pokemon.begin_session()
                 move = str(event[3])
@@ -1488,6 +1503,7 @@ class OpponentModel:
                     # it is never part of a randbats set for any species.
                     to_id(move) != "struggle"
                     and not (invoked_by & _FOREIGN_MOVE_EFFECTS)
+                    and not dancer_copy
                     and not session.transformed
                     and not session.mimicked
                 ):
@@ -1604,6 +1620,11 @@ class OpponentModel:
                             _record_ability_if_original(target, target_session, old_ability)
                         target_session.received_abilities.add(effect_id)
                     return
+
+                if effect_kind == "ability" and effect_id == "dancer":
+                    dancer_id = _protocol_identity(event[2])
+                    if dancer_id is not None:
+                        state.dancer_pending.add(dancer_id)
 
                 if effect_kind == "ability":
                     identity = _attributed_identity(event, event[2], label="ability activation")
@@ -1795,6 +1816,21 @@ class OpponentModel:
                     and to_id(value) in _zoroark_option_ids(self.data, kind)
                     for kind, value in resolved
                 )
+                if (
+                    can_be_disguise
+                    and not suspect
+                    and resolved
+                    and self._fits_no_role(tracker, resolved)
+                    and all(
+                        to_id(value) in _zoroark_option_ids(self.data, kind)
+                        for kind, value in resolved
+                    )
+                ):
+                    # Every value is legal for the shown species on its own, but
+                    # no single role has them all -- one switch-in cannot be
+                    # two roles, while a Zoroark can have them all (e.g. Mew
+                    # Encore + Dark Pulse).
+                    suspect = True
                 observations.extend((kind, value, suspect) for kind, value in resolved)
             # The tracker keeps the first copy of a repeated observation, so
             # feed binding evidence first: a clean switch-in confirming
@@ -2006,6 +2042,17 @@ class OpponentModel:
         if zoroark_cannot_have(earlier):
             return "earlier_real"
         return "ambiguous"
+
+    @staticmethod
+    def _fits_no_role(tracker: SetTracker, observations: Sequence[tuple[str, str]]) -> bool:
+        """True when no single randbats role of ``tracker`` has every observation."""
+        for role in tracker._roles.values():
+            if all(
+                to_id(value) in {to_id(option) for option in role.options(kind)}
+                for kind, value in observations
+            ):
+                return False
+        return bool(tracker._roles)
 
     def _own_option_ids(self, tracker: SetTracker, kind: str) -> set[str]:
         return {
