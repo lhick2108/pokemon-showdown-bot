@@ -76,3 +76,41 @@ def test_default_triples_are_side_one_and_bad_states_are_counted(tmp_path, state
     assert len(features) == pe.FEATURE_LENGTH and value == 1.0 and policy
     assert stats.bad_states == 3 and stats.games == 2
     assert dataset.collect_statistics(tmp_path)["decisions"] == 2
+
+
+def _write_q(tmp_path, state, worlds, result=recorder.RESULT_WIN, tag="q"):
+    rec = recorder.GameRecorder(tmp_path)
+    rec.start_game(tag, "u")
+    rec.add_decision(tag, "u", {
+        "turn": 1, "worlds": [recorder.world_record(state, w) for w in worlds],
+        "policy": {"a": 1.0}, "chosen": "a", "truth": {"state": state}, "truth_status": "ok",
+    })
+    rec.end_game(tag, "u", result, turns=2)
+
+
+def test_search_value_decision_mean_world_and_side_flip(tmp_path, state_string):
+    worlds = [
+        (100, [("a", 100, 70.0)]),  # q = 0.7
+        (50, [("a", 50, 10.0)]),    # q = 0.2
+        (0, []),                    # zero visits: ignored
+    ]
+    _write_q(tmp_path, state_string, worlds)
+    dec = list(dataset.iter_samples(tmp_path, sides=(1, 2)))
+    assert len(dec) == (3 + 1) * 2
+    one = [s for s in dec if s.side == 1]
+    two = [s for s in dec if s.side == 2]
+    assert all(abs(s.search_value - 0.45) < 1e-9 for s in one)  # mean(0.7, 0.2)
+    assert all(abs(s.search_value - 0.55) < 1e-9 for s in two)
+    assert [s.kind for s in one] == ["world"] * 3 + ["truth"]
+    wor = [s for s in dataset.iter_samples(tmp_path, q_source="world")]
+    assert [None if s.search_value is None else round(s.search_value, 6) for s in wor] == [
+        0.7, 0.2, None, 0.45]  # zero-visit world has no q of its own; truth keeps the mean
+    with pytest.raises(ValueError):
+        list(dataset.iter_samples(tmp_path, q_source="bogus"))
+
+
+def test_search_value_none_when_no_world_has_visits(tmp_path, state_string):
+    _write_q(tmp_path, state_string, [(0, [])])
+    assert all(s.search_value is None for s in dataset.iter_samples(tmp_path))
+    assert dataset.decision_search_value({"worlds": [{"avg_score": None, "total_visits": 5}]}) is None
+    assert dataset.decision_search_value({}) is None

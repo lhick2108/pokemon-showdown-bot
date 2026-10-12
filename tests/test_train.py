@@ -102,3 +102,31 @@ def test_metrics_helpers():
     acc, n = train.decisive_accuracy(logits, y)
     assert n == 3 and abs(acc - 2 / 3) < 1e-9
     assert sum(b[2] for b in train.calibration_buckets(logits, y)) == 4
+
+
+def test_make_targets_modes():
+    y = np.array([1.0, 0.0, 0.5, 1.0], dtype=np.float32)
+    q = np.array([0.8, 0.4, np.nan, 0.2], dtype=np.float32)
+    out, n = train.make_targets(y, q, "outcome")
+    assert out is y and n == 0  # exactly the old target
+    out, n = train.make_targets(y, None, "blend")
+    assert out is y and n == 0
+    out, n = train.make_targets(y, q, "search")
+    assert n == 1 and np.allclose(out, [0.8, 0.4, 0.5, 0.2])  # NaN falls back to z
+    out, n = train.make_targets(y, q, "blend", 0.25)
+    assert n == 1 and np.allclose(out, [0.95, 0.1, 0.5, 0.8])
+    out, _ = train.make_targets(y, q, "blend", 0.0)
+    assert np.allclose(out, y)
+    with pytest.raises(ValueError):
+        train.make_targets(y, q, "nope")
+
+
+def test_data_targets_follow_subset_and_fit_uses_them():
+    data = _synthetic(60, 1)
+    data.q = np.where(np.arange(60) % 5 == 0, np.nan, 0.5).astype(np.float32)
+    assert data.y_fit is data.y  # outcome mode: unchanged labels
+    data.target, _ = train.make_targets(data.y, data.q, "search")
+    sub = data.subset(np.array([0, 1, 2]))
+    assert sub.y_fit.tolist() == [data.y[0], 0.5, 0.5] and sub.y.tolist() == data.y[:3].tolist()
+    corr, n = train.q_z_correlation(data)
+    assert n == 48 and np.isnan(corr)  # q is constant, so the correlation is undefined

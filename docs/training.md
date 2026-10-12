@@ -106,6 +106,39 @@ bench process would give both the net; use `scripts/duel.py` for that match-up
   trainer reloads the file with `Evaluator.load` and checks `evaluate` against
   the torch logits on up to 100 val states (tolerance 1e-3, observed ~1e-6).
 
+### Value targets
+
+`--value-target outcome|search|blend` chooses what the net regresses on:
+
+- `outcome` (default, the original behaviour): the game result z (1/0.5/0).
+- `search`: q, the search's own value estimate. The recorder stores each
+  searched world's `avg_score` (MCTS root total score / visits, in [0, 1] from
+  our side). q of a decision is the mean over its worlds that had visits;
+  world and truth samples of the decision share it (`--q-source decision`,
+  default). `--q-source world` gives each world sample its own `avg_score`
+  (truth keeps the decision mean). Side-two views use `1 - q`.
+- `blend`: `(1 - L) * z + L * q` with `--blend-lambda L` (default 0.5).
+
+Positions without a usable q (no world with visits) fall back to z; the count
+is printed. The loss stays BCE-with-logits, which accepts soft targets. The
+report always prints BCE, accuracy and calibration against the pure outcome z
+(so models trained on different targets stay comparable with the `ln 2`
+baseline), and for `search`/`blend` also the BCE on the training target plus
+the val correlation between q and z.
+
+Rationale: a single game result is a very noisy label for a mid-game position;
+search-derived (soft) targets have lower variance and were found to beat the
+plain outcome target in AlphaZero-style training (Willemsen, Plaat & Preuss
+2021, "Value targets in off-policy AlphaZero: a new greedy backup"; Boige,
+Boumaza & Scherrer 2026, arXiv:2609.09094). Caveat: q comes from the search
+that used the evaluator which generated the data, so with the stock evaluator
+it carries that evaluator's biases.
+
+Smoke run (gen0, 314 battles / 64.5k positions, MLP-64, one seed; val outcome
+BCE vs constant 0.693): outcome 0.580, blend 0.5 0.573, search 0.675; val
+q-z correlation 0.17. This is a single small run; **duel results for these
+models are pending**.
+
 ## Reading the results
 
 - Val BCE must beat the constant predictor (`ln 2 = 0.693` for a balanced set).
