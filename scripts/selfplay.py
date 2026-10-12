@@ -46,6 +46,9 @@ def _parser() -> argparse.ArgumentParser:
                    help="per-player compute: worlds = 2 x parallelism (Foul Play's rule)")
     p.add_argument("--worlds", type=bench._positive_int, default=None, help="fixed worlds per decision")
     p.add_argument("--threads", type=bench._positive_int, default=1)
+    p.add_argument("--evaluator", default=None,
+                   help="learned .pev leaf evaluator for both players (default: stock evaluate())")
+    p.add_argument("--leaf-scale", type=float, default=1.0, help="leaf scale for --evaluator")
     p.add_argument("--workers", type=bench._positive_int, default=os.cpu_count() or 4,
                    help="shared MCTS process pool size (search vs search)")
     p.add_argument("--no-truth", action="store_true", help="do not record exact-state truth")
@@ -67,6 +70,8 @@ async def _selfplay_pair(args, run_dir: Path, rec: recorder.GameRecorder, share:
         parallelism=args.parallelism,
         worlds=args.worlds,
         threads=args.threads,
+        evaluator=args.evaluator,
+        evaluator_scale=args.leaf_scale,
     )
     players = [
         SearchPlayer(
