@@ -28,6 +28,10 @@ only poke-env options), these environment variables:
     SHOWDOWN_SEARCH_WORLDS       fixed world count (default 2 x parallelism, 4x early)
     SHOWDOWN_SEARCH_THREADS      engine threads per world (default 1)
     SHOWDOWN_SEARCH_MODE         "mixed" (default) or "argmax"
+    SHOWDOWN_SEARCH_SELECTION    engine tree-policy: "ucb1" (default), "exp3" or "rm";
+                                 exp3/rm need threads == 1 (see docs/selection.md)
+    SHOWDOWN_SEARCH_SELECTION_GAMMA
+                                 exploration rate in (0, 1] for exp3/rm (default 0.1)
     SHOWDOWN_SEARCH_EVALUATOR    path to a learned .pev leaf evaluator (default: the
                                  stock hand-written evaluation); see docs/training.md.
                                  Each pool worker loads it once and reuses it.
@@ -81,6 +85,9 @@ ARGMAX = "argmax"
 MIXED_THRESHOLD = 0.75
 EVALUATOR_ENV = "SHOWDOWN_SEARCH_EVALUATOR"
 EVALUATOR_SCALE_ENV = "SHOWDOWN_SEARCH_EVALUATOR_SCALE"
+SELECTION_ENV = "SHOWDOWN_SEARCH_SELECTION"
+SELECTION_GAMMA_ENV = "SHOWDOWN_SEARCH_SELECTION_GAMMA"
+SELECTIONS = ("ucb1", "exp3", "rm")
 
 
 def _env_int(name: str, default: int | None) -> int | None:
@@ -113,6 +120,21 @@ def _env_scale(name: str, default: float = 1.0) -> float:
     return value
 
 
+def _env_gamma(name: str, default: float = 0.1) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("Ignoring non-numeric %s=%r", name, raw)
+        return default
+    if not (math.isfinite(value) and 0 < value <= 1):
+        logger.warning("Ignoring %s=%r (need 0 < gamma <= 1)", name, raw)
+        return default
+    return value
+
+
 @dataclass(frozen=True)
 class SearchConfig:
     """Compute and selection settings (defaults equal Foul Play's)."""
@@ -125,6 +147,8 @@ class SearchConfig:
     mixed_threshold: float = MIXED_THRESHOLD
     evaluator: str | None = None  # path of a .pev file; None: stock evaluation
     evaluator_scale: float = 1.0  # learned leaf scale k (score = sigmoid(k * dz))
+    selection: str = "ucb1"  # engine tree policy: ucb1 | exp3 | rm
+    selection_gamma: float = 0.1  # exploration rate for exp3 / rm
 
     @classmethod
     def from_env(cls) -> SearchConfig:
@@ -132,6 +156,10 @@ class SearchConfig:
         if mode not in (MIXED, ARGMAX):
             logger.warning("Unknown SHOWDOWN_SEARCH_MODE=%r; using %s", mode, MIXED)
             mode = MIXED
+        selection = os.environ.get(SELECTION_ENV, "ucb1").strip().lower() or "ucb1"
+        if selection not in SELECTIONS:
+            logger.warning("Unknown %s=%r; using ucb1", SELECTION_ENV, selection)
+            selection = "ucb1"
         return cls(
             search_time_ms=_env_int("SHOWDOWN_SEARCH_TIME_MS", 100) or 100,
             parallelism=_env_int("SHOWDOWN_SEARCH_PARALLELISM", 1) or 1,
@@ -140,6 +168,8 @@ class SearchConfig:
             mode=mode,
             evaluator=(os.environ.get(EVALUATOR_ENV, "").strip() or None),
             evaluator_scale=_env_scale(EVALUATOR_SCALE_ENV),
+            selection=selection,
+            selection_gamma=_env_gamma(SELECTION_GAMMA_ENV),
         )
 
     def plan(self, early: bool) -> tuple[int, int]:
@@ -263,20 +293,31 @@ def default_randbats_data() -> RandbatsData:
 # Pure policy helpers (unit-tested without a server)
 # ---------------------------------------------------------------------------
 
-WorldResult = tuple[int, list[tuple[str, int, float]]]
+# (total_visits, [(choice, visits, total_score), ...]) for ucb1; exp3 / rm append a
+# third element: the average-strategy share of each option (aligned with the list).
+WorldResult = tuple
 
 
 def aggregate_policy(results: list[WorldResult]) -> dict[str, float]:
-    """Average each choice's visit share over the worlds (weight 1/len(results))."""
+    """Average each choice's share over the worlds (weight 1/len(results)).
+
+    The share is the visit share, or the average-strategy share when the world
+    carries one (selection exp3 / rm: the Nash-converging quantity).
+    """
     policy: dict[str, float] = {}
-    usable = [(total, options) for total, options in results if total > 0 and options]
+    usable = [r for r in results if r[0] > 0 and r[1]]
     if not usable:
         return policy
     weight = 1.0 / len(usable)
-    for total, options in usable:
-        visits_sum = sum(visits for _, visits, _ in options) or total
-        for choice, visits, _score in options:
-            policy[choice] = policy.get(choice, 0.0) + weight * (visits / visits_sum)
+    for result in usable:
+        total, options = result[0], result[1]
+        if len(result) > 2:
+            shares = [float(s) for s in result[2]]
+        else:
+            visits_sum = sum(visits for _, visits, _ in options) or total
+            shares = [visits / visits_sum for _, visits, _ in options]
+        for (choice, _visits, _score), share in zip(options, shares):
+            policy[choice] = policy.get(choice, 0.0) + weight * share
     return policy
 
 
@@ -322,6 +363,8 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         recorder: GameRecorder | None = None,
         evaluator: str | os.PathLike[str] | None = None,
         evaluator_scale: float | None = None,
+        selection: str | None = None,
+        selection_gamma: float | None = None,
         **kwargs: Any,
     ):
         data = data or (opponent_model.data if opponent_model else default_randbats_data())
@@ -340,6 +383,16 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             self.config = dataclasses.replace(self.config, evaluator=str(Path(evaluator).resolve()))
         if evaluator_scale is not None:
             self.config = dataclasses.replace(self.config, evaluator_scale=float(evaluator_scale))
+        if selection is not None:
+            self.config = dataclasses.replace(self.config, selection=str(selection).lower())
+        if selection_gamma is not None:
+            self.config = dataclasses.replace(self.config, selection_gamma=float(selection_gamma))
+        if self.config.selection not in SELECTIONS:
+            raise ValueError(f"selection must be one of {SELECTIONS}, got {self.config.selection!r}")
+        if not (math.isfinite(self.config.selection_gamma) and 0 < self.config.selection_gamma <= 1):
+            raise ValueError(f"selection_gamma must be in (0, 1], got {self.config.selection_gamma}")
+        if self.config.selection != "ucb1" and self.config.threads > 1:
+            raise ValueError("selection exp3/rm needs threads == 1 (the shared-tree search is ucb1 only)")
         if not (math.isfinite(self.config.evaluator_scale) and self.config.evaluator_scale > 0):
             raise ValueError(f"evaluator_scale must be finite and > 0, got {self.config.evaluator_scale}")
         if self.config.evaluator is not None:
@@ -488,6 +541,7 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             loop.run_in_executor(
                 executor, _worker.search_world, state, time_ms, self.config.threads,
                 self.config.evaluator, self.config.evaluator_scale,
+                self.config.selection, self.config.selection_gamma,
             )
             for state in state_strings
         ]

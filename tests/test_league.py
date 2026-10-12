@@ -124,6 +124,14 @@ def test_parse_spec_good():
     assert league.parse_spec("search:time_ms=20").label == "search"
 
 
+def test_parse_spec_selection_keys():
+    spec = league.parse_spec("rm=search:selection=RM:gamma=0.2")
+    assert spec.param("selection") == "rm" and spec.param("gamma") == 0.2
+    for bad in ("x=search:selection=foo", "x=search:gamma=0", "x=search:gamma=1.5"):
+        with pytest.raises(ValueError):
+            league.parse_spec(bad)
+
+
 @pytest.mark.parametrize("bad", [
     "x=search:bogus=1", "x=search:time_ms", "x=search:time_ms=abc", "x=search:time_ms=0",
     "x=search:scale=-1", "x=nope", "=search", "x=search:time_ms=1:time_ms=2",

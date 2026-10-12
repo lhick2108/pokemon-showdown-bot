@@ -15,7 +15,8 @@ use poke_engine::features::{
     feature_names, features, FEATURE_LEN, FEATURE_VERSION,
 };
 use poke_engine::learned::{Evaluator, Scratch};
-use poke_engine::mcts::{perform_mcts_with, MctsResult, MctsSideResult};
+use poke_engine::mcts::{perform_mcts_selecting, MctsResult, MctsSideResult};
+use poke_engine::selection::{SelectionConfig, SelectionMode};
 use poke_engine::mcts_threaded::perform_mcts_shared_tree_with;
 use poke_engine::pokemon::PokemonName;
 use poke_engine::search::iterative_deepen_expectiminimax;
@@ -862,6 +863,7 @@ struct PyMctsSideResult {
     pub move_choice: String,
     pub total_score: f32,
     pub visits: u32,
+    pub avg_strategy: f32,
 }
 
 impl PyMctsSideResult {
@@ -870,6 +872,7 @@ impl PyMctsSideResult {
             move_choice: movechoice_to_string(side, &result.move_choice),
             total_score: result.total_score,
             visits: result.visits,
+            avg_strategy: result.avg_strategy,
         }
     }
 }
@@ -1078,14 +1081,32 @@ fn state_feature_names() -> Vec<String> {
 }
 
 #[pyfunction]
-#[pyo3(signature = (py_state, duration_ms, iterations, threads, evaluator=None))]
+#[pyo3(signature = (py_state, duration_ms, iterations, threads, evaluator=None, selection="ucb1", gamma=0.1))]
 fn mcts(
     py_state: PyState,
     duration_ms: u64,
     mut iterations: u32,
     threads: usize,
     evaluator: Option<PyEvaluator>,
+    selection: &str,
+    gamma: f64,
 ) -> PyResult<PyMctsResult> {
+    let mode = SelectionMode::parse(selection).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "unknown selection {selection:?} (expected ucb1, exp3 or rm)"
+        ))
+    })?;
+    if !(gamma.is_finite() && gamma > 0.0 && gamma <= 1.0) {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "gamma must be in (0, 1], got {gamma}"
+        )));
+    }
+    if mode != SelectionMode::Ucb1 && threads > 1 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "selection exp3/rm is single-threaded only; the shared-tree search is ucb1 (use threads=1)",
+        ));
+    }
+    let selection_config = SelectionConfig { mode, gamma };
     let evaluator_ref: Option<&Evaluator> = evaluator.as_ref().map(|e| e.inner.as_ref());
     let mut state: State = py_state.into();
     let duration = Duration::from_millis(duration_ms);
@@ -1104,13 +1125,14 @@ fn mcts(
             evaluator_ref,
         )
     } else {
-        perform_mcts_with(
+        perform_mcts_selecting(
             &mut state,
             s1_options,
             s2_options,
             duration,
             iterations,
             evaluator_ref,
+            &selection_config,
         )
     };
 

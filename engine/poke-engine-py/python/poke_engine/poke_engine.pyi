@@ -425,6 +425,7 @@ class MctsSideResult:
     move_choice: Tuple[str, str]
     total_score: float
     visits: int
+    avg_strategy: float
 
 class MctsResult:
     """Result from MCTS algorithm."""
@@ -499,6 +500,8 @@ def mcts(
     iterations: int,
     threads: int,
     evaluator: Optional[Evaluator] = None,
+    selection: str = "ucb1",
+    gamma: float = 0.1,
 ) -> MctsResult:
     """
     Perform Monte Carlo Tree Search on the given state.
@@ -507,6 +510,8 @@ def mcts(
     :param duration_ms: Duration in milliseconds to run MCTS. ignored if iterations > 0.
     :param iterations: Exact number of monte-carlo iterations to run
     :param threads: Number of threads to use for MCTS
+    :param selection: "ucb1" (default), "exp3" or "rm"; exp3/rm require threads == 1
+    :param gamma: exploration rate in (0, 1] for exp3/rm
     :return: MCTS results for both sides
     """
     ...

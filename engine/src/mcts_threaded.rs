@@ -477,25 +477,25 @@ pub fn perform_mcts_shared_tree_with(
     });
 
     let options = root.options.get().expect("root options initialized");
+    let side = |nodes: &[MoveNode]| -> Vec<MctsSideResult> {
+        // the threaded search is ucb1 only: the strategy is the visit share
+        let total: f32 = nodes.iter().map(|v| v.visits.load(Ordering::Acquire) as f32).sum();
+        nodes
+            .iter()
+            .map(|v| {
+                let visits = v.visits.load(Ordering::Acquire);
+                MctsSideResult {
+                    move_choice: v.move_choice,
+                    total_score: v.total_score_f32(),
+                    visits,
+                    avg_strategy: if total > 0.0 { visits as f32 / total } else { 0.0 },
+                }
+            })
+            .collect()
+    };
     MctsResult {
-        s1: options
-            .s1
-            .iter()
-            .map(|v| MctsSideResult {
-                move_choice: v.move_choice,
-                total_score: v.total_score_f32(),
-                visits: v.visits.load(Ordering::Acquire),
-            })
-            .collect(),
-        s2: options
-            .s2
-            .iter()
-            .map(|v| MctsSideResult {
-                move_choice: v.move_choice,
-                total_score: v.total_score_f32(),
-                visits: v.visits.load(Ordering::Acquire),
-            })
-            .collect(),
+        s1: side(&options.s1),
+        s2: side(&options.s2),
         iteration_count: root.times_visited.load(Ordering::Acquire),
     }
 }

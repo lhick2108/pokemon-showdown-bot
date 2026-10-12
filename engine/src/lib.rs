@@ -22,6 +22,7 @@ pub mod io;
 pub mod learned;
 pub mod mcts;
 pub mod mcts_threaded;
+pub mod selection;
 pub mod pokemon;
 pub mod search;
 pub mod state;

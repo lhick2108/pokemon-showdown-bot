@@ -51,12 +51,12 @@ def result_from_battle(battle: Any) -> str:
 
 
 def world_record(
-    state: str, outcome: tuple[int, list[tuple[str, int, float]]]
+    state: str, outcome: tuple
 ) -> dict[str, Any]:
     """One searched world: its State string and the MCTS root statistics."""
-    total, options = outcome
+    total, options = outcome[0], outcome[1]
     score_sum = sum(score for _, _, score in options)
-    return {
+    record = {
         "state": state,
         "total_visits": int(total),
         "avg_score": (score_sum / total) if total else None,
@@ -65,6 +65,10 @@ def world_record(
             for choice, visits, score in options
         ],
     }
+    if len(outcome) > 2:  # exp3 / rm: average-strategy share per move
+        for move, share in zip(record["moves"], outcome[2]):
+            move["strategy"] = float(share)
+    return record
 
 
 class GameRecorder:

@@ -38,10 +38,14 @@ def search_world(
     threads: int,
     evaluator_path: str | None = None,
     evaluator_scale: float = 1.0,
-) -> tuple[int, list[tuple[str, int, float]]]:
+    selection: str = "ucb1",
+    selection_gamma: float = 0.1,
+) -> tuple:
     """Run MCTS on one serialised world.
 
-    Returns ``(total_visits, [(our_choice, visits, total_score), ...])``.
+    Returns ``(total_visits, [(our_choice, visits, total_score), ...])``; for
+    ``selection`` other than ucb1 a third element is appended: our average-strategy
+    share per option (aligned with the list).
     Plain tuples keep the result cheap to pickle. A Rust panic surfaces in
     Python as ``pyo3_runtime.PanicException`` (a ``BaseException``), so it is
     converted to an ordinary ``RuntimeError`` here.
@@ -50,19 +54,24 @@ def search_world(
 
     try:
         state = State.from_string(state_string)
-        if evaluator_path is None:
-            result = monte_carlo_tree_search(state, search_time_ms, threads=threads)
-        else:
-            result = monte_carlo_tree_search(
-                state, search_time_ms, threads=threads, evaluator=get_evaluator(evaluator_path, evaluator_scale),
+        kwargs: dict = {}
+        if evaluator_path is not None:
+            kwargs["evaluator"] = get_evaluator(evaluator_path, evaluator_scale)
+        if selection != "ucb1":
+            kwargs["selection"] = selection
+            kwargs["gamma"] = float(selection_gamma)
+        result = monte_carlo_tree_search(state, search_time_ms, threads=threads, **kwargs)
+        options = [
+            (option.move_choice, int(option.visits), float(option.total_score))
+            for option in result.side_one
+        ]
+        if selection != "ucb1":
+            return (
+                int(result.total_visits),
+                options,
+                [float(option.avg_strategy) for option in result.side_one],
             )
-        return (
-            int(result.total_visits),
-            [
-                (option.move_choice, int(option.visits), float(option.total_score))
-                for option in result.side_one
-            ],
-        )
+        return (int(result.total_visits), options)
     except Exception:
         raise
     except BaseException as exc:  # pyo3 PanicException

@@ -209,3 +209,27 @@ def test_leaf_scale_does_not_change_logit():
     b = Evaluator.linear(_opp_hp_weights(-3.0), leaf_scale=3.0)
     assert a.logit(state) == b.logit(state)
     assert monte_carlo_tree_search(state, iterations=200, evaluator=b).total_visits > 0
+
+
+def test_selection_modes_return_a_strategy():
+    ucb = monte_carlo_tree_search(make_state(), iterations=3000, selection="ucb1")
+    total = sum(m.visits for m in ucb.side_one)
+    for m in ucb.side_one:  # ucb1 reports its visit share as the strategy
+        assert m.avg_strategy == pytest.approx(m.visits / total, abs=1e-5)
+    for mode in ("exp3", "rm"):
+        result = monte_carlo_tree_search(make_state(), iterations=5000, selection=mode, gamma=0.1)
+        assert result.total_visits >= 5000
+        for side in (result.side_one, result.side_two):
+            assert sum(m.avg_strategy for m in side) == pytest.approx(1.0, abs=1e-3)
+            assert all(m.avg_strategy >= 0.1 / len(side) - 1e-3 for m in side)
+
+
+def test_selection_validation_and_threads():
+    state = make_state()
+    with pytest.raises(ValueError):
+        monte_carlo_tree_search(state, iterations=10, selection="nope")
+    with pytest.raises(ValueError):
+        monte_carlo_tree_search(state, iterations=10, selection="rm", gamma=0.0)
+    with pytest.raises(ValueError):
+        monte_carlo_tree_search(state, iterations=10, selection="exp3", threads=2)
+    assert monte_carlo_tree_search(state, iterations=500, threads=2).total_visits > 0

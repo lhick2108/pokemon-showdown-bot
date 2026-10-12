@@ -75,6 +75,13 @@ def test_aggregate_policy_averages_visit_shares_per_world():
     assert aggregate_policy([(0, [])]) == {}
 
 
+def test_aggregate_policy_uses_average_strategy_when_present():
+    world_a = (100, [("a", 75, 0.0), ("b", 25, 0.0)], [0.2, 0.8])
+    world_b = (400, [("a", 100, 0.0), ("b", 300, 0.0)], [0.4, 0.6])
+    policy = aggregate_policy([world_a, world_b])
+    assert policy["a"] == pytest.approx(0.3) and policy["b"] == pytest.approx(0.7)
+
+
 def test_argmax_selection_is_deterministic():
     policy = {"a": 0.5, "b": 0.3, "c": 0.2}
     rng = random.Random(0)
@@ -318,3 +325,46 @@ def test_worker_evaluator_cache_keys_on_scale(tmp_path):
     assert _worker.get_evaluator(str(path), 1.0) is a
     b = _worker.get_evaluator(str(path), 2.0)
     assert b is not a and b.leaf_scale == 2.0 and a.leaf_scale == 1.0
+
+
+def test_selection_config_env_and_validation(data, monkeypatch):
+    assert SearchConfig().selection == "ucb1" and SearchConfig().selection_gamma == 0.1
+    monkeypatch.setenv("SHOWDOWN_SEARCH_SELECTION", "RM")
+    monkeypatch.setenv("SHOWDOWN_SEARCH_SELECTION_GAMMA", "0.25")
+    cfg = SearchConfig.from_env()
+    assert (cfg.selection, cfg.selection_gamma) == ("rm", 0.25)
+    monkeypatch.setenv("SHOWDOWN_SEARCH_SELECTION", "bogus")
+    monkeypatch.setenv("SHOWDOWN_SEARCH_SELECTION_GAMMA", "2")
+    cfg = SearchConfig.from_env()
+    assert (cfg.selection, cfg.selection_gamma) == ("ucb1", 0.1)
+    with pytest.raises(ValueError):
+        _spy_player(data, selection="bogus")
+    with pytest.raises(ValueError):
+        _spy_player(data, selection="exp3", selection_gamma=0.0)
+    with pytest.raises(ValueError):
+        _spy_player(data, config=SearchConfig(threads=2), selection="rm")
+
+
+@pytest.mark.parametrize("mode", ["exp3", "rm"])
+def test_selection_reaches_worker_and_policy_uses_strategy(data, mode):
+    p, calls, pool = _spy_player(
+        data, config=SearchConfig(search_time_ms=30), selection=mode, selection_gamma=0.2
+    )
+    order = asyncio.run(p.choose_move(_battle()))
+    pool.shutdown()
+    assert order.message in _legal(_battle())
+    assert p.stats.fallbacks == 0 and p.stats.world_errors == 0
+    assert calls and all(args[5:7] == (mode, 0.2) for args in calls)
+    assert sum(p.last_policy.values()) == pytest.approx(1.0, abs=1e-3)
+
+
+def test_worker_ucb1_result_shape_unchanged_and_strategy_appended():
+    from showdown_bot.players import _worker
+    from test_engine import make_state
+
+    s = str(make_state().to_string())
+    base = _worker.search_world(s, 20, 1)
+    assert len(base) == 2
+    ex = _worker.search_world(s, 20, 1, None, 1.0, "exp3", 0.1)
+    assert len(ex) == 3 and len(ex[2]) == len(ex[1])
+    assert sum(ex[2]) == pytest.approx(1.0, abs=1e-3)

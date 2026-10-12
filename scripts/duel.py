@@ -3,7 +3,11 @@
     python -m uv run python scripts/duel.py --evaluator models/x.pev --games 100 --pairs 4
 
 Both sides get the same SearchConfig (time per world, worlds, threads, mode)
-except for ``evaluator``; each side's config is passed to its player as a
+except for ``evaluator`` and, if asked, the engine selection mode
+(--net-selection / --stock-selection, gamma --selection-gamma); with
+--stock-uses-evaluator both sides use the same evaluator, so e.g.
+``--net-selection rm --stock-selection ucb1 --stock-uses-evaluator`` isolates
+the selection rule; each side's config is passed to its player as a
 constructor argument, so the process-wide SHOWDOWN_SEARCH_* env vars are not
 used. The two sides of every pair share one MCTS process pool, so CPU
 contention is symmetric. Needs the local server on 127.0.0.1:8000
@@ -26,7 +30,9 @@ from pathlib import Path
 from poke_env.ps_client import AccountConfiguration, LocalhostServerConfiguration
 
 from showdown_bot import bench
-from showdown_bot.players.search import SearchConfig, SearchNetPlayer, SearchPlayer, get_pool
+from showdown_bot.players.search import (
+    SELECTIONS, SearchConfig, SearchNetPlayer, SearchPlayer, get_pool,
+)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -34,6 +40,14 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--evaluator", type=Path, required=True, help="learned .pev file")
     p.add_argument("--leaf-scale", type=float, default=1.0,
                    help="learned leaf scale k: score = sigmoid(k * dz); net side only")
+    p.add_argument("--net-selection", choices=SELECTIONS, default="ucb1",
+                   help="engine tree policy of the net side (default ucb1)")
+    p.add_argument("--stock-selection", choices=SELECTIONS, default="ucb1",
+                   help="engine tree policy of the stock side (default ucb1)")
+    p.add_argument("--selection-gamma", type=float, default=0.1,
+                   help="exploration rate in (0, 1] for exp3/rm sides")
+    p.add_argument("--stock-uses-evaluator", action="store_true",
+                   help="give the second side the same evaluator/leaf scale (isolates selection)")
     p.add_argument("--games", type=bench._positive_int, default=100)
     p.add_argument("--pairs", type=bench._positive_int, default=4, help="parallel pairs")
     p.add_argument("--format", default="gen9randombattle")
@@ -59,17 +73,24 @@ async def _duel_pair(args, share: int, pool):
     }
     base = SearchConfig(
         search_time_ms=args.search_time_ms, parallelism=args.parallelism,
-        worlds=args.worlds, threads=args.threads,
+        worlds=args.worlds, threads=args.threads, selection_gamma=args.selection_gamma,
     )
+    evaluator_fields = {"evaluator": str(args.evaluator.resolve()),
+                        "evaluator_scale": args.leaf_scale}
     net = SearchNetPlayer(
         account_configuration=AccountConfiguration("dn" + secrets.token_hex(5), None),
-        config=SearchConfig(**{**base.__dict__, "evaluator": str(args.evaluator.resolve()),
-                          "evaluator_scale": args.leaf_scale}),
+        config=SearchConfig(**{**base.__dict__, **evaluator_fields,
+                          "selection": args.net_selection}),
         executor=pool, **options,
     )
-    stock = SearchPlayer(
+    stock_cls = SearchNetPlayer if args.stock_uses_evaluator else SearchPlayer
+    stock = stock_cls(
         account_configuration=AccountConfiguration("ds" + secrets.token_hex(5), None),
-        config=base, executor=pool, **options,
+        config=SearchConfig(**{
+            **base.__dict__, **(evaluator_fields if args.stock_uses_evaluator else {}),
+            "selection": args.stock_selection,
+        }),
+        executor=pool, **options,
     )
     try:
         await bench._wait_for_player_logins([net, stock], args.connect_timeout)
@@ -99,6 +120,13 @@ def main(argv=None) -> int:
     if not (math.isfinite(args.leaf_scale) and args.leaf_scale > 0):
         print(f"--leaf-scale must be finite and > 0, got {args.leaf_scale}", file=sys.stderr)
         return 2
+    if not (math.isfinite(args.selection_gamma) and 0 < args.selection_gamma <= 1):
+        print(f"--selection-gamma must be in (0, 1], got {args.selection_gamma}", file=sys.stderr)
+        return 2
+    if "ucb1" != args.net_selection or "ucb1" != args.stock_selection:
+        if args.threads > 1:
+            print("exp3/rm selection needs --threads 1", file=sys.stderr)
+            return 2
     if not args.evaluator.is_file():
         print(f"no such evaluator: {args.evaluator}", file=sys.stderr)
         return 2
@@ -116,7 +144,10 @@ def main(argv=None) -> int:
     wins = sum(net.n_won_battles for net, _ in pairs)
     lo, hi = bench.wilson_interval(wins, n)
     print("\n=== duel: search-net vs search ===")
-    print(f"evaluator: {args.evaluator} (leaf scale {args.leaf_scale:g}, net side only)")
+    print(f"evaluator: {args.evaluator} (leaf scale {args.leaf_scale:g}, "
+          f"{'both sides' if args.stock_uses_evaluator else 'net side only'})")
+    print(f"selection: net={args.net_selection} stock={args.stock_selection} "
+          f"(gamma {args.selection_gamma:g} for exp3/rm)")
     print(f"compute (both sides): {args.search_time_ms} ms/world, parallelism {args.parallelism}, "
           f"worlds {args.worlds or '2 x parallelism (4x early)'}, threads {args.threads}; "
           f"{len(pairs)} parallel pairs, pool of {args.workers}")

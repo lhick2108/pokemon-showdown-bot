@@ -51,8 +51,10 @@ PRIOR_WEIGHT = 0.5  # virtual tie games added between every pair of bots
 # ---------------------------------------------------------------------------
 
 SPEC_KEYS = {
-    "search": {"evaluator": str, "scale": float, "time_ms": int, "worlds": int},
-    "search-net": {"evaluator": str, "scale": float, "time_ms": int, "worlds": int},
+    "search": {"evaluator": str, "scale": float, "time_ms": int, "worlds": int,
+               "selection": str, "gamma": float},
+    "search-net": {"evaluator": str, "scale": float, "time_ms": int, "worlds": int,
+                   "selection": str, "gamma": float},
 }
 
 
@@ -119,7 +121,11 @@ def parse_spec(text: str) -> BotSpec:
                 raise ValueError(f"{key} must be positive in bot spec {raw!r}")
             if key == "scale" and not (math.isfinite(parsed) and parsed > 0):
                 raise ValueError(f"scale must be positive in bot spec {raw!r}")
-            params.append((key, parsed))
+            if key == "selection" and parsed.lower() not in ("ucb1", "exp3", "rm"):
+                raise ValueError(f"selection must be ucb1, exp3 or rm in bot spec {raw!r}")
+            if key == "gamma" and not (math.isfinite(parsed) and 0 < parsed <= 1):
+                raise ValueError(f"gamma must be in (0, 1] in bot spec {raw!r}")
+            params.append((key, parsed.lower() if key == "selection" else parsed))
     if type_name == "search-net" and not any(k == "evaluator" for k, _ in params) \
             and not os.environ.get("SHOWDOWN_SEARCH_EVALUATOR"):
         raise ValueError(f"search-net spec {raw!r} needs evaluator=<path.pev>")
@@ -519,6 +525,13 @@ def _make_player(spec: BotSpec, cfg: LeagueConfig, recorder, concurrency: int, s
                     "which this checkout does not have (branch feat/589.16-leaf-scale)"
                 )
             kwargs["evaluator_scale"] = scale
+        if spec.param("selection") is not None or spec.param("gamma") is not None:
+            if "selection" not in inspect.signature(cls.__init__).parameters:
+                raise ValueError(f"{spec.label}: selection/gamma need SearchPlayer(selection=...)")
+            if spec.param("selection") is not None:
+                kwargs["selection"] = spec.param("selection")
+            if spec.param("gamma") is not None:
+                kwargs["selection_gamma"] = spec.param("gamma")
         if cfg.search_workers:
             kwargs["executor"] = get_pool(cfg.search_workers)
     return cls(**kwargs)
@@ -738,7 +751,7 @@ def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     p.add_argument("--bots", help="comma-separated label=type[:key=value...] or plain type. Types: "
                    + ", ".join(sorted(bench.PLAYER_REGISTRY)) + ", foulplay. search keys: "
-                   "evaluator, scale, time_ms, worlds. e.g. net=search-net:evaluator=m.pev:scale=4")
+                   "evaluator, scale, time_ms, worlds, selection (ucb1|exp3|rm), gamma. e.g. net=search-net:evaluator=m.pev:scale=4")
     p.add_argument("--games-per-pair", type=bench._positive_int, default=20)
     p.add_argument("--out", type=Path, help="output dir, e.g. data/league/<run-id>")
     p.add_argument("--rate-only", type=Path, metavar="DIR", help="recompute results from DIR/games.jsonl")
