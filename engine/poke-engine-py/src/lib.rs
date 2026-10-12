@@ -942,6 +942,15 @@ fn value_err(e: String) -> PyErr {
     pyo3::exceptions::PyValueError::new_err(e)
 }
 
+/// `stock_coef == 0` keeps the evaluator plain; anything else makes it residual.
+fn with_residual(ev: Evaluator, stock_coef: f32) -> PyResult<Evaluator> {
+    if stock_coef == 0.0 {
+        Ok(ev)
+    } else {
+        ev.with_stock_coef(stock_coef).map_err(value_err)
+    }
+}
+
 #[pymethods]
 impl PyEvaluator {
     /// Load a weights file written by `write_linear` / `write_mlp` (or Rust `Evaluator::save`).
@@ -958,15 +967,15 @@ impl PyEvaluator {
 
     /// value = weights . state_features + bias
     #[staticmethod]
-    #[pyo3(signature = (weights, bias=0.0, relative_to_root=true, leaf_scale=1.0))]
+    #[pyo3(signature = (weights, bias=0.0, relative_to_root=true, leaf_scale=1.0, stock_coef=0.0))]
     fn linear(
         weights: Vec<f32>,
         bias: f32,
         relative_to_root: bool,
         leaf_scale: f32,
+        stock_coef: f32,
     ) -> PyResult<PyEvaluator> {
-        let ev = Evaluator::linear(weights, bias)
-            .map_err(value_err)?
+        let ev = with_residual(Evaluator::linear(weights, bias).map_err(value_err)?, stock_coef)?
             .with_relative_to_root(relative_to_root)
             .with_leaf_scale(leaf_scale)
             .map_err(value_err)?;
@@ -975,7 +984,7 @@ impl PyEvaluator {
 
     /// value = w2 . relu(W1 x + b1) + b2; `w1` is flat row-major [hidden][FEATURE_LENGTH].
     #[staticmethod]
-    #[pyo3(signature = (w1, b1, w2, b2=0.0, relative_to_root=true, leaf_scale=1.0))]
+    #[pyo3(signature = (w1, b1, w2, b2=0.0, relative_to_root=true, leaf_scale=1.0, stock_coef=0.0))]
     fn mlp(
         w1: Vec<f32>,
         b1: Vec<f32>,
@@ -983,10 +992,10 @@ impl PyEvaluator {
         b2: f32,
         relative_to_root: bool,
         leaf_scale: f32,
+        stock_coef: f32,
     ) -> PyResult<PyEvaluator> {
         let hidden = b1.len();
-        let ev = Evaluator::mlp(hidden, w1, b1, w2, b2)
-            .map_err(value_err)?
+        let ev = with_residual(Evaluator::mlp(hidden, w1, b1, w2, b2).map_err(value_err)?, stock_coef)?
             .with_relative_to_root(relative_to_root)
             .with_leaf_scale(leaf_scale)
             .map_err(value_err)?;
@@ -1027,6 +1036,18 @@ impl PyEvaluator {
     #[getter]
     fn relative_to_root(&self) -> bool {
         self.inner.relative_to_root
+    }
+
+    /// True if the logit includes `stock_coef * evaluate(state)`.
+    #[getter]
+    fn residual(&self) -> bool {
+        self.inner.is_residual()
+    }
+
+    /// Multiplier on the raw stock evaluation (0.0 when not residual).
+    #[getter]
+    fn stock_coef(&self) -> f32 {
+        self.inner.stock_coef.unwrap_or(0.0)
     }
 }
 

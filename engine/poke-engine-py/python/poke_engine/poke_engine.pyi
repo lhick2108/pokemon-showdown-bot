@@ -449,6 +449,7 @@ class Evaluator:
         bias: float = 0.0,
         relative_to_root: bool = True,
         leaf_scale: float = 1.0,
+        stock_coef: float = 0.0,
     ) -> "Evaluator": ...
     @staticmethod
     def mlp(
@@ -458,6 +459,7 @@ class Evaluator:
         b2: float = 0.0,
         relative_to_root: bool = True,
         leaf_scale: float = 1.0,
+        stock_coef: float = 0.0,
     ) -> "Evaluator": ...
     def save(self, path: str) -> None: ...
     def evaluate(self, py_state: State) -> float: ...
@@ -472,6 +474,14 @@ class Evaluator:
     def hidden_size(self) -> int: ...
     @property
     def relative_to_root(self) -> bool: ...
+    @property
+    def residual(self) -> bool:
+        """True if the logit is ``stock_coef * evaluate(state) + net(features)``."""
+        ...
+    @property
+    def stock_coef(self) -> float:
+        """Multiplier on the raw stock ``evaluate()`` (0.0 when not residual)."""
+        ...
 
 def evaluate(py_state: State) -> float:
     """Stock hand-written evaluation (eval points) of the state."""

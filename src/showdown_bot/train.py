@@ -32,6 +32,16 @@ Value target (``--value-target``)
     decision's mean over worlds (default) or each world's own score. Metrics are
     reported against the training target and against the pure outcome z.
 
+Residual evaluator (``--residual``)
+    The stock evaluation is the starting point and the net learns only a
+    correction: ``z = a * 0.0125 * evaluate(state) + net(features)``. ``a`` is a
+    learnable scalar initialised from a weighted logistic fit of the outcome on
+    ``0.0125 * evaluate`` (with intercept b) on the train split, or
+    ``--stock-coef-init``; ``--freeze-stock-coef`` keeps it fixed. The net's
+    output layer starts at zero weights and bias b, so the untrained model IS
+    the calibrated stock logistic; its val BCE is printed as the baseline. The
+    export is a format-2 ``.pev`` with ``stock_coef = a * 0.0125``.
+
 Device: cuda when available, else cpu (``--device`` overrides).
 """
 
@@ -74,6 +84,14 @@ class Data:
     # from y and q. ``y`` is always the pure outcome; ``target`` None means y.
     q: np.ndarray | None = None
     target: np.ndarray | None = None
+    # residual mode: the last column of ``x`` is the raw stock evaluate(state)
+    residual: bool = False
+
+    @property
+    def e(self) -> np.ndarray:
+        """Raw stock evaluation per sample (residual data only)."""
+        assert self.residual
+        return self.x[:, -1]
 
     @property
     def y_fit(self) -> np.ndarray:
@@ -91,6 +109,7 @@ class Data:
             [self.tags[i] for i in idx], [self.states[i] for i in idx],
             None if self.q is None else self.q[idx],
             None if self.target is None else self.target[idx],
+            self.residual,
         )
 
 
@@ -133,25 +152,33 @@ def load_data(
     value_target: str = "outcome",
     blend_lambda: float = 0.5,
     q_source: str = "decision",
+    residual: bool = False,
 ) -> Data:
-    """Load every sample of the given run directories into memory."""
-    feats, ys, qs, tags, strings = [], [], [], [], []
+    """Load every sample of the given run directories into memory.
+
+    ``residual`` appends the raw stock ``evaluate(state)`` as the last column of ``x``.
+    """
+    feats, ys, qs, tags, strings, evals = [], [], [], [], [], []
     load = dataset.LoadStats()
     for path in paths:
         for s in dataset.iter_samples(
             path, sides=(1,), worlds=states in ("both", "worlds"),
             truth=states in ("both", "truth"), stats=load, q_source=q_source,
+            with_stock_eval=residual,
         ):
             feats.append(s.features)
             ys.append(s.value)
             qs.append(np.nan if s.search_value is None else s.search_value)
             tags.append(s.battle_tag)
             strings.append(s.state)
+            evals.append(s.stock_eval)
     if load.bad_states:
         print(f"warning: {load.bad_states} unparsable states skipped", file=sys.stderr)
     if not feats:
         raise SystemExit("no samples found in " + ", ".join(map(str, paths)))
     x = np.asarray(feats, dtype=np.float32)
+    if residual:
+        x = np.concatenate([x, np.asarray(evals, dtype=np.float32)[:, None]], axis=1)
     y = np.asarray(ys, dtype=np.float32)
     q = np.asarray(qs, dtype=np.float32)
     target, n_fallback = make_targets(y, q, value_target, blend_lambda)
@@ -160,7 +187,7 @@ def load_data(
               f"value and fall back to the outcome")
     return Data(
         x, y, sample_weights(tags, weighting), tags, strings, q,
-        None if value_target == "outcome" else target,
+        None if value_target == "outcome" else target, residual,
     )
 
 
@@ -182,12 +209,70 @@ def split_by_battle(
 # ---------------------------------------------------------------------------
 
 
-def build_model(kind: str, n_in: int, hidden: int) -> nn.Module:
+def build_model(
+    kind: str, n_in: int, hidden: int, residual: tuple[float, float] | None = None,
+    freeze_a: bool = False,
+) -> nn.Module:
+    """``n_in`` counts feature columns only. ``residual=(a, b)`` wraps the net in a ResidualNet."""
     if kind == "linear":
-        return nn.Linear(n_in, 1)
-    if kind == "mlp":
-        return nn.Sequential(nn.Linear(n_in, hidden), nn.ReLU(), nn.Linear(hidden, 1))
-    raise ValueError(f"unknown model {kind!r}")
+        net: nn.Module = nn.Linear(n_in, 1)
+    elif kind == "mlp":
+        net = nn.Sequential(nn.Linear(n_in, hidden), nn.ReLU(), nn.Linear(hidden, 1))
+    else:
+        raise ValueError(f"unknown model {kind!r}")
+    if residual is not None:
+        return ResidualNet(net, residual[0], residual[1], freeze_a)
+    return net
+
+
+STOCK_SCALE = 0.0125  # the stock search scale: P = sigmoid(0.0125 * evaluate)
+
+
+class ResidualNet(nn.Module):
+    """``z = a * 0.0125 * e + net(x)``; input is ``[x, e]`` (e = raw stock evaluate)."""
+
+    def __init__(self, net: nn.Module, a: float, intercept: float = 0.0, freeze_a: bool = False):
+        super().__init__()
+        self.net = net
+        self.a = nn.Parameter(torch.tensor(float(a)), requires_grad=not freeze_a)
+        # zero output layer + intercept: the untrained model is the stock logistic fit
+        out = net if isinstance(net, nn.Linear) else net[2]
+        nn.init.zeros_(out.weight)
+        nn.init.constant_(out.bias, float(intercept))
+
+    def forward(self, xe: torch.Tensor) -> torch.Tensor:
+        return self.net(xe[:, :-1]) + STOCK_SCALE * self.a * xe[:, -1:]
+
+    @property
+    def stock_coef(self) -> float:
+        return STOCK_SCALE * float(self.a.item())
+
+
+def fit_stock_logistic(
+    e: np.ndarray, y: np.ndarray, w: np.ndarray, fixed_a: float | None = None, iters: int = 50
+) -> tuple[float, float]:
+    """Weighted logistic fit ``y ~ sigmoid(a * 0.0125 * e + b)`` by Newton (IRLS).
+
+    Returns ``(a, b)``. With ``fixed_a`` only the intercept is fitted.
+    """
+    s = STOCK_SCALE * e.astype(np.float64)
+    y = y.astype(np.float64)
+    w = w.astype(np.float64)
+    if fixed_a is not None:
+        design, offset, beta = np.ones((len(s), 1)), fixed_a * s, np.zeros(1)
+    else:
+        design, offset, beta = np.stack([s, np.ones_like(s)], axis=1), 0.0, np.array([0.5, 0.0])
+    for _ in range(iters):
+        p = 1 / (1 + np.exp(-(design @ beta + offset)))
+        grad = design.T @ (w * (p - y))
+        hess = (design * (w * p * (1 - p))[:, None]).T @ design + 1e-9 * np.eye(len(beta))
+        step = np.linalg.solve(hess, grad)
+        beta -= step
+        if np.abs(step).max() < 1e-9:
+            break
+    if fixed_a is not None:
+        return float(fixed_a), float(beta[0])
+    return float(beta[0]), float(beta[1])
 
 
 def logits_of(model: nn.Module, x: torch.Tensor, batch: int = 8192) -> torch.Tensor:
@@ -276,7 +361,11 @@ def fit(
     model.to(device)
     xt, yt, wt = (torch.from_numpy(a).to(device) for a in (train.x, train.y_fit, train.w))
     xv, yv, wv = (torch.from_numpy(a).to(device) for a in (val.x, val.y_fit, val.w))
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    decayed = [p for n_, p in model.named_parameters() if p.requires_grad and n_ != "a"]
+    groups = [{"params": decayed}]
+    if isinstance(model, ResidualNet) and model.a.requires_grad:
+        groups.append({"params": [model.a], "weight_decay": 0.0})  # a is not shrunk toward 0
+    opt = torch.optim.AdamW(groups, lr=lr, weight_decay=weight_decay)
     gen = torch.Generator().manual_seed(seed)
     best_loss, best_state, best_epoch, stale = float("inf"), None, 0, 0
     history: list[tuple[int, float, float]] = []
@@ -324,9 +413,16 @@ def export_pev(model: nn.Module, out: Path) -> None:
 
     out.parent.mkdir(parents=True, exist_ok=True)
     model = model.to("cpu")
+    stock_coef = 0.0
+    if isinstance(model, ResidualNet):
+        stock_coef = model.stock_coef
+        if stock_coef == 0.0:
+            raise ValueError("residual model with stock_coef 0 cannot be exported as residual")
+        model = model.net
     if isinstance(model, nn.Linear):
         poke_engine.write_linear(
-            str(out), model.weight.detach().reshape(-1).tolist(), float(model.bias.item())
+            str(out), model.weight.detach().reshape(-1).tolist(), float(model.bias.item()),
+            stock_coef=stock_coef,
         )
         return
     l1, l2 = model[0], model[2]
@@ -336,6 +432,7 @@ def export_pev(model: nn.Module, out: Path) -> None:
         l1.bias.detach().tolist(),
         l2.weight.detach().reshape(-1).tolist(),
         float(l2.bias.item()),
+        stock_coef=stock_coef,
     )
 
 
@@ -349,9 +446,12 @@ def verify_export(model: nn.Module, path: Path, states: list[str], tol: float = 
     evaluator = poke_engine.Evaluator.load(str(path))
     model = model.to("cpu")
     parsed = [poke_engine.State.from_string(s) for s in states]
-    feats = torch.tensor(
-        [poke_engine.state_features(s, 1) for s in parsed], dtype=torch.float32
-    )
+    rows = [poke_engine.state_features(s, 1) for s in parsed]
+    if isinstance(model, ResidualNet):
+        rows = [r + [poke_engine.evaluate(s)] for r, s in zip(rows, parsed)]
+        if not evaluator.residual or abs(evaluator.stock_coef - model.stock_coef) > 1e-7:
+            raise RuntimeError("exported evaluator lost its residual stock_coef")
+    feats = torch.tensor(rows, dtype=torch.float32)
     expected = logits_of(model, feats).numpy()
     got = np.array([evaluator.evaluate(s) for s in parsed])
     worst = float(np.abs(expected - got).max())
@@ -436,6 +536,12 @@ def _parser() -> argparse.ArgumentParser:
                    help="weight L of q in the blend target (default 0.5)")
     p.add_argument("--q-source", choices=dataset.Q_SOURCES, default="decision",
                    help="q for world samples: decision mean (default) or the world's own score")
+    p.add_argument("--residual", action="store_true",
+                   help="learn a correction to the stock evaluation: z = a*0.0125*evaluate + net(x)")
+    p.add_argument("--stock-coef-init", type=float, default=None,
+                   help="residual: initial/fixed a (default: logistic fit on the train split)")
+    p.add_argument("--freeze-stock-coef", action="store_true",
+                   help="residual: keep a at its initial value")
     p.add_argument("--val-fraction", type=float, default=0.1)
     p.add_argument("--epochs", type=int, default=60)
     p.add_argument("--patience", type=int, default=6)
@@ -467,7 +573,8 @@ def main(argv=None) -> int:
         else f" (q-source={args.q_source})" if args.value_target == "search" else "")
     print(f"value target: {target_desc}")
     data = load_data(
-        args.data, args.states, args.weighting, args.value_target, args.blend_lambda, args.q_source
+        args.data, args.states, args.weighting, args.value_target, args.blend_lambda, args.q_source,
+        residual=args.residual,
     )
     tr_idx, va_idx = split_by_battle(data.tags, args.val_fraction, args.seed)
     if len(va_idx) == 0 or len(tr_idx) == 0:
@@ -479,12 +586,29 @@ def main(argv=None) -> int:
           f"train {len(train)} samples / {len(set(train.tags))} battles; "
           f"val {len(val)} samples / {len(set(val.tags))} battles; "
           f"mean value {float(data.y.mean()):.3f}")
-    model = build_model(args.model, data.x.shape[1], args.hidden)
+    n_feat = data.x.shape[1] - (1 if args.residual else 0)
+    res_init = None
+    if args.residual:
+        a0, b0 = fit_stock_logistic(train.e, train.y_fit, train.w, args.stock_coef_init)
+        res_init = (a0, b0)
+        base_lv = torch.from_numpy((STOCK_SCALE * a0 * val.e + b0).astype(np.float32))
+        base_lt = torch.from_numpy((STOCK_SCALE * a0 * train.e + b0).astype(np.float32))
+        yv, wv = torch.from_numpy(val.y), torch.from_numpy(val.w)
+        yt, wt = torch.from_numpy(train.y), torch.from_numpy(train.w)
+        print(f"stock-only logistic (a={a0:.4f}, b={b0:.4f}, fitted on train"
+              f"{'' if args.stock_coef_init is None else ', a fixed'}): "
+              f"val BCE weighted {weighted_bce(base_lv, yv, wv):.4f}  "
+              f"unweighted {weighted_bce(base_lv, yv):.4f}  "
+              f"(train weighted {weighted_bce(base_lt, yt, wt):.4f})")
+    model = build_model(args.model, n_feat, args.hidden, res_init, args.freeze_stock_coef)
     result = fit(
         model, train, val, device=device, epochs=args.epochs, patience=args.patience,
         batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay, seed=args.seed,
     )
     print(f"best epoch {result.best_epoch} of {result.epochs_run}")
+    if args.residual:
+        print(f"learned a = {float(result.model.a.item()):.4f}  "
+              f"(stock_coef = {result.model.stock_coef:.6f})")
     report(result.model, train, val, device)
     export_pev(result.model, args.out)
     rng = random.Random(args.seed)

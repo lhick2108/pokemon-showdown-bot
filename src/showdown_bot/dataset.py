@@ -46,6 +46,9 @@ class Sample:
     # Search-based value estimate in [0, 1] from this sample's side's view (MCTS root
     # avg_score; side two gets 1 - q). None when no searched world had visits.
     search_value: float | None = None
+    # Stock ``poke_engine.evaluate(state)`` (eval points, side one's view; NOT flipped for
+    # side two). Only filled with ``iter_samples(..., with_stock_eval=True)``.
+    stock_eval: float | None = None
 
     def as_tuple(self) -> tuple[list[float], float, dict[str, float] | None]:
         return self.features, self.value, self.policy
@@ -87,6 +90,7 @@ def iter_samples(
     truth: bool = True,
     stats: LoadStats | None = None,
     q_source: str = "decision",
+    with_stock_eval: bool = False,
 ) -> Iterator[Sample]:
     """Yield one ``Sample`` per stored state (every searched world, plus truth).
 
@@ -133,6 +137,7 @@ def iter_samples(
                 except BaseException:  # includes pyo3 PanicException (not an Exception)
                     stats.bad_states += 1
                     continue
+                stock_eval = poke_engine.evaluate(state) if with_stock_eval else None
                 for side in sides:
                     yield Sample(
                         features=poke_engine.state_features(state, side),
@@ -144,6 +149,7 @@ def iter_samples(
                         turn=decision.get("turn"),
                         state=state_string,
                         search_value=None if q is None else (q if side == 1 else 1.0 - q),
+                        stock_eval=stock_eval,
                     )
 
 
