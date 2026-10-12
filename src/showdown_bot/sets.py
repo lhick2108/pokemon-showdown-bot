@@ -1525,8 +1525,12 @@ class OpponentModel:
             if self._damage_inferer is None:
                 self._damage_inferer = DamageInferer(self.data)
             trackers = self.update(battle)
+            try:
+                illusion_p = sum(self.illusion_probability(battle).values())
+            except Exception:
+                illusion_p = 0.0
             results = self._damage_inferer.evaluate_all(
-                battle, trackers, [record[0] for record in pending]
+                battle, trackers, [record[0] for record in pending], illusion_p
             )
             role = getattr(battle, "player_role", None)
             for obs, _key, constraint in results:

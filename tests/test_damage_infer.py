@@ -228,3 +228,64 @@ def test_inference_off_skips_damage(data):
         ("-damage", "p1a: Heatran", f"{hp // 2}/{max_hp}"),
     )
     assert model.damage_stats is None
+
+
+def test_roost_and_attacker_hp_are_tracked_for_the_hit():
+    base = [
+        ["", "switch", "p1a: Heatran", "Great Tusk, L80", "100/100"],
+        ["", "switch", "p2a: Gardevoir", "Gardevoir, L83", "100/100"],
+        ["", "turn", "1"],
+    ]
+    # an earlier hit this turn lowered the attacker's HP: the observation carries it
+    tracker = InferenceTracker()
+    emitted = []
+    for e in base + [
+        ["", "move", "p1a: Heatran", "Earthquake", "p2a: Gardevoir"],
+        ["", "-damage", "p2a: Gardevoir", "40/100"],
+        ["", "move", "p2a: Gardevoir", "Moonblast", "p1a: Heatran"],
+        ["", "-damage", "p1a: Heatran", "50/100"],
+        ["", "upkeep"],
+    ]:
+        emitted += tracker.feed(e)
+    moonblast = [x[1] for x in emitted if isinstance(x[1], inference.DamageObs)
+                 and x[1].move_id == "moonblast"]
+    assert moonblast and moonblast[0].attacker_hp == pytest.approx(0.4)
+
+    # Roost (-singleturn) removes Flying for the turn: later hits are not plain
+    tracker = InferenceTracker()
+    emitted = []
+    for e in base + [
+        ["", "move", "p1a: Heatran", "Roost", "p1a: Heatran"],
+        ["", "-singleturn", "p1a: Heatran", "move: Roost"],
+        ["", "move", "p2a: Gardevoir", "Moonblast", "p1a: Heatran"],
+        ["", "-damage", "p1a: Heatran", "50/100"],
+        ["", "upkeep"],
+    ]:
+        emitted += tracker.feed(e)
+    assert not [x for x in emitted if isinstance(x[1], inference.DamageObs)]
+
+
+def test_roll_consistent_window_and_survival_effects():
+    # exact HP: rolls span [0.85, 1.0] of 100, widened by the margins
+    assert damage_infer.roll_consistent(100, 93, True, 500)
+    assert damage_infer.roll_consistent(100, 85, True, 500)
+    assert not damage_infer.roll_consistent(100, 60, True, 500)
+    assert not damage_infer.roll_consistent(100, 130, True, 500)
+    # percent HP
+    assert damage_infer.roll_consistent(40.0, 36.0, False, 100.0)
+    assert not damage_infer.roll_consistent(40.0, 20.0, False, 100.0)
+    # a hit that must have KOed (min roll >= defender HP) but did not is a
+    # Focus Sash / Sturdy / Endure style cut: it says nothing about the roll
+    assert damage_infer.roll_consistent(300, 97, True, 100)
+    assert damage_infer.roll_consistent(173.0, 97.0, False, 100.0)
+
+
+def test_unmodelled_forms_and_retyping_abilities_are_not_judged():
+    class Mon:
+        def __init__(self, species):
+            self.species = species
+
+    assert damage_infer._unmodelled_forme(Mon("Minior-Meteor"))
+    assert damage_infer._unmodelled_forme(Mon("ditto"))
+    assert not damage_infer._unmodelled_forme(Mon("Gardevoir"))
+    assert {"protean", "libero", "analytic"} <= damage_infer._UNRELIABLE_ABILITIES
