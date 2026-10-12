@@ -18,6 +18,14 @@ from types import MappingProxyType
 from typing import Any
 
 
+from showdown_bot.inference import (
+    Constraint,
+    InferenceTracker,
+    SpeedObs,
+    constraint_allows,
+    resolve_speed,
+)
+
 logger = logging.getLogger(__name__)
 
 _DATA_URL = "https://pkmn.github.io/randbats/data"
@@ -577,6 +585,16 @@ class SetTracker:
         self._provisional_move_names: list[str] = []
         self._provisional_observations: list[tuple[str, str]] = []
         self._binding_revealed_moves: list[str] = []
+        # Negative / indirect evidence (task 589.28): predicates over full sets.
+        self._constraints: list[Constraint] = []
+        self._provisional_constraints: list[Constraint] = []
+        self._signature: tuple | None = None
+        self._match_cache: list[tuple[str, FullSet]] | None = None
+
+    @property
+    def constraints(self) -> tuple[Constraint, ...]:
+        """Binding negative-evidence predicates applied when sampling."""
+        return tuple(self._constraints)
 
     @property
     def revealed_moves(self) -> tuple[str, ...]:
@@ -608,6 +626,13 @@ class SetTracker:
         self, observations: Sequence[tuple[str, Any, bool]]
     ) -> None:
         """Replace model-fed evidence after protocol provenance is reconciled."""
+        signature = tuple(observations)
+        if signature == self._signature:
+            return
+        self._signature = signature
+        self._match_cache = None
+        self._constraints = []
+        self._provisional_constraints = []
         self._observations.clear()
         self._observation_ids.clear()
         self._revealed_moves.clear()
@@ -623,6 +648,13 @@ class SetTracker:
         for kind, value, provisional in observations:
             if kind in {"moves", "items", "abilities", "teraTypes"}:
                 self._observe(kind, value, provisional=provisional)
+            elif kind == "constraint":
+                target = self._provisional_constraints if provisional else self._constraints
+                if value not in target:
+                    target.append(value)
+        # _observe() cleared the cache and signature; restore the signature.
+        self._signature = signature
+        self._match_cache = None
 
     def observe_move(self, move: Any, *, provisional: bool = False) -> None:
         self._observe("moves", move, provisional=provisional)
@@ -643,6 +675,8 @@ class SetTracker:
             return
         if kind == "items" and option_id == "unknownitem":
             return
+        self._signature = None
+        self._match_cache = None
         key = (kind, option_id)
         if key in self._observation_ids:
             return
@@ -745,13 +779,33 @@ class SetTracker:
         )
 
     def _matching_full_sets(self) -> list[tuple[str, FullSet]]:
-        """Full sets, across every candidate species id, legal given evidence."""
-        return [
+        """Full sets, across every candidate species id, legal given evidence.
+
+        Binding revealed evidence is mandatory. Negative-evidence constraints
+        (task 589.28) are applied one at a time and a constraint that would
+        leave nothing is skipped, so a wrongly-inferred exclusion can degrade
+        sampling to "no inference" but never to the role-based fallback.
+        """
+        if self._match_cache is not None:
+            return self._match_cache
+        matches = [
             (species_id, full_set)
             for species_id in self._species_ids
             for full_set in self.data.full_sets(species_id)
             if self._full_set_consistent(full_set)
         ]
+        for constraint in self._constraints:
+            if not matches:
+                break
+            kept = [
+                (species_id, full_set)
+                for species_id, full_set in matches
+                if constraint_allows(constraint, species_id, full_set)
+            ]
+            if kept:
+                matches = kept
+        self._match_cache = matches
+        return matches
 
     def _full_set_consistent(self, full_set: FullSet) -> bool:
         move_ids = {to_id(move) for move in full_set.moves}
@@ -888,6 +942,11 @@ class SetTracker:
         return tuple(moves)
 
 
+_ORIGIN_REVEAL_EVENTS = frozenset(
+    {"-damage", "-heal", "-status", "-boost", "-unboost", "-curestatus", "-sethp",
+     "-immune", "-activate", "-block"}
+)
+
 _PROTOCOL_IDENTIFIER = re.compile(r"^(p[12])([a-z])?:\s*(.+)$", re.IGNORECASE)
 _TRANSFER_MOVES = {"trick", "switcheroo", "bestow", "thief", "covet"}
 _TRANSFER_ABILITIES = {"magician", "pickpocket", "symbiosis"}
@@ -931,6 +990,11 @@ class _ProtocolSession:
     hit_moves: list[str] = field(default_factory=list)
     terastallized: bool = False
     duplicate: str | None = None  # "hp" | "fainted"
+    # Negative / indirect evidence (task 589.28): predicates over full sets and
+    # raw speed-order observations. Held per session so they follow Illusion's
+    # ``replace`` reattribution and its provisional handling like moves do.
+    constraints: list[Constraint] = field(default_factory=list)
+    speed_obs: list[SpeedObs] = field(default_factory=list)
 
 
 @dataclass
@@ -969,6 +1033,7 @@ class _BattleOpponentState:
     # copied ``|move|`` event has not: that move is the dancer's copy of
     # someone else's move, even when the server leaves off its ``[from]`` tag.
     dancer_pending: set[tuple[str, str]] = field(default_factory=set)
+    inference: InferenceTracker = field(default_factory=InferenceTracker)
 
 
 def _protocol_name(value: Any) -> tuple[str, str] | None:
@@ -1372,11 +1437,83 @@ class OpponentModel:
     and other tells and give P(active opponent is a disguised Zoroark).
     """
 
-    def __init__(self, data: RandbatsData):
+    def __init__(self, data: RandbatsData, *, inference: bool = True):
         self.data = data
         self._battles: dict[str, _BattleOpponentState] = {}
+        # False disables the 589.28 inference (item/ability origin reveals,
+        # negative evidence, speed): the pre-589.28 behaviour, for A/B duels.
+        self.inference_enabled = inference
 
     def observe(self, battle_tag: str, event: list[str]) -> None:
+        """Consume one raw ``parse_message`` event (see ``_observe_core``).
+
+        After the ordered-provenance bookkeeping, item/ability reveals tagged
+        ``[from] item:`` / ``[from] ability:`` are recorded and the negative
+        evidence tracker (``showdown_bot.inference``) is fed; both attach to
+        the same protocol sessions as every other observation.
+        """
+        self._observe_core(battle_tag, event)
+        if (
+            not self.inference_enabled
+            or not isinstance(event, Sequence)
+            or isinstance(event, str)
+            or len(event) < 2
+        ):
+            return
+        try:
+            state = self._battles.setdefault(str(battle_tag), _BattleOpponentState())
+            self._record_origin_reveal(state, event)
+            for identity, evidence in state.inference.feed(event):
+                session = _current_session(state, identity)
+                if isinstance(evidence, SpeedObs):
+                    if evidence not in session.speed_obs:
+                        session.speed_obs.append(evidence)
+                elif evidence not in session.constraints:
+                    session.constraints.append(evidence)
+        except Exception as exc:  # inference must never break the battle loop
+            logger.debug("Inference skipped event for %s (%s): %r", battle_tag, exc, event)
+
+    @staticmethod
+    def _record_origin_reveal(state: _BattleOpponentState, event: Sequence[str]) -> None:
+        """Record items/abilities named by a ``[from] item:|ability:`` tag.
+
+        The tagged effect's owner is the event's Pokemon, except on ``-damage``
+        where ``[of]`` names the holder of Rocky Helmet, Rough Skin, Jaboca
+        Berry and similar punishers.
+        """
+        event_type = str(event[1]).lower()
+        if len(event) < 4 or event_type not in _ORIGIN_REVEAL_EVENTS:
+            return
+        owner = event[2]
+        origin = _tagged_value(event[3:], "[from]")
+        if origin is None and event_type in {"-activate", "-block"}:
+            effect = str(event[3]).strip()
+            if effect.lower().startswith("item:"):
+                origin = effect
+        if origin is None:
+            return
+        kind, _, name = origin.partition(":")
+        kind, name = kind.strip().lower(), name.strip()
+        if kind not in {"item", "ability"} or not name:
+            return
+        if event_type == "-damage":
+            holder = _tagged_value(event[3:], "[of]")
+            if holder:
+                owner = holder
+        elif kind == "ability" and event_type not in {"-heal", "-immune"}:
+            return
+        identity = _protocol_identity(owner)
+        if identity is None:
+            return
+        pokemon = state.pokemon.setdefault(identity, _ProtocolPokemon())
+        session = pokemon.current or pokemon.begin_session()
+        if kind == "item":
+            if not session.received_item:
+                _record_protocol_observation(pokemon, "items", name)
+        elif to_id(name) not in session.received_abilities:
+            _record_ability_if_original(pokemon, session, name)
+
+    def _observe_core(self, battle_tag: str, event: list[str]) -> None:
         """Consume one raw ``parse_message`` event and keep ordered provenance.
 
         Illusion observations are provisional within a switch-in session and
@@ -1832,6 +1969,13 @@ class OpponentModel:
                     # Encore + Dark Pulse).
                     suspect = True
                 observations.extend((kind, value, suspect) for kind, value in resolved)
+                if self.inference_enabled:
+                    for constraint in session.constraints:
+                        observations.append(("constraint", constraint, suspect))
+                    for obs in session.speed_obs:
+                        speed = self._speed_constraint(battle, obs)
+                        if speed is not None:
+                            observations.append(("constraint", speed, suspect))
             # The tracker keeps the first copy of a repeated observation, so
             # feed binding evidence first: a clean switch-in confirming
             # something seen during a suspect one makes it binding.
@@ -1839,6 +1983,25 @@ class OpponentModel:
             tracker._replace_observations(observations)
 
         return dict(state.trackers)
+
+    @staticmethod
+    def _speed_constraint(battle: Any, obs: SpeedObs) -> Constraint | None:
+        """Resolve a raw speed-order observation against our own mon's stats."""
+        role = getattr(battle, "player_role", None)
+        if role is None or obs.our_identity[0] != role:
+            return None
+        team = getattr(battle, "team", None)
+        if not isinstance(team, Mapping):
+            return None
+        for identifier, mon in team.items():
+            ident = str(identifier)
+            if to_id(ident.partition(":")[2]) != obs.our_identity[1]:
+                continue
+            stats = getattr(mon, "stats", None) or {}
+            ability = getattr(mon, "ability", None)
+            item = getattr(mon, "item", None)
+            return resolve_speed(obs, stats.get("spe"), ability or "", item or "")
+        return None
 
     @staticmethod
     def _resolved_observations(
