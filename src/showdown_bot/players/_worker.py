@@ -12,27 +12,32 @@ def ping() -> int:
     return os.getpid()
 
 
-# Evaluators loaded in this worker process, keyed by path; ``EVALUATOR_LOADS``
+# Evaluators loaded in this worker process, keyed by (path, leaf scale); ``EVALUATOR_LOADS``
 # counts actual file loads (the cache must make it 1 per path per process).
-_EVALUATORS: dict[str, object] = {}
+_EVALUATORS: dict[tuple[str, float], object] = {}
 EVALUATOR_LOADS = 0
 
 
-def get_evaluator(path: str):
-    """The ``poke_engine.Evaluator`` for ``path``, loaded once per process."""
+def get_evaluator(path: str, scale: float = 1.0):
+    """The ``poke_engine.Evaluator`` for ``(path, scale)``, loaded once per process."""
     global EVALUATOR_LOADS
-    evaluator = _EVALUATORS.get(path)
+    key = (path, float(scale))
+    evaluator = _EVALUATORS.get(key)
     if evaluator is None:
         from poke_engine import Evaluator
 
-        evaluator = Evaluator.load(path)
+        evaluator = Evaluator.load(path, leaf_scale=float(scale))
         EVALUATOR_LOADS += 1
-        _EVALUATORS[path] = evaluator
+        _EVALUATORS[key] = evaluator
     return evaluator
 
 
 def search_world(
-    state_string: str, search_time_ms: int, threads: int, evaluator_path: str | None = None
+    state_string: str,
+    search_time_ms: int,
+    threads: int,
+    evaluator_path: str | None = None,
+    evaluator_scale: float = 1.0,
 ) -> tuple[int, list[tuple[str, int, float]]]:
     """Run MCTS on one serialised world.
 
@@ -49,7 +54,7 @@ def search_world(
             result = monte_carlo_tree_search(state, search_time_ms, threads=threads)
         else:
             result = monte_carlo_tree_search(
-                state, search_time_ms, threads=threads, evaluator=get_evaluator(evaluator_path)
+                state, search_time_ms, threads=threads, evaluator=get_evaluator(evaluator_path, evaluator_scale),
             )
         return (
             int(result.total_visits),

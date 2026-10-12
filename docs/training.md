@@ -119,3 +119,29 @@ bench process would give both the net; use `scripts/duel.py` for that match-up
 - The duel prints the iterations per second of each side. The net costs
   1.5-2.4x per iteration, so at equal time it must be better per iteration by
   more than it is slower to win.
+
+## Leaf scale
+
+Stock leaf scores are `sigmoid(0.0125 * dEval)` with typical dEval of 50-200
+points, so scores spread widely. A net trained on noisy outcomes has logits that
+barely move between root and leaf, so `sigmoid(z_leaf - z_root)` sits near 0.5
+everywhere and MCTS cannot discriminate (hypothesis (a) of showdown-bot-589.16).
+
+The runtime knob `leaf_scale` k (not stored in the `.pev`; default 1.0 = old
+behaviour) makes the score `sigmoid(k * (z_leaf - z_root))` (or `sigmoid(k * z_leaf)`
+with `relative_to_root=False`).
+
+- Python: `Evaluator.load(path, leaf_scale=k)` (also `linear` / `mlp`; must be
+  finite and > 0, else `ValueError`); `ev.leaf_scale`, `ev.logit(state)` and the
+  stock `poke_engine.evaluate(state)` are exposed.
+- Search player: `SearchConfig.evaluator_scale`, constructor arg
+  `evaluator_scale=`, env `SHOWDOWN_SEARCH_EVALUATOR_SCALE`. Pool workers cache
+  evaluators per (path, scale).
+- Duel: `scripts/duel.py --leaf-scale K` (net side only).
+- Calibration: `python scripts/calibrate_leaf_scale.py --data DIR [--data DIR...]
+  --model x.pev [--max-games N]` compares the per-decision change of
+  `0.0125 * evaluate` with the change of the net logit over consecutive recorded
+  states and prints k = std(d_stock) / std(d_net) (and a MAD version) plus a
+  k/2, k, 2k sweep.
+
+Status: the duel sweep over k is pending; no result is recorded yet.
