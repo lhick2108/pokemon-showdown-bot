@@ -28,7 +28,7 @@ from pathlib import Path
 from poke_env.ps_client import AccountConfiguration, LocalhostServerConfiguration
 
 from showdown_bot import bench, dataset, recorder
-from showdown_bot.players.search import SearchConfig, SearchPlayer, get_pool, total_stats
+from showdown_bot.players.search import SearchConfig, SearchPlayer, get_pool, inference_summary, total_stats
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -51,6 +51,10 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--leaf-scale", type=float, default=1.0, help="leaf scale for --evaluator")
     p.add_argument("--workers", type=bench._positive_int, default=os.cpu_count() or 4,
                    help="shared MCTS process pool size (search vs search)")
+    p.add_argument("--inference", choices=("on", "off"), default="on",
+                   help="589.28 opponent set inference (off = pre-589.28 baseline sampling)")
+    p.add_argument("--damage-inference", choices=("on", "off"), default="on",
+                   help="damage-roll part of the inference (needs --inference on)")
     p.add_argument("--no-truth", action="store_true", help="do not record exact-state truth")
     p.add_argument("--connect-timeout", type=bench._positive_seconds, default=30)
     p.add_argument("--game-timeout", type=bench._positive_seconds, default=900)
@@ -72,6 +76,8 @@ async def _selfplay_pair(args, run_dir: Path, rec: recorder.GameRecorder, share:
         threads=args.threads,
         evaluator=args.evaluator,
         evaluator_scale=args.leaf_scale,
+        inference=args.inference == "on",
+        damage_inference=args.damage_inference == "on",
     )
     players = [
         SearchPlayer(
@@ -158,6 +164,7 @@ def main(argv=None) -> int:
         print(f"disk:                 {stats['bytes'] / 1e6:.2f} MB total; "
               f"{stats['bytes'] / 1e6 / battles * 1000:.1f} MB per 1,000 games")
     print(f"search stats:         {total_stats().summary()}")
+    print(f"inference stats:      {inference_summary()}")
     return 0 if games else 1
 
 

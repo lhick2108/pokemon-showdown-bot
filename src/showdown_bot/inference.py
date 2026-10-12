@@ -90,6 +90,23 @@ _PRIORITY_ABILITIES = frozenset({"prankster", "galewings", "triage", "myceliummi
 
 # Moves whose priority is not their data value (or whose order is otherwise not
 # plain speed).
+_TURN_BOUNDARY = frozenset({"turn", "upkeep", "", "switch", "drag", "replace", "cant", "win", "faint"})
+# Events that, between a move and its damage, mean the damage is not a plain hit.
+_DAMAGE_SPOILERS = frozenset(
+    {"-crit", "-activate", "-miss", "-immune", "-fail", "-notarget", "-block", "-hitcount",
+     "-ability", "-enditem", "-item", "-sethp", "-message", "-prepare", "-formechange",
+     "-transform", "-terastallize"}
+)
+# Events that change something damage depends on for later moves this turn.
+_DIRTYING = frozenset(
+    {"-boost", "-unboost", "-setboost", "-clearallboost", "-clearboost",
+     "-clearnegativeboost", "-invertboost", "-swapboost", "-copyboost", "-restoreboost",
+     "-status", "-curestatus", "-cureteam", "-weather", "-fieldstart", "-fieldend",
+     "-sidestart", "-sideend", "-start", "-end", "-ability", "-item", "-enditem",
+     "-transform", "-terastallize", "-formechange", "-detailschange", "-mega",
+     "switch", "drag", "replace", "-sethp", "-activate", "-block", "-swapsideconditions"}
+)
+
 _ODD_PRIORITY_MOVES = frozenset(
     {"grassyglide", "pursuit", "counter", "mirrorcoat", "metalburst", "focuspunch",
      "beakblast", "shelltrap", "upperhand", "firstimpression"}
@@ -185,6 +202,8 @@ def constraint_allows(constraint: Constraint, species_id: str, full_set: Any) ->
         return all(_hazard_blocked(h, types, ability, item) for h in constraint.data)
     if kind == "speed":
         return _speed_allows(constraint.data, species_id, full_set, item, ability)
+    if kind == "reject":
+        return set_key(species_id, full_set) not in constraint.data[0]
     return True
 
 
@@ -232,6 +251,58 @@ class SpeedObs:
     status_move: bool  # either move was a status move (Prankster possible)
 
 
+@dataclass(frozen=True)
+class DamageObs:
+    """A clean single-hit damaging move landed; see ``damage_infer``.
+
+    ``hp_before``/``hp_after`` are the defender's HP fractions around the hit.
+    "Clean" means nothing that changes damage (boosts, status, weather, items,
+    abilities, switches...) happened earlier in the turn, so the battle state at
+    the start of the message is the state the move was calculated in.
+    """
+
+    attacker: Identity
+    defender: Identity
+    move_id: str
+    hp_before: float
+    hp_after: float
+
+
+def set_key(species_id: str, full_set: Any) -> tuple:
+    """Hashable identity of one candidate full set."""
+    return (
+        species_id,
+        int(full_set.level),
+        to_id(full_set.item) if full_set.item else "",
+        to_id(full_set.ability),
+        to_id(full_set.tera_type),
+        tuple(to_id(m) for m in full_set.moves),
+    )
+
+
+_DAMAGE_MOVE_EXCLUDED_KEYS = frozenset(
+    {
+        "basePowerCallback", "onBasePower", "onModifyType", "onModifyMove",
+        "onModifyDamage", "overrideOffensiveStat", "overrideOffensivePokemon",
+        "overrideDefensivePokemon", "multihit", "damage", "damageCallback", "ohko",
+        "willCrit", "onTryHit", "onTry", "onPrepareHit", "isZ", "isMax",
+        "selfdestruct", "mindBlownRecoil", "multiaccuracy", "thawsTarget",
+        "forceSwitch", "breaksProtect", "onHit", "onAfterHit",
+    }
+)
+
+
+@lru_cache(maxsize=None)
+def damage_move_ok(move_id: str) -> bool:
+    """Plain fixed-power single-hit attack the engine can be trusted to calculate."""
+    data = _move(move_id)
+    if not data or data.get("category") not in ("Physical", "Special"):
+        return False
+    if int(data.get("basePower") or 0) <= 0:
+        return False
+    return not (_DAMAGE_MOVE_EXCLUDED_KEYS & set(data))
+
+
 # ---------------------------------------------------------------------------
 # State machine
 # ---------------------------------------------------------------------------
@@ -240,6 +311,7 @@ class SpeedObs:
 @dataclass
 class _Mon:
     hp: float | None = None
+    prev_hp: float | None = None  # HP before the latest HP-changing event
     status: str = ""
     stage_spe: int = 0
     moves_used: list[str] = field(default_factory=list)
@@ -333,6 +405,10 @@ class InferenceTracker:
         self.turn_snapshot: tuple | None = None
         self.speed_dirty = False
         self.turn_evaluated = False
+        # Damage-roll observations: ``dirty`` flips once anything that changes
+        # damage happens in a turn; ``cur`` is the move whose hit we are reading.
+        self.dirty = False
+        self.cur: dict | None = None
 
     # -- helpers ---------------------------------------------------------
 
@@ -376,7 +452,81 @@ class InferenceTracker:
         handler = getattr(self, "_on_" + re.sub(r"[^a-z]", "", kind), None) if kind else self._on_blank
         if handler is not None:
             handler(event, out)
+        self._damage_gate(kind, event, out)
         return out
+
+    # -- damage-roll reading -----------------------------------------------
+
+    def _damage_gate(self, kind: str, event: Sequence[str], out: list[Emission]) -> None:
+        cur = self.cur
+        if kind == "move":
+            self._finalize_damage(out)
+            self._start_damage_move(event)
+            return
+        if kind in _TURN_BOUNDARY:
+            self._finalize_damage(out)
+        elif cur is not None:
+            if kind == "-damage":
+                self._damage_event(event, cur)
+            elif kind in _DAMAGE_SPOILERS:
+                cur["spoiled"] = True
+        if kind == "turn":
+            self.dirty = False
+        elif kind in _DIRTYING:
+            self.dirty = True
+
+    def _start_damage_move(self, event: Sequence[str]) -> None:
+        self.cur = None
+        if len(event) < 5:
+            return
+        foreign = any(
+            str(p).strip().lower().startswith(("[from]", "[miss]", "[notarget]", "[still]"))
+            for p in event[4:]
+        )
+        attacker, slot, target = _ident(event[2]), _slot(event[2]), _slot(event[4])
+        move_id = to_id(event[3])
+        if foreign or attacker is None or slot is None or target is None or target[0] == slot[0]:
+            return
+        if not damage_move_ok(move_id):
+            return
+        self.cur = {
+            "attacker": attacker, "move": move_id, "target_side": target[0],
+            "clean": not self.dirty, "spoiled": False, "hit": None, "defender": None,
+        }
+
+    def _damage_event(self, event: Sequence[str], cur: dict) -> None:
+        if len(event) < 4 or any(str(p).strip().startswith("[from]") for p in event[4:]):
+            return
+        identity = _ident(event[2])
+        if identity is None or identity[0] != cur["target_side"]:
+            return
+        if cur["hit"] is not None:
+            cur["spoiled"] = True  # second hit: multi-hit / Parental Bond
+            return
+        mon = self.mons.get(identity)
+        after = _parse_hp(event[3])
+        # _on_damage ran first and already stored ``after``; the HP before the hit
+        # is what it replaced.
+        before = mon.prev_hp if mon is not None else None
+        if before is None or after is None:
+            cur["spoiled"] = True
+            return
+        cur["hit"] = (before, after)
+        cur["defender"] = identity
+
+    def _finalize_damage(self, out: list[Emission]) -> None:
+        cur, self.cur = self.cur, None
+        if cur is None or cur["spoiled"] or not cur["clean"] or cur["hit"] is None:
+            return
+        before, after = cur["hit"]
+        if after <= 0 or after >= before:
+            return
+        out.append(
+            (
+                cur["attacker"],
+                DamageObs(cur["attacker"], cur["defender"], cur["move"], before, after),
+            )
+        )
 
     # -- handlers --------------------------------------------------------
 
@@ -587,6 +737,7 @@ class InferenceTracker:
         mon = self._mon(identity)
         hp = _parse_hp(event[3])
         if hp is not None:
+            mon.prev_hp = mon.hp
             mon.hp = hp
         origin = _tag(event[4:], "[from]") or ""
         origin_id = to_id(origin.split(":", 1)[-1])
@@ -619,6 +770,7 @@ class InferenceTracker:
         mon = self._mon(identity)
         hp = _parse_hp(event[3])
         if hp is not None:
+            mon.prev_hp = mon.hp
             mon.hp = hp
         if mon.in_residual:
             mon.res_heal = True

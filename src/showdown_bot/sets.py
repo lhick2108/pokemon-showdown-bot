@@ -10,6 +10,7 @@ import json
 import logging
 import math
 import re
+import time
 import urllib.request
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -20,6 +21,7 @@ from typing import Any
 
 from showdown_bot.inference import (
     Constraint,
+    DamageObs,
     InferenceTracker,
     SpeedObs,
     constraint_allows,
@@ -27,6 +29,10 @@ from showdown_bot.inference import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: Wall-clock seconds spent in event-level inference (``OpponentModel.observe``'s
+#: negative-evidence part), summed over every model in this process.
+INFERENCE_SECONDS = [0.0]
 
 _DATA_URL = "https://pkmn.github.io/randbats/data"
 _DEFAULT_CACHE_DIR = Path(".cache") / "randbats"
@@ -1034,6 +1040,9 @@ class _BattleOpponentState:
     # someone else's move, even when the server leaves off its ``[from]`` tag.
     dancer_pending: set[tuple[str, str]] = field(default_factory=set)
     inference: InferenceTracker = field(default_factory=InferenceTracker)
+    # (DamageObs, attacker session, defender session) read from the current
+    # message and not yet evaluated against the pre-message battle state.
+    pending_damage: list = field(default_factory=list)
 
 
 def _protocol_name(value: Any) -> tuple[str, str] | None:
@@ -1437,9 +1446,11 @@ class OpponentModel:
     and other tells and give P(active opponent is a disguised Zoroark).
     """
 
-    def __init__(self, data: RandbatsData, *, inference: bool = True):
+    def __init__(self, data: RandbatsData, *, inference: bool = True, damage: bool = True):
         self.data = data
         self._battles: dict[str, _BattleOpponentState] = {}
+        self.damage_enabled = damage
+        self._damage_inferer: Any = None
         # False disables the 589.28 inference (item/ability origin reveals,
         # negative evidence, speed): the pre-589.28 behaviour, for A/B duels.
         self.inference_enabled = inference
@@ -1460,10 +1471,21 @@ class OpponentModel:
             or len(event) < 2
         ):
             return
+        started = time.perf_counter()
         try:
             state = self._battles.setdefault(str(battle_tag), _BattleOpponentState())
             self._record_origin_reveal(state, event)
             for identity, evidence in state.inference.feed(event):
+                if isinstance(evidence, DamageObs):
+                    if self.damage_enabled and len(state.pending_damage) < 8:
+                        state.pending_damage.append(
+                            (
+                                evidence,
+                                _current_session(state, evidence.attacker),
+                                _current_session(state, evidence.defender),
+                            )
+                        )
+                    continue
                 session = _current_session(state, identity)
                 if isinstance(evidence, SpeedObs):
                     if evidence not in session.speed_obs:
@@ -1472,6 +1494,55 @@ class OpponentModel:
                     session.constraints.append(evidence)
         except Exception as exc:  # inference must never break the battle loop
             logger.debug("Inference skipped event for %s (%s): %r", battle_tag, exc, event)
+        finally:
+            INFERENCE_SECONDS[0] += time.perf_counter() - started
+
+    def observe_events(
+        self, battle_tag: str, events: Sequence[Sequence[str]], battle: Any | None = None
+    ) -> None:
+        """Observe one message's events, then evaluate damage rolls against ``battle``.
+
+        ``battle`` must still be in its state from BEFORE these events were
+        applied (poke-env has not parsed them yet): damage-roll inference
+        calculates each clean hit in that state. Without a battle the hits are
+        simply dropped.
+        """
+        for event in events:
+            if len(event) >= 2 and event[0] == "":
+                self.observe(battle_tag, list(event))
+        self.resolve_damage(battle_tag, battle)
+
+    def resolve_damage(self, battle_tag: str, battle: Any | None) -> None:
+        state = self._battles.get(str(battle_tag))
+        if state is None or not state.pending_damage:
+            return
+        pending, state.pending_damage = state.pending_damage, []
+        if battle is None or not (self.inference_enabled and self.damage_enabled):
+            return
+        try:
+            from showdown_bot.damage_infer import DamageInferer
+
+            if self._damage_inferer is None:
+                self._damage_inferer = DamageInferer(self.data)
+            trackers = self.update(battle)
+            results = self._damage_inferer.evaluate_all(
+                battle, trackers, [record[0] for record in pending]
+            )
+            role = getattr(battle, "player_role", None)
+            for obs, _key, constraint in results:
+                for record in pending:
+                    if record[0] is obs:
+                        session = record[2] if obs.attacker[0] == role else record[1]
+                        if constraint not in session.constraints:
+                            session.constraints.append(constraint)
+            if results:
+                self.update(battle)
+        except Exception as exc:  # inference must never break the battle loop
+            logger.debug("Damage inference failed in %s: %s", battle_tag, exc)
+
+    @property
+    def damage_stats(self) -> Any:
+        return None if self._damage_inferer is None else self._damage_inferer.stats
 
     @staticmethod
     def _record_origin_reveal(state: _BattleOpponentState, event: Sequence[str]) -> None:
@@ -2274,9 +2345,9 @@ class OpponentModelPlayerMixin:
     async def _handle_battle_message(self, split_messages: list[list[str]]) -> Any:
         battle_tag = _real_battle_tag(split_messages)
         if battle_tag is not None:
-            for event in split_messages[1:]:
-                if len(event) >= 2 and event[0] == "":
-                    self.opponent_model.observe(battle_tag, event)
+            self.opponent_model.observe_events(
+                battle_tag, split_messages[1:], getattr(self, "_battles", {}).get(battle_tag)
+            )
         result = await super()._handle_battle_message(split_messages)
         if battle_tag is not None:
             battle = getattr(self, "_battles", {}).get(battle_tag)
