@@ -100,11 +100,119 @@ def test_roundrobin_and_seat_alternation():
 
 
 def test_parse_bots_aliases_and_errors():
-    assert league.parse_bots("random,heuristic,fp") == ["random", "heuristics", "foulplay"]
+    assert [s.label for s in league.parse_bots("random,heuristic,fp")] == [
+        "random", "heuristics", "foulplay"
+    ]
     with pytest.raises(ValueError):
         league.parse_bots("random")
     with pytest.raises(ValueError):
         league.parse_bots("random,nope")
+
+
+def test_parse_spec_good():
+    specs = league.parse_bots(
+        "stock=search,net64=search-net:evaluator=models/a.pev:scale=4,"
+        "n2=search-net:evaluator=C:\m\a.pev:scale=8:time_ms=50:worlds=3,foulplay"
+    )
+    stock, net, n2, fp = specs
+    assert (stock.label, stock.type, stock.params) == ("stock", "search", ())
+    assert net.type == "search-net" and net.param("evaluator") == "models/a.pev"
+    assert net.param("scale") == 4.0 and net.text.startswith("net64=search-net")
+    assert n2.param("evaluator") == "C:\m\a.pev"
+    assert (n2.param("time_ms"), n2.param("worlds")) == (50, 3)
+    assert fp.type == "foulplay"
+    assert league.parse_spec("search:time_ms=20").label == "search"
+
+
+@pytest.mark.parametrize("bad", [
+    "x=search:bogus=1", "x=search:time_ms", "x=search:time_ms=abc", "x=search:time_ms=0",
+    "x=search:scale=-1", "x=nope", "=search", "x=search:time_ms=1:time_ms=2",
+    "x=random:time_ms=5", "x=search-net", "a b=search", "x=y=search",
+])
+def test_parse_spec_malformed(bad, monkeypatch):
+    monkeypatch.delenv("SHOWDOWN_SEARCH_EVALUATOR", raising=False)
+    with pytest.raises(ValueError):
+        league.parse_spec(bad)
+
+
+def test_duplicate_labels_rejected():
+    with pytest.raises(ValueError):
+        league.parse_bots("a=search,a=random")
+
+
+def test_specs_in_games_and_results(tmp_path):
+    specs = {"a": "a=search", "b": "b=random"}
+    games = [Game(f"t{i}", "a", "b", "a" if i % 2 else "b", 9, 0, specs=specs) for i in range(10)]
+    path = tmp_path / "games.jsonl"
+    league.write_games(path, games)
+    assert json.loads(path.read_text().splitlines()[0])["specs"] == specs
+    assert league.read_games(path)[0].specs == specs
+    res = league.write_results(tmp_path, games, ["a", "b"], n_boot=5, seed=0, anchor=None,
+                               extra={"specs": specs})
+    assert json.loads((tmp_path / "results.json").read_text())["specs"] == res["specs"] == specs
+
+
+def test_scale_guard_without_evaluator_scale(tmp_path):
+    spec = league.parse_spec("n=search-net:evaluator=x.pev:scale=4")
+    cfg = league.LeagueConfig(out=tmp_path)
+    import inspect
+    from showdown_bot.players.search import SearchNetPlayer
+    if "evaluator_scale" not in inspect.signature(SearchNetPlayer.__init__).parameters:
+        with pytest.raises(ValueError, match="evaluator_scale"):
+            league._make_player(spec, cfg, None, 1, 0)
+
+
+def test_run_limited_respects_limit_and_order():
+    import asyncio
+
+    state = {"now": 0, "peak": 0}
+
+    def job(i):
+        async def run():
+            state["now"] += 1
+            state["peak"] = max(state["peak"], state["now"])
+            await asyncio.sleep(0.01 * (5 - i))
+            state["now"] -= 1
+            return i
+        return run
+
+    out = asyncio.run(league.run_limited([job(i) for i in range(5)], 2))
+    assert out == [0, 1, 2, 3, 4] and state["peak"] == 2
+    state.update(now=0, peak=0)
+    asyncio.run(league.run_limited([job(i) for i in range(5)], 1))
+    assert state["peak"] == 1
+
+
+def test_run_limited_failure_cancels_others():
+    import asyncio
+
+    cancelled = []
+
+    async def slow():
+        try:
+            await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            cancelled.append(1)
+            raise
+
+    async def boom():
+        await asyncio.sleep(0.01)
+        raise RuntimeError("x")
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(league.run_limited([slow, boom, slow], 3))
+    assert len(cancelled) == 2
+
+
+def test_load_report_warns_when_oversubscribed(tmp_path):
+    specs = league.parse_bots("random,search,foulplay")
+    by = {s.label: s for s in specs}
+    pairs = [(by[a], by[b]) for a, b in league.roundrobin_pairs(list(by))]
+    cfg = league.LeagueConfig(out=tmp_path, parallel_pairs=3, fp_parallelism=2, fp_threads=2)
+    line, warn = league.load_report(pairs, cfg, cpu_count=4)
+    assert "foulplay=8" in line and warn and "exceeds" in warn
+    cfg1 = league.LeagueConfig(out=tmp_path, parallel_pairs=1)
+    assert league.load_report(pairs, cfg1, cpu_count=64)[1] is None
 
 
 def test_rate_only_on_fixture_dir(tmp_path):

@@ -15,16 +15,19 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
+import os
 import itertools
 import json
 import logging
 import math
 import random
+import re
 import secrets
 import sys
 import time
-from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Iterable, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from poke_env import to_id_str
@@ -41,6 +44,86 @@ TIE = "tie"
 ALIASES = {"heuristic": "heuristics", "fp": FOULPLAY_NAME}
 SEARCH_BOTS = ("search", "search-net")
 PRIOR_WEIGHT = 0.5  # virtual tie games added between every pair of bots
+
+
+# ---------------------------------------------------------------------------
+# Bot specs: label=type[:key=value[:key=value...]]
+# ---------------------------------------------------------------------------
+
+SPEC_KEYS = {
+    "search": {"evaluator": str, "scale": float, "time_ms": int, "worlds": int},
+    "search-net": {"evaluator": str, "scale": float, "time_ms": int, "worlds": int},
+}
+
+
+@dataclass(frozen=True)
+class BotSpec:
+    """A league participant: ``label`` is its identity in ratings and games.jsonl."""
+
+    label: str
+    type: str
+    params: tuple[tuple[str, object], ...] = ()
+    text: str = ""
+
+    def param(self, key: str, default=None):
+        return dict(self.params).get(key, default)
+
+
+def _split_spec_params(rest: str) -> list[str]:
+    """Split on ':' but keep Windows drive letters (``C:\\x``) inside a value."""
+    parts: list[str] = []
+    for seg in rest.split(":"):
+        if parts and "=" not in seg:
+            parts[-1] += ":" + seg
+        else:
+            parts.append(seg)
+    return parts
+
+
+def parse_spec(text: str) -> BotSpec:
+    raw = text.strip()
+    if not raw:
+        raise ValueError("empty bot spec")
+    head, _, rest = raw.partition(":")
+    label, eq, type_name = head.partition("=")
+    if not eq:
+        label, type_name = head, head
+    if "=" in type_name:
+        raise ValueError(f"malformed bot spec {raw!r}")
+    type_name = ALIASES.get(type_name.strip(), type_name.strip())
+    label = ALIASES.get(label.strip(), label.strip())
+    if not label or not re.fullmatch(r"[A-Za-z0-9_.+-]+", label):
+        raise ValueError(f"bad bot label {label!r} in {raw!r}")
+    if type_name != FOULPLAY_NAME:
+        bench.get_player_class(type_name)  # ValueError for unknown types
+    params: list[tuple[str, object]] = []
+    if rest:
+        allowed = SPEC_KEYS.get(type_name, {})
+        for item in _split_spec_params(rest):
+            key, eq, value = item.partition("=")
+            key = key.strip()
+            if not eq or not value:
+                raise ValueError(f"malformed parameter {item!r} in bot spec {raw!r}")
+            if key not in allowed:
+                supported = ", ".join(sorted(allowed)) or "none"
+                raise ValueError(
+                    f"unsupported key {key!r} for {type_name} in {raw!r} (supported: {supported})"
+                )
+            if any(k == key for k, _ in params):
+                raise ValueError(f"duplicate key {key!r} in bot spec {raw!r}")
+            try:
+                parsed = allowed[key](value)
+            except ValueError:
+                raise ValueError(f"bad value {value!r} for {key!r} in bot spec {raw!r}") from None
+            if key in ("time_ms", "worlds") and parsed <= 0:
+                raise ValueError(f"{key} must be positive in bot spec {raw!r}")
+            if key == "scale" and not (math.isfinite(parsed) and parsed > 0):
+                raise ValueError(f"scale must be positive in bot spec {raw!r}")
+            params.append((key, parsed))
+    if type_name == "search-net" and not any(k == "evaluator" for k, _ in params) \
+            and not os.environ.get("SHOWDOWN_SEARCH_EVALUATOR"):
+        raise ValueError(f"search-net spec {raw!r} needs evaluator=<path.pev>")
+    return BotSpec(label, type_name, tuple(params), raw)
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +144,7 @@ class Game:
     p1_user: str = ""
     p2_user: str = ""
     format: str = "gen9randombattle"
+    specs: dict = field(default_factory=dict)  # label -> spec text
 
     def score_for(self, bot: str) -> float:
         if self.winner == TIE:
@@ -80,6 +164,7 @@ class Game:
             "turns": self.turns,
             "seed": self.seed,
             "format": self.format,
+            "specs": self.specs,
         }
 
     @classmethod
@@ -93,6 +178,7 @@ class Game:
             battle_tag=d["battle_tag"], p1=d["p1"], p2=d["p2"], winner=winner,
             turns=int(d["turns"]), seed=d.get("seed"), p1_user=d.get("p1_user", ""),
             p2_user=d.get("p2_user", ""), format=d.get("format", "gen9randombattle"),
+            specs=dict(d.get("specs") or {}),
         )
 
 
@@ -378,6 +464,9 @@ class LeagueConfig:
     fp_parallelism: int = 1
     fp_threads: int = 1
     seed: int = 0
+    search_workers: int | None = None  # shared MCTS pool size; None: per-player default
+    parallel_pairs: int = 1
+    specs: dict = field(default_factory=dict)  # label -> BotSpec
 
 
 class Tracker:
@@ -399,8 +488,8 @@ class Tracker:
         return bad
 
 
-def _make_player(name: str, cfg: LeagueConfig, recorder, concurrency: int, salt: int) -> Player:
-    cls = bench.get_player_class(name)
+def _make_player(spec: BotSpec, cfg: LeagueConfig, recorder, concurrency: int, salt: int) -> Player:
+    cls = bench.get_player_class(spec.type)
     kwargs = dict(
         battle_format=cfg.battle_format,
         max_concurrent_battles=concurrency,
@@ -410,12 +499,28 @@ def _make_player(name: str, cfg: LeagueConfig, recorder, concurrency: int, salt:
         open_timeout=cfg.connect_timeout,
         save_replays=str(cfg.out / "replays"),
     )
-    if name in SEARCH_BOTS:
-        from showdown_bot.players.search import SearchConfig
+    if spec.type in SEARCH_BOTS:
+        from showdown_bot.players.search import SearchConfig, get_pool
 
-        kwargs["config"] = SearchConfig(search_time_ms=cfg.search_time_ms)
+        # Explicit per-player config: the process-wide SHOWDOWN_SEARCH_* vars are not used.
+        kwargs["config"] = SearchConfig(
+            search_time_ms=spec.param("time_ms", cfg.search_time_ms),
+            worlds=spec.param("worlds"),
+        )
         kwargs["recorder"] = recorder
         kwargs["seed"] = cfg.seed * 1000 + salt
+        if spec.param("evaluator") is not None:
+            kwargs["evaluator"] = spec.param("evaluator")
+        scale = spec.param("scale", 1.0)
+        if scale != 1:
+            if "evaluator_scale" not in inspect.signature(cls.__init__).parameters:
+                raise ValueError(
+                    f"{spec.label}: scale={scale:g} needs SearchPlayer(evaluator_scale=...), "
+                    "which this checkout does not have (branch feat/589.16-leaf-scale)"
+                )
+            kwargs["evaluator_scale"] = scale
+        if cfg.search_workers:
+            kwargs["executor"] = get_pool(cfg.search_workers)
     return cls(**kwargs)
 
 
@@ -436,23 +541,24 @@ def _new_games(bot_name: str, player: Player, opp_name: str, opp_user: str, seen
         else:
             winner = TIE
         users = (player.username, opp_user) if role == "p1" else (opp_user, player.username)
+        specs = {k: cfg.specs[k].text for k in (bot_name, opp_name) if k in cfg.specs}
         out.append(Game(tag, mine, theirs, winner, int(battle.turn), seed,
-                        users[0], users[1], cfg.battle_format))
+                        users[0], users[1], cfg.battle_format, specs))
     return out
 
 
 async def play_matchup(a: str, b: str, cfg: LeagueConfig, tracker: Tracker, recorder,
                        games_path: Path, pair_index: int) -> list[Game]:
     """Play cfg.games_per_pair games between two bots (one may be Foul Play)."""
-    if FOULPLAY_NAME in (a, b):
+    if FOULPLAY_NAME in (cfg.specs[a].type, cfg.specs[b].type):
         return await _play_foulplay_matchup(a, b, cfg, tracker, recorder, games_path, pair_index)
     players: list[Player] = []
     games: list[Game] = []
     try:
-        pa = _make_player(a, cfg, recorder, cfg.concurrency, 2 * pair_index)
+        pa = _make_player(cfg.specs[a], cfg, recorder, cfg.concurrency, 2 * pair_index)
         players.append(pa)
         tracker.players.append(pa)
-        pb = _make_player(b, cfg, recorder, cfg.concurrency, 2 * pair_index + 1)
+        pb = _make_player(cfg.specs[b], cfg, recorder, cfg.concurrency, 2 * pair_index + 1)
         players.append(pb)
         tracker.players.append(pb)
         await bench._wait_for_player_logins(players, cfg.connect_timeout)
@@ -477,8 +583,9 @@ async def play_matchup(a: str, b: str, cfg: LeagueConfig, tracker: Tracker, reco
 
 
 async def _play_foulplay_matchup(a, b, cfg, tracker, recorder, games_path, pair_index):
-    bot_name = b if a == FOULPLAY_NAME else a
-    if bot_name == FOULPLAY_NAME:
+    fp_label = a if cfg.specs[a].type == FOULPLAY_NAME else b
+    bot_name = b if fp_label == a else a
+    if cfg.specs[bot_name].type == FOULPLAY_NAME:
         raise ValueError("foulplay cannot play itself")
     n = cfg.games_per_pair
     fp_user = bench._foulplay_username()
@@ -492,7 +599,7 @@ async def _play_foulplay_matchup(a, b, cfg, tracker, recorder, games_path, pair_
     bot = None
     games: list[Game] = []
     try:
-        bot = _make_player(bot_name, cfg, recorder, 1, 2 * pair_index)
+        bot = _make_player(cfg.specs[bot_name], cfg, recorder, 1, 2 * pair_index)
         tracker.players.append(bot)
         await bench._wait_for_player_logins([bot], cfg.connect_timeout)
         seen: set = set()
@@ -505,7 +612,7 @@ async def _play_foulplay_matchup(a, b, cfg, tracker, recorder, games_path, pair_
                     bot.send_challenges(to_id_str(fp_user), 1), timeout=cfg.game_timeout)
             except TimeoutError:
                 raise RuntimeError(f"Foul Play game {game}/{n} timed out") from None
-            for g in _new_games(bot_name, bot, FOULPLAY_NAME, fp_user, seen, cfg, cfg.seed):
+            for g in _new_games(bot_name, bot, fp_label, fp_user, seen, cfg, cfg.seed):
                 append_game(games_path, g)
                 games.append(g)
     finally:
@@ -515,28 +622,88 @@ async def _play_foulplay_matchup(a, b, cfg, tracker, recorder, games_path, pair_
     return games
 
 
-async def run_league(bots: Sequence[str], cfg: LeagueConfig) -> tuple[list[Game], list[str]]:
+async def run_limited(jobs: Sequence[Callable[[], Awaitable]], limit: int) -> list:
+    """Run jobs with at most ``limit`` in flight; results keep job order.
+
+    The first failure cancels the other jobs (their ``finally`` blocks clean up).
+    """
+    sem = asyncio.Semaphore(max(1, limit))
+
+    async def guarded(job):
+        async with sem:
+            return await job()
+
+    tasks = [asyncio.ensure_future(guarded(j)) for j in jobs]
+    try:
+        return list(await asyncio.gather(*tasks))
+    except BaseException:
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+
+def pair_cores(a: BotSpec, b: BotSpec, cfg: LeagueConfig) -> tuple[int, int]:
+    """Rough (foul_play_cores, our_cores) one matchup keeps busy."""
+    fp = cfg.fp_parallelism * cfg.fp_threads if FOULPLAY_NAME in (a.type, b.type) else 0
+    ours = sum(1 for x in (a, b) if x.type in SEARCH_BOTS)
+    return fp, ours
+
+
+def load_report(pairs: Sequence[tuple[BotSpec, BotSpec]], cfg: LeagueConfig,
+                cpu_count: int | None = None) -> tuple[str, str | None]:
+    """Cores used at the peak of ``cfg.parallel_pairs`` concurrent matchups."""
+    loads = sorted((pair_cores(a, b, cfg) for a, b in pairs), key=lambda x: -(x[0] + x[1]))
+    top = loads[: cfg.parallel_pairs]
+    fp = sum(x[0] for x in top)
+    ours = sum(x[1] for x in top)
+    if cfg.search_workers:
+        ours = min(ours, cfg.search_workers) if ours else 0
+    available = cpu_count if cpu_count is not None else os.cpu_count()
+    line = (f"cores used (peak, {cfg.parallel_pairs} parallel pairs): "
+            f"foulplay={fp}, search={ours}")
+    warning = None
+    if available is not None and fp + ours > available:
+        warning = (f"WARNING: requested compute ({fp + ours} cores) exceeds "
+                   f"os.cpu_count()={available}; CPU contention will skew ratings")
+    return line, warning
+
+
+async def run_league(specs: Sequence[BotSpec], cfg: LeagueConfig) -> tuple[list[Game], list[str]]:
     cfg.out.mkdir(parents=True, exist_ok=True)
     (cfg.out / "replays").mkdir(exist_ok=True)
+    cfg.specs = {s.label: s for s in specs}
+    labels = [s.label for s in specs]
     games_path = cfg.out / "games.jsonl"
     games_path.write_text("", encoding="utf-8")
     recorder = None
-    if any(b in SEARCH_BOTS for b in bots):
+    if any(s.type in SEARCH_BOTS for s in specs):
         from showdown_bot.recorder import GameRecorder
 
         recorder = GameRecorder(cfg.out / "records")
     tracker = Tracker()
-    all_games: list[Game] = []
-    for idx, (a, b) in enumerate(roundrobin_pairs(bots)):
-        start = time.perf_counter()
-        logger.info("matchup %s vs %s (%d games)", a, b, cfg.games_per_pair)
-        got = await play_matchup(a, b, cfg, tracker, recorder, games_path, idx)
-        all_games.extend(got)
-        logger.info("  %s %d - %d %s (%d games, %.0fs)", a, sum(g.winner == a for g in got),
-                    sum(g.winner == b for g in got), b, len(got), time.perf_counter() - start)
-        leaks = tracker.open_connections()
-        if leaks:
-            logger.warning("  leaked after matchup: %s", leaks)
+    pairs = roundrobin_pairs(labels)
+    line, warning = load_report([(cfg.specs[a], cfg.specs[b]) for a, b in pairs], cfg)
+    logger.info(line)
+    if warning:
+        logger.warning(warning)
+
+    def make_job(idx, a, b):
+        async def job():
+            start = time.perf_counter()
+            logger.info("matchup %s vs %s (%d games)", a, b, cfg.games_per_pair)
+            got = await play_matchup(a, b, cfg, tracker, recorder, games_path, idx)
+            logger.info("  %s %d - %d %s (%d games, %.0fs)", a, sum(g.winner == a for g in got),
+                        sum(g.winner == b for g in got), b, len(got), time.perf_counter() - start)
+            leaks = tracker.open_connections()
+            if leaks and cfg.parallel_pairs == 1:
+                logger.warning("  leaked after matchup: %s", leaks)
+            return got
+        return job
+
+    results = await run_limited(
+        [make_job(i, a, b) for i, (a, b) in enumerate(pairs)], cfg.parallel_pairs)
+    all_games = [g for got in results for g in got]
     await asyncio.sleep(0.2)
     leaks = tracker.open_connections()
     leaks += [f"pending asyncio task: {t.get_coro()}" for t in asyncio.all_tasks()
@@ -550,25 +717,28 @@ async def run_league(bots: Sequence[str], cfg: LeagueConfig) -> tuple[list[Game]
 # ---------------------------------------------------------------------------
 
 
-def parse_bots(text: str) -> list[str]:
-    bots = []
-    for raw in text.split(","):
-        name = ALIASES.get(raw.strip(), raw.strip())
-        if not name:
-            continue
-        if name != FOULPLAY_NAME:
-            bench.get_player_class(name)
-        if name in bots:
-            raise ValueError(f"duplicate bot {name!r}")
-        bots.append(name)
-    if len(bots) < 2:
+def split_entries(text: str) -> list[str]:
+    return [t for t in (x.strip() for x in text.split(",")) if t]
+
+
+def parse_bots(text: str) -> list[BotSpec]:
+    """Parse ``label=type[:k=v...]`` entries (plain names are label = type)."""
+    specs: list[BotSpec] = []
+    for raw in split_entries(text):
+        spec = parse_spec(raw)
+        if any(s.label == spec.label for s in specs):
+            raise ValueError(f"duplicate bot label {spec.label!r}")
+        specs.append(spec)
+    if len(specs) < 2:
         raise ValueError("need at least two bots")
-    return bots
+    return specs
 
 
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
-    p.add_argument("--bots", help="comma-separated: " + ", ".join(sorted(bench.PLAYER_REGISTRY)) + ", foulplay")
+    p.add_argument("--bots", help="comma-separated label=type[:key=value...] or plain type. Types: "
+                   + ", ".join(sorted(bench.PLAYER_REGISTRY)) + ", foulplay. search keys: "
+                   "evaluator, scale, time_ms, worlds. e.g. net=search-net:evaluator=m.pev:scale=4")
     p.add_argument("--games-per-pair", type=bench._positive_int, default=20)
     p.add_argument("--out", type=Path, help="output dir, e.g. data/league/<run-id>")
     p.add_argument("--rate-only", type=Path, metavar="DIR", help="recompute results from DIR/games.jsonl")
@@ -583,6 +753,10 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--connect-timeout", type=bench._positive_seconds, default=30)
     p.add_argument("--game-timeout", type=bench._positive_seconds, default=900)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--search-workers", type=bench._positive_int, default=None,
+                   help="one MCTS process pool of this size shared by all search players")
+    p.add_argument("--parallel-pairs", type=bench._positive_int, default=1,
+                   help="matchups played concurrently")
     p.add_argument("--bootstrap", type=int, default=1000)
     p.add_argument("--anchor", default=None, help="bot whose rating is 0 (default: mean 0)")
     return p
@@ -605,7 +779,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("--bots and --out are required (or use --rate-only DIR)", file=sys.stderr)
         return 2
     try:
-        bots = parse_bots(args.bots)
+        specs = parse_bots(args.bots)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -615,9 +789,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         game_timeout=args.game_timeout, search_time_ms=args.search_time_ms,
         fp_search_time_ms=args.fp_search_time_ms, fp_parallelism=args.fp_parallelism,
         fp_threads=args.fp_threads, seed=args.seed,
+        search_workers=args.search_workers, parallel_pairs=args.parallel_pairs,
     )
     try:
-        games, leaks = asyncio.run(run_league(bots, cfg))
+        games, leaks = asyncio.run(run_league(specs, cfg))
     except KeyboardInterrupt:
         print("league interrupted; games.jsonl holds finished games "
               "(rate with --rate-only)", file=sys.stderr)
@@ -626,8 +801,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"league error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
     res = write_results(
-        cfg.out, games, bots, n_boot=args.bootstrap, seed=args.seed, anchor=anchor,
-        extra={"leaks": leaks, "games_per_pair": cfg.games_per_pair},
+        cfg.out, games, [s.label for s in specs], n_boot=args.bootstrap, seed=args.seed,
+        anchor=anchor,
+        extra={"leaks": leaks, "games_per_pair": cfg.games_per_pair,
+               "specs": {s.label: s.text for s in specs}},
     )
     print(format_markdown(res))
     if leaks:

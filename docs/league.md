@@ -22,11 +22,36 @@ Seats: poke-env's challenger is p1. Against our own bots the challenger alternat
 every `--concurrency` games. Foul Play only accepts challenges, so it is always p2;
 its pairs are therefore not seat balanced.
 
+## Bot specs
+
+Each `--bots` entry is `label=type[:key=value[:key=value...]]`; a plain `type` has label = type.
+The label is the bot's name in ratings and `games.jsonl`. For `search` / `search-net`
+the keys are `evaluator` (path to a `.pev`), `scale` (leaf-value scale, passed as
+`evaluator_scale=`; needs a checkout that has it, otherwise any scale other than 1
+is an error), `time_ms` and `worlds`. Example:
+
+```
+--bots stock=search,net64=search-net:evaluator=models/a.pev:scale=4,foulplay
+```
+
+Config is passed per player (the `SHOWDOWN_SEARCH_*` env vars are not used). A colon
+inside a value (a Windows drive letter) is kept. The spec text of every bot is stored
+in `results.json` (`specs`) and on each `games.jsonl` line.
+
+## Compute
+
+- `--search-workers N`: one MCTS process pool of N workers shared by all search
+  players (as in `scripts/duel.py`). Default: each player uses its own default pool.
+- `--parallel-pairs K`: play up to K matchups at once (default 1); Foul Play matchups
+  each launch their own instance. A cores-used line is logged and a WARNING when the
+  peak exceeds `os.cpu_count()`. If any matchup fails the others are cancelled and
+  cleaned up.
+
 ## Outputs (`--out`)
 
 - `games.jsonl`: one line per finished game: `schema_version`, `battle_tag`, `p1`/`p2`
   (bot names by seat), `p1_user`/`p2_user`, `bots`, `winner` (bot name or `tie`), `turns`,
-  `seed`, `format`. The ratings are computed only from this file.
+  `seed`, `format`, `specs` (label to spec text). The ratings are computed only from this file.
 - `replays/`: poke-env replay HTML, saved by every player (each side's view).
 - `records/`: for `search`/`search-net`, the existing recorder output
   (see `docs/selfplay-data.md`): per-decision state, policy, chosen action, outcome.
