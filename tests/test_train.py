@@ -130,3 +130,90 @@ def test_data_targets_follow_subset_and_fit_uses_them():
     assert sub.y_fit.tolist() == [data.y[0], 0.5, 0.5] and sub.y.tolist() == data.y[:3].tolist()
     corr, n = train.q_z_correlation(data)
     assert n == 48 and np.isnan(corr)  # q is constant, so the correlation is undefined
+
+
+# --- residual evaluator (stock + learned correction) -------------------------
+
+
+def _perturb(model):
+    with torch.no_grad():
+        for p in model.parameters():
+            p.add_(torch.randn_like(p) * 0.3)
+
+
+@pytest.mark.parametrize("kind,hidden", [("mlp", 16), ("linear", 0)])
+def test_residual_export_round_trip_matches_torch(tmp_path, state_strings, kind, hidden):
+    torch.manual_seed(5)
+    model = train.build_model(kind, pe.FEATURE_LENGTH, hidden, residual=(0.7, -0.1))
+    _perturb(model.net)
+    out = tmp_path / "res.pev"
+    train.export_pev(model, out)
+    raw = out.read_bytes()
+    assert int.from_bytes(raw[4:8], "little") == 2  # format 2
+    ev = pe.Evaluator.load(str(out))
+    assert ev.residual
+    assert ev.stock_coef == pytest.approx(0.7 * 0.0125, rel=1e-6)
+    assert ev.kind == kind
+    assert train.verify_export(model, out, state_strings, tol=1e-3) < 1e-3
+    # stock term really contributes: differs from the bare net on some state
+    bare = tmp_path / "bare.pev"
+    train.export_pev(model.net, bare)
+    bev = pe.Evaluator.load(str(bare))
+    assert not bev.residual and bev.stock_coef == 0.0
+    states = [pe.State.from_string(s) for s in state_strings]
+    for s in states:
+        assert ev.evaluate(s) == pytest.approx(
+            bev.evaluate(s) + ev.stock_coef * pe.evaluate(s), abs=1e-4
+        )
+
+
+@pytest.mark.parametrize("kind,hidden", [("mlp", 8), ("linear", 0)])
+def test_zero_init_residual_is_the_stock_logistic(state_strings, kind, hidden):
+    a, b = 0.5, -0.04
+    model = train.build_model(kind, pe.FEATURE_LENGTH, hidden, residual=(a, b))
+    states = [pe.State.from_string(s) for s in state_strings]
+    rows = [pe.state_features(s, 1) + [pe.evaluate(s)] for s in states]
+    z = train.logits_of(model, torch.tensor(rows, dtype=torch.float32)).numpy()
+    expected = np.array([a * 0.0125 * pe.evaluate(s) + b for s in states])
+    np.testing.assert_allclose(z, expected, atol=1e-5)
+
+
+def test_fit_stock_logistic_recovers_parameters():
+    rng = np.random.default_rng(0)
+    e = rng.normal(0, 150, 60000).astype(np.float32)
+    p = 1 / (1 + np.exp(-(0.5 * 0.0125 * e - 0.04)))
+    y = (rng.random(len(e)) < p).astype(np.float32)
+    a, b = train.fit_stock_logistic(e, y, np.ones_like(y))
+    assert a == pytest.approx(0.5, abs=0.03) and b == pytest.approx(-0.04, abs=0.03)
+    a2, b2 = train.fit_stock_logistic(e, y, np.ones_like(y), fixed_a=0.5)
+    assert a2 == 0.5 and b2 == pytest.approx(-0.04, abs=0.03)
+
+
+def test_v1_files_still_load_and_plain_writes_stay_v1(tmp_path):
+    path = tmp_path / "plain.pev"
+    pe.write_mlp(str(path), [0.0] * (4 * pe.FEATURE_LENGTH), [0.0] * 4, [1.0] * 4, 0.25)
+    raw = path.read_bytes()
+    assert int.from_bytes(raw[4:8], "little") == 1
+    assert len(raw) == 24 + 4 * (4 * pe.FEATURE_LENGTH + 4 + 4 + 1)
+    ev = pe.Evaluator.load(str(path))
+    assert not ev.residual and ev.stock_coef == 0.0 and ev.hidden_size == 4
+    state = pe.State.from_string(pe.State().to_string())
+    assert ev.evaluate(state) == pytest.approx(0.25)
+    # an explicit stock_coef=0 is also plain v1
+    path0 = tmp_path / "plain0.pev"
+    pe.write_linear(str(path0), [0.0] * pe.FEATURE_LENGTH, 0.5, stock_coef=0.0)
+    assert int.from_bytes(path0.read_bytes()[4:8], "little") == 1
+
+
+def test_residual_training_starts_at_stock_and_does_not_get_worse(state_strings):
+    states = [pe.State.from_string(s) for s in state_strings]
+    x = np.array([pe.state_features(s, 1) + [pe.evaluate(s)] for s in states], dtype=np.float32)
+    rng = np.random.default_rng(1)
+    y = (rng.random(len(x)) < 0.5).astype(np.float32)
+    w = np.ones(len(x), dtype=np.float32)
+    data = train.Data(x, y, w, [f"b{i}" for i in range(len(x))], list(state_strings), residual=True)
+    a0, b0 = train.fit_stock_logistic(data.e, y, w)
+    model = train.build_model("mlp", pe.FEATURE_LENGTH, 4, (a0, b0), freeze_a=True)
+    res = train.fit(model, data, data, device=torch.device("cpu"), epochs=3, seed=0, log=lambda *_: None)
+    assert float(res.model.a) == pytest.approx(a0)  # frozen
+    assert res.history[0][2] < 1.0

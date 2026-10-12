@@ -194,9 +194,12 @@ def iterative_deepening_expectiminimax(
 # --- learned-evaluator weight files (sdb fork) -------------------------------
 # Format (little endian): "PEVN", u32 format=1, u32 feature_version, u32 kind
 # (1 linear, 2 mlp), u32 n_in, u32 n_hidden, then f32 data. See engine/README.md.
+# Residual evaluators use format=2: u32 flags (bit0 = residual) and f32 stock_coef
+# follow n_hidden. Plain evaluators are still written as format 1.
 
 _MAGIC = b"PEVN"
 _FORMAT_VERSION = 1
+_FORMAT_VERSION_RESIDUAL = 2
 
 
 def _flat(x) -> list:
@@ -214,29 +217,39 @@ def _flat(x) -> list:
     return out
 
 
-def _pack(kind: int, n_hidden: int, *arrays) -> bytes:
-    header = _MAGIC + struct.pack(
-        "<5I", _FORMAT_VERSION, FEATURE_VERSION, kind, FEATURE_LENGTH, n_hidden
-    )
+def _pack(kind: int, n_hidden: int, *arrays, stock_coef: float = 0.0) -> bytes:
+    if stock_coef != 0.0:
+        header = _MAGIC + struct.pack(
+            "<5IIf", _FORMAT_VERSION_RESIDUAL, FEATURE_VERSION, kind, FEATURE_LENGTH,
+            n_hidden, 1, float(stock_coef),
+        )
+    else:
+        header = _MAGIC + struct.pack(
+            "<5I", _FORMAT_VERSION, FEATURE_VERSION, kind, FEATURE_LENGTH, n_hidden
+        )
     body = b"".join(struct.pack(f"<{len(a)}f", *a) for a in arrays)
     return header + body
 
 
-def write_linear(path, weights, bias: float = 0.0) -> None:
-    """Write a linear evaluator: value = weights . state_features + bias."""
+def write_linear(path, weights, bias: float = 0.0, stock_coef: float = 0.0) -> None:
+    """Write a linear evaluator: value = weights . state_features + bias.
+
+    ``stock_coef != 0`` makes it residual (format 2): value additionally gets
+    ``stock_coef * evaluate(state)``. 0 writes the plain format 1.
+    """
     w = _flat(weights)
     if len(w) != FEATURE_LENGTH:
         raise ValueError(f"expected {FEATURE_LENGTH} weights, got {len(w)}")
     with open(path, "wb") as f:
-        f.write(_pack(1, 0, w, [float(bias)]))
+        f.write(_pack(1, 0, w, [float(bias)], stock_coef=stock_coef))
 
 
-def write_mlp(path, w1, b1, w2, b2: float = 0.0) -> None:
+def write_mlp(path, w1, b1, w2, b2: float = 0.0, stock_coef: float = 0.0) -> None:
     """Write a 2-layer MLP evaluator: value = w2 . relu(W1 x + b1) + b2.
 
     ``w1`` has shape [hidden][FEATURE_LENGTH] (the layout of torch's
     ``nn.Linear(FEATURE_LENGTH, hidden).weight``), ``b1`` and ``w2`` have
-    length hidden.
+    length hidden. ``stock_coef != 0`` makes it residual (see ``write_linear``).
     """
     w1f, b1f, w2f = _flat(w1), _flat(b1), _flat(w2)
     hidden = len(b1f)
@@ -246,4 +259,4 @@ def write_mlp(path, w1, b1, w2, b2: float = 0.0) -> None:
             f"b1={hidden}, w2={len(w2f)}"
         )
     with open(path, "wb") as f:
-        f.write(_pack(2, hidden, w1f, b1f, w2f, [float(b2)]))
+        f.write(_pack(2, hidden, w1f, b1f, w2f, [float(b2)], stock_coef=stock_coef))

@@ -13,6 +13,10 @@
 //! A net trained on noisy outcomes has logits that barely move between root
 //! and leaf, so k > 1 spreads the scores the way the stock 0.0125 * dEval does.
 //!
+//! A **residual** evaluator adds the stock evaluation: `z = stock_coef *
+//! evaluate(state) + net(features)` (`stock_coef` = a * 0.0125, learned). The
+//! net then only has to learn a correction to the stock evaluation.
+//!
 //! Terminal states keep their exact 0 / 1 value, as in stock.
 //!
 //! Weights file format (little endian, see `README.md`):
@@ -27,6 +31,12 @@
 //! mlp:     W1[n_hidden][n_in] f32 (row-major, PyTorch nn.Linear weight layout),
 //!          b1[n_hidden], w2[n_hidden], b2
 //! ```
+//! Format 2 (written only for residual evaluators; format 1 is still read and
+//! written for plain ones) inserts two fields after `n_hidden`:
+//! ```text
+//! flags      u32  bit0 = residual
+//! stock_coef f32  multiplier applied to the raw stock evaluate()
+//! ```
 
 use crate::engine::evaluate::evaluate;
 use crate::features::{features_into, FEATURE_LEN, FEATURE_VERSION};
@@ -34,7 +44,11 @@ use crate::state::{SideReference, State};
 use std::convert::TryInto;
 
 pub const MAGIC: &[u8; 4] = b"PEVN";
+/// Format written for non-residual evaluators.
 pub const FORMAT_VERSION: u32 = 1;
+/// Format written for residual evaluators.
+pub const FORMAT_VERSION_RESIDUAL: u32 = 2;
+const FLAG_RESIDUAL: u32 = 1;
 const KIND_LINEAR: u32 = 1;
 const KIND_MLP: u32 = 2;
 
@@ -61,6 +75,8 @@ pub struct Evaluator {
     pub relative_to_root: bool,
     /// Multiplies the logit (gap) before the sigmoid. Default 1.0.
     pub leaf_scale: f32,
+    /// If `Some(c)` the logit is `c * evaluate(state) + net(features)`.
+    pub stock_coef: Option<f32>,
 }
 
 /// Per-worker scratch buffers so evaluation does not allocate.
@@ -103,6 +119,7 @@ impl Evaluator {
             model: Model::Linear { w, b },
             relative_to_root: true,
             leaf_scale: 1.0,
+            stock_coef: None,
         })
     }
 
@@ -148,12 +165,26 @@ impl Evaluator {
             },
             relative_to_root: true,
             leaf_scale: 1.0,
+            stock_coef: None,
         })
     }
 
     pub fn with_relative_to_root(mut self, relative: bool) -> Evaluator {
         self.relative_to_root = relative;
         self
+    }
+
+    /// Make this a residual evaluator: logit = `stock_coef * evaluate(state) + net`.
+    pub fn with_stock_coef(mut self, stock_coef: f32) -> Result<Evaluator, String> {
+        if !stock_coef.is_finite() {
+            return Err(format!("stock_coef must be finite, got {stock_coef}"));
+        }
+        self.stock_coef = Some(stock_coef);
+        Ok(self)
+    }
+
+    pub fn is_residual(&self) -> bool {
+        self.stock_coef.is_some()
     }
 
     /// Set the leaf scale; must be finite and > 0.
@@ -180,7 +211,8 @@ impl Evaluator {
         }
     }
 
-    /// Logit from an already computed feature vector (length `FEATURE_LEN`).
+    /// Net output (without the stock term of a residual evaluator) from an
+    /// already computed feature vector (length `FEATURE_LEN`).
     /// Inputs that are exactly 0.0 are skipped (the encoding is sparse).
     pub fn logit_from_features(&self, x: &[f32], hidden_buf: &mut Vec<f32>) -> f32 {
         match &self.model {
@@ -223,7 +255,11 @@ impl Evaluator {
     /// z = logit of P(side one wins) at `state`.
     pub fn logit(&self, state: &State, scratch: &mut Scratch) -> f32 {
         features_into(state, SideReference::SideOne, &mut scratch.feats);
-        self.logit_from_features(&scratch.feats, &mut scratch.hidden)
+        let net = self.logit_from_features(&scratch.feats, &mut scratch.hidden);
+        match self.stock_coef {
+            Some(c) => c * evaluate(state) + net,
+            None => net,
+        }
     }
 
     /// Leaf score in [0, 1] from the leaf and root logits.
@@ -240,7 +276,10 @@ impl Evaluator {
         let mut out = Vec::new();
         out.extend_from_slice(MAGIC);
         let push = |out: &mut Vec<u8>, v: u32| out.extend_from_slice(&v.to_le_bytes());
-        push(&mut out, FORMAT_VERSION);
+        push(
+            &mut out,
+            if self.is_residual() { FORMAT_VERSION_RESIDUAL } else { FORMAT_VERSION },
+        );
         push(&mut out, FEATURE_VERSION);
         let pushf = |out: &mut Vec<u8>, xs: &[f32]| {
             for x in xs {
@@ -276,6 +315,13 @@ impl Evaluator {
                 pushf(&mut out, &[*b2]);
             }
         }
+        if let Some(c) = self.stock_coef {
+            // splice flags + stock_coef in after the 24-byte header
+            let mut extra = Vec::with_capacity(8);
+            extra.extend_from_slice(&FLAG_RESIDUAL.to_le_bytes());
+            extra.extend_from_slice(&c.to_le_bytes());
+            out.splice(24..24, extra);
+        }
         out
     }
 
@@ -285,7 +331,7 @@ impl Evaluator {
         }
         let u32_at = |off: usize| u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
         let format = u32_at(4);
-        if format != FORMAT_VERSION {
+        if format != FORMAT_VERSION && format != FORMAT_VERSION_RESIDUAL {
             return Err(format!("unsupported weights format version {format}"));
         }
         let feat_ver = u32_at(8);
@@ -302,7 +348,26 @@ impl Evaluator {
                 "weights expect {n_in} inputs, this engine has FEATURE_LEN = {FEATURE_LEN}"
             ));
         }
-        let body = &bytes[24..];
+        let mut stock_coef = None;
+        let mut body_start = 24;
+        if format == FORMAT_VERSION_RESIDUAL {
+            if bytes.len() < 32 {
+                return Err("truncated v2 weights header".to_string());
+            }
+            let flags = u32_at(24);
+            if flags & !FLAG_RESIDUAL != 0 {
+                return Err(format!("unknown weights flags {flags:#x}"));
+            }
+            if flags & FLAG_RESIDUAL != 0 {
+                let c = f32::from_le_bytes(bytes[28..32].try_into().unwrap());
+                if !c.is_finite() {
+                    return Err(format!("non-finite stock_coef {c}"));
+                }
+                stock_coef = Some(c);
+            }
+            body_start = 32;
+        }
+        let body = &bytes[body_start..];
         let floats_needed = match kind {
             KIND_LINEAR => n_in + 1,
             KIND_MLP => hidden * n_in + hidden + hidden + 1,
@@ -319,7 +384,7 @@ impl Evaluator {
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
             .collect();
-        if kind == KIND_LINEAR {
+        let ev = if kind == KIND_LINEAR {
             Evaluator::linear(floats[..n_in].to_vec(), floats[n_in])
         } else {
             let a = hidden * n_in;
@@ -330,6 +395,10 @@ impl Evaluator {
                 floats[a + hidden..a + 2 * hidden].to_vec(),
                 floats[a + 2 * hidden],
             )
+        }?;
+        match stock_coef {
+            Some(c) => ev.with_stock_coef(c),
+            None => Ok(ev),
         }
     }
 
@@ -506,6 +575,77 @@ mod tests {
         let mut bad = bytes.clone();
         bad[8] = 99; // feature version
         assert!(Evaluator::from_bytes(&bad).is_err());
+    }
+
+    #[test]
+    fn v1_bytes_unchanged_for_non_residual() {
+        let ev = Evaluator::linear(vec![0.0; FEATURE_LEN], 1.0).unwrap();
+        let bytes = ev.to_bytes();
+        assert_eq!(&bytes[4..8], &1u32.to_le_bytes());
+        assert_eq!(bytes.len(), 24 + (FEATURE_LEN + 1) * 4);
+        assert!(!Evaluator::from_bytes(&bytes).unwrap().is_residual());
+    }
+
+    #[test]
+    fn residual_roundtrip_v2() {
+        let mut w = vec![0.0; FEATURE_LEN];
+        w[idx("own.p0.hp")] = 1.5;
+        let lin = Evaluator::linear(w, 0.25).unwrap().with_stock_coef(0.0063).unwrap();
+        let bytes = lin.to_bytes();
+        assert_eq!(&bytes[4..8], &2u32.to_le_bytes());
+        assert_eq!(bytes.len(), 32 + (FEATURE_LEN + 1) * 4);
+        let back = Evaluator::from_bytes(&bytes).unwrap();
+        assert_eq!(back.stock_coef, Some(0.0063));
+        let s = state_with_hp(80, 30);
+        let mut sc = Scratch::new();
+        assert_eq!(lin.logit(&s, &mut sc), back.logit(&s, &mut sc));
+
+        let hidden = 2;
+        let mut w1 = vec![0.0; hidden * FEATURE_LEN];
+        w1[FEATURE_LEN + 5] = 3.0;
+        let mlp = Evaluator::mlp(hidden, w1, vec![0.0, 1.0], vec![1.0, 2.0], 0.5)
+            .unwrap()
+            .with_stock_coef(-0.01)
+            .unwrap();
+        let back = Evaluator::from_bytes(&mlp.to_bytes()).unwrap();
+        assert_eq!(back.stock_coef, Some(-0.01));
+        assert_eq!(back.hidden_size(), 2);
+        assert_eq!(mlp.logit(&s, &mut sc), back.logit(&s, &mut sc));
+    }
+
+    #[test]
+    fn residual_with_zero_net_is_scaled_stock() {
+        let ev = Evaluator::linear(vec![0.0; FEATURE_LEN], 0.0)
+            .unwrap()
+            .with_stock_coef(0.00625)
+            .unwrap();
+        let mut sc = Scratch::new();
+        for s in [state_with_hp(100, 40), state_with_hp(20, 90), State::default()] {
+            let z = ev.logit(&s, &mut sc);
+            let expected = 0.00625 * evaluate(&s);
+            assert!((z - expected).abs() < 1e-5, "z = {z}, expected = {expected}");
+        }
+    }
+
+    #[test]
+    fn corrupt_v2_rejected() {
+        let ev = Evaluator::linear(vec![0.0; FEATURE_LEN], 0.0)
+            .unwrap()
+            .with_stock_coef(0.0125)
+            .unwrap();
+        let bytes = ev.to_bytes();
+        assert!(Evaluator::from_bytes(&bytes[..bytes.len() - 4]).is_err());
+        assert!(Evaluator::from_bytes(&bytes[..28]).is_err());
+        let mut bad = bytes.clone();
+        bad[24] = 0x80; // unknown flag bit
+        assert!(Evaluator::from_bytes(&bad).is_err());
+        let mut bad = bytes.clone();
+        bad[28..32].copy_from_slice(&f32::NAN.to_le_bytes());
+        assert!(Evaluator::from_bytes(&bad).is_err());
+        let mut bad = bytes.clone();
+        bad[4] = 3; // unknown format
+        assert!(Evaluator::from_bytes(&bad).is_err());
+        assert!(ev.clone().with_stock_coef(f32::INFINITY).is_err());
     }
 
     #[test]

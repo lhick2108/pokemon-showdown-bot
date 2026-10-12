@@ -106,6 +106,40 @@ bench process would give both the net; use `scripts/duel.py` for that match-up
   trainer reloads the file with `Evaluator.load` and checks `evaluate` against
   the torch logits on up to 100 val states (tolerance 1e-3, observed ~1e-6).
 
+### Residual evaluator
+
+`--residual` starts from the stock evaluation and learns only a correction:
+
+    z = a * 0.0125 * evaluate(state) + net(features)
+
+On gen0 truth positions a 2-parameter logistic fit of the outcome on
+`0.0125 * evaluate` is already about as good as a plain learned MLP, so the net
+should not have to re-learn it. `a` is a learnable scalar, initialised from a
+weighted Newton logistic fit (with intercept b) on the train split
+(`--stock-coef-init A` overrides, `--freeze-stock-coef` keeps it fixed). The
+net's output layer starts at zero weights and bias b, so the untrained model is
+exactly the calibrated stock logistic; the trainer prints that stock-only val
+BCE next to the net's. The raw `evaluate()` per sample is computed once at load
+time (`dataset.iter_samples(..., with_stock_eval=True)`) and travels as the last
+column of `Data.x`.
+
+Export writes weights-format 2 with `stock_coef = a * 0.0125` (see
+`engine/README.md`; non-residual models still write format 1), and the
+post-export check reloads the file and compares `Evaluator.evaluate` (which adds
+the stock term) with the torch logit. In search the leaf score is still
+`sigmoid(leaf_scale * (z_leaf - z_root))`, so with a zero net this is the stock
+formula with the scale `a * 0.0125` instead of `0.0125`.
+
+gen0 truth states (35,381 positions, 604 battles, seed 0, 60 val battles),
+weighted val BCE against the outcome, `--lr 1e-4` (the default `1e-3` overfits
+after one epoch):
+
+| model | val BCE | stock-only logistic | learned a |
+| --- | --- | --- | --- |
+| residual MLP-64 | 0.5200 | 0.5336 | 0.509 |
+| residual MLP-16 | 0.5189 | 0.5336 | 0.506 |
+| residual linear | 0.5179 | 0.5336 | 0.522 |
+
 ### Value targets
 
 `--value-target outcome|search|blend` chooses what the net regresses on:

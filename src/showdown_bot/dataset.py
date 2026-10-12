@@ -51,7 +51,7 @@ class Sample:
     # Absolute version: the recorded avg_score is relative to the root evaluation, so
     # q_abs = sigmoid(scale * evaluate(state) + logit(avg_score)) (see absolute_search_value).
     search_value_abs: float | None = None
-    stock_eval: float | None = None  # poke_engine.evaluate(state), always side one's view
+    stock_eval: float | None = None  # poke_engine.evaluate(state), side one's view, not flipped for side two
 
     def as_tuple(self) -> tuple[list[float], float, dict[str, float] | None]:
         return self.features, self.value, self.policy
@@ -108,6 +108,7 @@ def iter_samples(
     stats: LoadStats | None = None,
     q_source: str = "decision",
     q_eval_scale: float = Q_EVAL_SCALE,
+    with_stock_eval: bool = False,
 ) -> Iterator[Sample]:
     """Yield one ``Sample`` per stored state (every searched world, plus truth).
 
@@ -181,6 +182,7 @@ def iter_samples(
                 if state is None:
                     stats.bad_states += 1
                     continue
+                stock_eval = float(poke_engine.evaluate(state))  # always filled (absolute q needs it)
                 for side in sides:
                     yield Sample(
                         features=poke_engine.state_features(state, side),
@@ -192,7 +194,7 @@ def iter_samples(
                         turn=decision.get("turn"),
                         state=state_string,
                         search_value=None if q is None else (q if side == 1 else 1.0 - q),
-                        stock_eval=float(poke_engine.evaluate(state)),
+                        stock_eval=stock_eval,
                         search_value_abs=(
                             None if q_abs is None else (q_abs if side == 1 else 1.0 - q_abs)
                         ),

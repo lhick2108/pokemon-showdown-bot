@@ -77,6 +77,21 @@ pe.state_features(state)                             # list[float], len FEATURE_
 pe.state_features(state, side=2)                     # side-two view
 ```
 
+### Weights file format
+
+Little endian: `"PEVN"`, `u32 format`, `u32 feature_version`, `u32 kind`
+(1 linear, 2 mlp), `u32 n_in`, `u32 n_hidden`, then the f32 weights (linear:
+`w[n_in], b`; mlp: `W1[n_hidden][n_in], b1, w2, b2`).
+
+**Format 2 (residual evaluators)** inserts two fields after `n_hidden`:
+`u32 flags` (bit0 = residual) and `f32 stock_coef`. A residual evaluator's logit
+is `stock_coef * evaluate(state) + net(features)` (the net's bias included);
+`stock_coef = a * 0.0125`, the multiplier on the raw stock evaluation points.
+Format 1 files load unchanged (not residual). Plain evaluators are still
+written as format 1, so older tooling keeps working; only a residual file needs
+a v2-aware reader. `write_linear` / `write_mlp` take `stock_coef` (default 0.0 =
+plain format 1); `Evaluator.residual` and `Evaluator.stock_coef` report it.
+
 `w1` follows the `torch.nn.Linear(FEATURE_LENGTH, hidden).weight` layout, so a
 trained model exports with `write_mlp(path, l1.weight, l1.bias, l2.weight, l2.bias)`
 (torch tensors and numpy arrays are accepted).
