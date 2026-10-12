@@ -13,7 +13,7 @@ torch = pytest.importorskip("torch")
 
 from battle_helpers import event, make_battle, opp_switch, request_for  # noqa: E402
 
-from showdown_bot import engine_state, train  # noqa: E402
+from showdown_bot import augment, engine_state, train  # noqa: E402
 from showdown_bot.sets import OpponentModel, RandbatsData  # noqa: E402
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -217,3 +217,80 @@ def test_residual_training_starts_at_stock_and_does_not_get_worse(state_strings)
     res = train.fit(model, data, data, device=torch.device("cpu"), epochs=3, seed=0, log=lambda *_: None)
     assert float(res.model.a) == pytest.approx(a0)  # frozen
     assert res.history[0][2] < 1.0
+
+
+# ---- augmentation (589.20) -------------------------------------------------
+
+
+def _batch(n=64, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    return torch.randn(n, pe.FEATURE_LENGTH, generator=g)
+
+
+def test_layout_matches_engine_names():
+    augment.check_layout()
+    bad = list(pe.state_feature_names())
+    bad[augment.SLOT] = "own.p1.attack"
+    with pytest.raises(AssertionError):
+        augment.check_layout(bad)
+
+
+def test_bench_permutation_moves_whole_blocks_only():
+    x = _batch()
+    out = augment.permute_bench(x, torch.Generator().manual_seed(1))
+    S, B = augment.SLOT, augment.SIDE
+    for s in range(2):
+        o = s * B
+        assert torch.equal(out[:, o:o + S], x[:, o:o + S])  # active fixed
+        assert torch.equal(out[:, o + 6 * S:o + B], x[:, o + 6 * S:o + B])  # extras fixed
+        for r in range(len(x)):  # each output bench block is exactly one input bench block, bijectively
+            src = []
+            for k in range(1, 6):
+                blk = out[r, o + k * S:o + (k + 1) * S]
+                m = [j for j in range(1, 6) if torch.equal(blk, x[r, o + j * S:o + (j + 1) * S])]
+                assert len(m) == 1
+                src.append(m[0])
+            assert sorted(src) == [1, 2, 3, 4, 5]
+    assert torch.equal(out[:, 2 * B:], x[:, 2 * B:])  # field fixed
+    assert not torch.equal(out, x)
+
+
+def test_bench_permutation_leaves_residual_column_alone():
+    x = _batch(8, 2)
+    out = augment.permute_bench(x)
+    assert torch.equal(out[:, -1], x[:, -1])
+
+
+def test_side_swap_equals_side_two_features(state_strings):
+    rows1 = torch.tensor([pe.state_features(pe.State.from_string(s), 1) for s in state_strings])
+    rows2 = torch.tensor([pe.state_features(pe.State.from_string(s), 2) for s in state_strings])
+    flip = torch.ones(len(rows1), dtype=torch.bool)
+    assert torch.equal(augment.swap_sides(rows1, flip), rows2)
+    assert torch.equal(augment.swap_sides(rows1, ~flip), rows1)
+
+
+def test_augmenter_flips_labels_and_residual_eval():
+    x = torch.cat([_batch(32, 3), torch.randn(32, 1)], dim=1)
+    y = torch.rand(32)
+    aug = augment.Augmenter(bench=False, sides=True, residual=True, seed=4)
+    xo, yo = aug(x, y)
+    flipped = ~torch.isclose(yo, y)
+    assert flipped.any() and (~flipped).any()
+    assert torch.allclose(yo[flipped], 1 - y[flipped])
+    assert torch.equal(xo[flipped, -1], -x[flipped, -1])
+    assert torch.equal(xo[~flipped], x[~flipped])
+    assert torch.equal(xo[flipped, :augment.SIDE], x[flipped, augment.SIDE:2 * augment.SIDE])
+
+
+def test_dropout_model_exports_exactly(tmp_path, state_strings):
+    torch.manual_seed(5)
+    model = train.build_model("mlp", pe.FEATURE_LENGTH, 16, dropout=0.5)
+    out = tmp_path / "d.pev"
+    train.export_pev(model, out)
+    assert train.verify_export(model, out, state_strings, tol=1e-3) < 1e-3
+    xs = _batch(4)
+    model.train()
+    assert not torch.equal(model(xs), model(xs))  # dropout active in training
+    res = train.build_model("mlp", pe.FEATURE_LENGTH, 16, residual=(0.7, -0.1), dropout=0.5)
+    train.export_pev(res, tmp_path / "r.pev")
+    assert train.verify_export(res, tmp_path / "r.pev", state_strings, tol=1e-3) < 1e-3
