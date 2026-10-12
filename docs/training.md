@@ -235,3 +235,57 @@ with `relative_to_root=False`).
   k/2, k, 2k sweep.
 
 Status: the duel sweep over k is pending; no result is recorded yet.
+
+## Augmentation and dropout (589.20)
+
+gen0 is 604 battles; every position of a battle shares its label and the
+per-slot stats/types fingerprint the battle, so the effective N is closer to
+the number of games than of positions (the MLP memorises: best epoch 1-3).
+Three training-only options (validation is never touched; code in
+`showdown_bot/augment.py`, layout constants asserted against
+`poke_engine.state_feature_names()` so a layout change fails loudly):
+
+- `--augment-bench`: per sample and side, randomly permute the bench slots 1..5
+  (53-wide blocks; slot 0, side extras and field untouched). Done as a GPU
+  gather per batch. Bench order is arbitrary team order, so it is
+  label-preserving. In residual mode the stock-eval column is untouched
+  (evaluate is permutation-invariant).
+- `--augment-sides`: with p = 1/2 swap the own/opp 363-blocks. This equals
+  `state_features(state, 2)` exactly (verified on 1500 real states and in a
+  test), the label becomes `1 - y` (outcome and q targets), and in residual mode
+  the raw stock eval flips sign (`evaluate` is exactly antisymmetric by
+  construction). Both views of a battle stay in the same split because the
+  swap is applied to training batches only.
+- `--dropout P`: dropout between the hidden ReLU and the output layer, training
+  only; eval-mode output equals the export (verified by the existing export
+  check and a test).
+
+Grid on gen0 (MLP-64, `--value-target blend --blend-lambda 0.75 --q-kind
+absolute`, states both, seed 0, same split: 60 val battles; val BCE is against
+the pure outcome, weighted; stock-eval logistic baseline 0.5113; train BCE is
+the clean (un-augmented) train set at the best epoch):
+
+| model | config | lr | val BCE | acc | best ep | train BCE |
+|---|---|---|---|---|---|---|
+| plain | none | 1e-3 | **0.4637** | 0.761 | 3/9 | 0.4677 |
+| plain | bench | 1e-3 | 0.4675 | 0.760 | 6/12 | 0.5074 |
+| plain | bench+sides | 1e-3 | 0.4684 | 0.762 | 6/12 | 0.5163 |
+| plain | bench+sides+dropout 0.2 | 1e-3 | 0.4787 | 0.764 | 4/10 | 0.5156 |
+| residual | none | 1e-3 | 0.4798 | 0.752 | 1/7 | 0.5110 |
+| residual | bench | 1e-3 | 0.4765 | 0.749 | 3/9 | 0.5191 |
+| residual | bench+sides | 1e-3 | 0.4809 | 0.755 | 1/7 | 0.5509 |
+| residual | bench+sides+dropout 0.2 | 1e-3 | 0.4822 | 0.755 | 1/7 | 0.5523 |
+| residual | none | 1e-4 | 0.4775 | 0.751 | 10/16 | 0.5069 |
+| residual | bench | 1e-4 | 0.4798 | 0.756 | 7/13 | 0.5460 |
+| residual | bench+sides | 1e-4 | 0.4808 | 0.757 | 13/19 | 0.5456 |
+| residual | bench+sides+dropout 0.2 | 1e-4 | 0.4809 | 0.755 | 13/19 | 0.5432 |
+
+(Residual runs: stock-only logistic baseline on this split is 0.5007.)
+
+Reading: augmentation lets the net train longer and shrinks the train/val
+mismatch but does **not** improve val BCE on gen0; differences of about 0.005
+are within the noise of 60 val battles and one seed. Early stopping already
+captures most of the benefit; the lever that is left is more games. Models
+kept: `models/gen0-aug-best-plain.pev` (bench) and
+`models/gen0-aug-best-res.pev` (residual, bench, lr 1e-3); the unaugmented
+plain baseline is still the best plain val BCE.

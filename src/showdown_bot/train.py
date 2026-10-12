@@ -45,6 +45,14 @@ Residual evaluator (``--residual``)
     the calibrated stock logistic; its val BCE is printed as the baseline. The
     export is a format-2 ``.pev`` with ``stock_coef = a * 0.0125``.
 
+Augmentation and regularisation (training batches only; validation is never touched)
+    ``--augment-bench`` randomly permutes the bench slots 1..5 of each side per
+    sample and batch; ``--augment-sides`` swaps own/opp with probability 1/2
+    (exactly ``state_features(state, 2)``) and flips the label to ``1 - y``
+    (outcome and q targets; in residual mode the stock evaluation changes sign).
+    See ``showdown_bot.augment``. ``--dropout P`` adds dropout between the hidden
+    ReLU and the output layer during training only; the export is unaffected.
+
 Device: cuda when available, else cpu (``--device`` overrides).
 """
 
@@ -63,7 +71,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from showdown_bot import dataset
+from showdown_bot import augment, dataset
 
 WEIGHTINGS = ("sqrt", "game", "none")
 STATE_CHOICES = ("both", "truth", "worlds")
@@ -220,13 +228,16 @@ def split_by_battle(
 
 def build_model(
     kind: str, n_in: int, hidden: int, residual: tuple[float, float] | None = None,
-    freeze_a: bool = False,
+    freeze_a: bool = False, dropout: float = 0.0,
 ) -> nn.Module:
     """``n_in`` counts feature columns only. ``residual=(a, b)`` wraps the net in a ResidualNet."""
     if kind == "linear":
         net: nn.Module = nn.Linear(n_in, 1)
     elif kind == "mlp":
-        net = nn.Sequential(nn.Linear(n_in, hidden), nn.ReLU(), nn.Linear(hidden, 1))
+        layers: list[nn.Module] = [nn.Linear(n_in, hidden), nn.ReLU()]
+        if dropout > 0:
+            layers.append(nn.Dropout(dropout))
+        net = nn.Sequential(*layers, nn.Linear(hidden, 1))
     else:
         raise ValueError(f"unknown model {kind!r}")
     if residual is not None:
@@ -245,7 +256,7 @@ class ResidualNet(nn.Module):
         self.net = net
         self.a = nn.Parameter(torch.tensor(float(a)), requires_grad=not freeze_a)
         # zero output layer + intercept: the untrained model is the stock logistic fit
-        out = net if isinstance(net, nn.Linear) else net[2]
+        out = net if isinstance(net, nn.Linear) else net[-1]
         nn.init.zeros_(out.weight)
         nn.init.constant_(out.bias, float(intercept))
 
@@ -364,6 +375,7 @@ def fit(
     weight_decay: float = 1e-4,
     seed: int = 0,
     log=print,
+    augmenter: augment.Augmenter | None = None,
 ) -> FitResult:
     """AdamW on weighted BCE; early stopping on weighted val BCE (best weights restored)."""
     torch.manual_seed(seed)
@@ -384,8 +396,11 @@ def fit(
         perm = torch.randperm(n, generator=gen).to(device)
         for i in range(0, n, batch_size):
             b = perm[i:i + batch_size]
+            xb, yb = xt[b], yt[b]
+            if augmenter is not None:
+                xb, yb = augmenter(xb, yb)
             loss = nn.functional.binary_cross_entropy_with_logits(
-                model(xt[b]).squeeze(-1), yt[b], reduction="none"
+                model(xb).squeeze(-1), yb, reduction="none"
             )
             loss = (loss * wt[b]).sum() / wt[b].sum()
             opt.zero_grad(set_to_none=True)
@@ -434,7 +449,7 @@ def export_pev(model: nn.Module, out: Path) -> None:
             stock_coef=stock_coef,
         )
         return
-    l1, l2 = model[0], model[2]
+    l1, l2 = model[0], model[-1]
     poke_engine.write_mlp(
         str(out),
         l1.weight.detach().reshape(-1).tolist(),
@@ -586,6 +601,12 @@ def _parser() -> argparse.ArgumentParser:
                    help="residual: initial/fixed a (default: logistic fit on the train split)")
     p.add_argument("--freeze-stock-coef", action="store_true",
                    help="residual: keep a at its initial value")
+    p.add_argument("--augment-bench", action="store_true",
+                   help="randomly permute bench slots 1..5 of each side in training batches")
+    p.add_argument("--augment-sides", action="store_true",
+                   help="swap own/opp (side-two view) with p=1/2 in training batches, label 1-y")
+    p.add_argument("--dropout", type=float, default=0.0,
+                   help="MLP dropout after the hidden ReLU (training only; export unaffected)")
     p.add_argument("--val-fraction", type=float, default=0.1)
     p.add_argument("--epochs", type=int, default=60)
     p.add_argument("--patience", type=int, default=6)
@@ -646,10 +667,19 @@ def main(argv=None) -> int:
               f"val BCE weighted {weighted_bce(base_lv, yv, wv):.4f}  "
               f"unweighted {weighted_bce(base_lv, yv):.4f}  "
               f"(train weighted {weighted_bce(base_lt, yt, wt):.4f})")
-    model = build_model(args.model, n_feat, args.hidden, res_init, args.freeze_stock_coef)
+    if not 0.0 <= args.dropout < 1.0:
+        print("--dropout must be in [0, 1)", file=sys.stderr)
+        return 2
+    model = build_model(args.model, n_feat, args.hidden, res_init, args.freeze_stock_coef,
+                        args.dropout)
+    augmenter = None
+    if args.augment_bench or args.augment_sides:
+        augmenter = augment.Augmenter(args.augment_bench, args.augment_sides, args.residual,
+                                      args.seed, device)
     result = fit(
         model, train, val, device=device, epochs=args.epochs, patience=args.patience,
         batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay, seed=args.seed,
+        augmenter=augmenter,
     )
     print(f"best epoch {result.best_epoch} of {result.epochs_run}")
     if args.residual:
