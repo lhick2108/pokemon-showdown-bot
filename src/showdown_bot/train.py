@@ -35,6 +35,12 @@ Value target (``--value-target``)
     decision's mean over worlds (default) or each world's own score. Metrics are
     reported against the training target and against the pure outcome z.
 
+Bootstrapped targets (``--value-target td|nstep``)
+    Look ahead within the same recording: ``td`` is the lambda-return over later
+    decisions' absolute q ending at z (``--td-lambda``; 1 = z, 0 = next decision's q),
+    ``nstep`` the q ``--td-n`` decisions later (z past the end). ``--td-include-self
+    --td-mu M`` blends the decision's own q. See docs/training.md.
+
 Residual evaluator (``--residual``)
     The stock evaluation is the starting point and the net learns only a
     correction: ``z = a * 0.0125 * evaluate(state) + net(features)``. ``a`` is a
@@ -75,7 +81,7 @@ from showdown_bot import augment, dataset
 
 WEIGHTINGS = ("sqrt", "game", "none")
 STATE_CHOICES = ("both", "truth", "worlds")
-VALUE_TARGETS = ("outcome", "search", "blend")
+VALUE_TARGETS = ("outcome", "search", "blend", "td", "nstep")
 N_BUCKETS = 10
 
 
@@ -168,12 +174,16 @@ def load_data(
     q_kind: str = "absolute",
     q_eval_scale: float = dataset.Q_EVAL_SCALE,
     residual: bool = False,
+    td_lambda: float = 0.7,
+    td_n: int = 1,
+    td_mu: float = 0.0,
 ) -> Data:
     """Load every sample of the given run directories into memory.
 
     ``residual`` appends the raw stock ``evaluate(state)`` as the last column of ``x``.
     """
     feats, ys, qs, evals, tags, strings = [], [], [], [], [], []
+    gids, didx, dqs = [], [], []
     load = dataset.LoadStats()
     for path in paths:
         for s in dataset.iter_samples(
@@ -188,6 +198,10 @@ def load_data(
             evals.append(s.stock_eval)
             tags.append(s.battle_tag)
             strings.append(s.state)
+            gids.append(s.game_id)
+            didx.append(s.decision_idx)
+            dq = s.decision_q_abs if q_kind == "absolute" else s.decision_q
+            dqs.append(np.nan if dq is None else dq)
     if load.bad_states:
         print(f"warning: {load.bad_states} unparsable states skipped", file=sys.stderr)
     if not feats:
@@ -197,8 +211,16 @@ def load_data(
         x = np.concatenate([x, np.asarray(evals, dtype=np.float32)[:, None]], axis=1)
     y = np.asarray(ys, dtype=np.float32)
     q = np.asarray(qs, dtype=np.float32)
-    target, n_fallback = make_targets(y, q, value_target, blend_lambda)
-    if value_target != "outcome":
+    if value_target in ("td", "nstep"):
+        target, st = dataset.bootstrapped_targets(
+            gids, didx, dqs, y, value_target, td_lambda, td_n, td_mu)
+        print(f"value target {value_target}: {st['gaps']} of {st['decisions']} decisions have no "
+              f"search value (gap: next available q, else outcome)")
+    else:
+        target, n_fallback = make_targets(y, q, value_target, blend_lambda)
+    if value_target in ("td", "nstep"):
+        pass
+    elif value_target != "outcome":
         print(f"value target {value_target}: {n_fallback} of {len(y)} samples have no search "
               f"value and fall back to the outcome")
     return Data(
@@ -589,6 +611,13 @@ def _parser() -> argparse.ArgumentParser:
                    help="outcome z (default), search value q, or blend (1-L)*z + L*q")
     p.add_argument("--blend-lambda", type=float, default=0.5,
                    help="weight L of q in the blend target (default 0.5)")
+    p.add_argument("--td-lambda", type=float, default=0.7,
+                   help="td target: lambda of the lambda-return over later decisions (default 0.7)")
+    p.add_argument("--td-n", type=int, default=1, help="nstep target: n (default 1)")
+    p.add_argument("--td-include-self", action="store_true",
+                   help="td/nstep: blend the decision's own q_t: (1-mu)*G + mu*q_t")
+    p.add_argument("--td-mu", type=float, default=0.0,
+                   help="weight mu of the own q_t with --td-include-self (default 0)")
     p.add_argument("--q-kind", choices=dataset.Q_KINDS, default="absolute",
                    help="q = root-relative avg_score, or absolute (adds back the root's stock eval)")
     p.add_argument("--q-eval-scale", type=float, default=dataset.Q_EVAL_SCALE,
@@ -633,15 +662,24 @@ def main(argv=None) -> int:
     if not 0.0 <= args.blend_lambda <= 1.0:
         print("--blend-lambda must be in [0, 1]", file=sys.stderr)
         return 2
+    if not 0.0 <= args.td_lambda <= 1.0 or not 0.0 <= args.td_mu <= 1.0 or args.td_n < 1:
+        print("--td-lambda/--td-mu must be in [0, 1] and --td-n >= 1", file=sys.stderr)
+        return 2
+    mu = args.td_mu if args.td_include_self else 0.0
     target_desc = args.value_target + (
         f" (lambda={args.blend_lambda}, q-kind={args.q_kind}, q-source={args.q_source}, "
         f"q-eval-scale={args.q_eval_scale})" if args.value_target == "blend"
         else f" (q-kind={args.q_kind}, q-source={args.q_source}, q-eval-scale={args.q_eval_scale})"
-        if args.value_target == "search" else "")
+        if args.value_target == "search"
+        else f" (lambda={args.td_lambda}, mu={mu}, q-kind={args.q_kind})"
+        if args.value_target == "td"
+        else f" (n={args.td_n}, mu={mu}, q-kind={args.q_kind})" if args.value_target == "nstep"
+        else "")
     print(f"value target: {target_desc}")
     data = load_data(
         args.data, args.states, args.weighting, args.value_target, args.blend_lambda, args.q_source,
         args.q_kind, args.q_eval_scale, residual=args.residual,
+        td_lambda=args.td_lambda, td_n=args.td_n, td_mu=mu,
     )
     tr_idx, va_idx = split_by_battle(data.tags, args.val_fraction, args.seed)
     if len(va_idx) == 0 or len(tr_idx) == 0:

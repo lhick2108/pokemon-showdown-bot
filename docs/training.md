@@ -196,6 +196,51 @@ same split; BCE and accuracy vs the pure outcome z, constant = 0.693):
 
 Val corr(q_abs, z) = 0.607. Single seed; **duel results are pending**.
 
+### Bootstrapped (TD) targets
+
+`--value-target td|nstep` replaces the single-step search value by a return
+that looks ahead along the same recording (one side's view of one battle; the
+file is the unit, so the chain is that player's decisions in order). Per
+decision t the chain value is q_t, the absolute decision-level search value
+(truth state's `q_abs` if the decision has a truth state, else the mean over
+worlds; `--q-kind relative` uses the raw score). World and truth samples of a
+decision share it and therefore share the target. With decisions t = 0..T-1
+and the outcome z as the step after the last decision:
+
+- `td` (`--td-lambda L`): the lambda-return
+  `G_t = (1-L) sum_{n=1}^{T-t-1} L^(n-1) q_{t+n} + L^(T-t-1) z`, computed by the
+  backward recursion `G_{T-1} = z`, `G_t = (1-L) q_{t+1} + L G_{t+1}`
+  (Sutton & Barto, lambda-returns). L=1 is the outcome z, L=0 the next
+  decision's q.
+- `nstep` (`--td-n N`): `G_t = q_{t+N}` if `t+N < T` else z.
+- `--td-include-self --td-mu M`: `target = (1-M) G_t + M q_t`.
+
+A decision with no usable q is a gap: it takes the next available later q
+(or z); the number of gaps is printed. Existing modes are unchanged. Motivation:
+Boige, Boumaza & Scherrer 2026 (arXiv:2609.09094) bootstrap AlphaZero value
+targets from later search values; the later q is a less noisy and less biased
+label than z while still carrying information from beyond the current search
+horizon.
+
+Full gen0 (604 battles, 40,359 decisions, none without q; MLP-64 plain, seed 0,
+same split as above; BCE/accuracy vs the pure outcome z):
+
+| target | val outcome BCE | accuracy | best epoch | train BCE |
+|---|---|---|---|---|
+| stock-eval logistic (baseline) | 0.5113 | - | - | - |
+| blend 0.75 abs (previous best) | 0.4637 | 0.761 | 3 | 0.4677 |
+| td L=0.5 | 0.4653 | 0.761 | 3 | 0.5162 |
+| td L=0.7 | 0.4672 | 0.758 | 4 | 0.4896 |
+| td L=0.9 | 0.4676 | 0.756 | 3 | 0.4493 |
+| nstep n=1 | 0.4597 | 0.767 | 3 | 0.5354 |
+| nstep n=3 | 0.4631 | 0.766 | 4 | 0.5033 |
+| td L=0.7, mu=0.5 | **0.4588** | 0.769 | 3 | 0.5241 |
+| td L=0.7, mu=0.5, residual MLP-16 (lr 1e-4) | 0.4656 | 0.751 | 46 | 0.5274 |
+
+Single seed; differences of ~0.005 are probably within noise. Pure TD without
+the own q is about equal to the blend; mixing in the decision's own q (mu=0.5)
+or a 1-step target is slightly better. Duels pending.
+
 ## Reading the results
 
 - Val BCE must beat the constant predictor (`ln 2 = 0.693` for a balanced set).

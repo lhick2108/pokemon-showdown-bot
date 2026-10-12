@@ -294,3 +294,10 @@ def test_dropout_model_exports_exactly(tmp_path, state_strings):
     res = train.build_model("mlp", pe.FEATURE_LENGTH, 16, residual=(0.7, -0.1), dropout=0.5)
     train.export_pev(res, tmp_path / "r.pev")
     assert train.verify_export(res, tmp_path / "r.pev", state_strings, tol=1e-3) < 1e-3
+
+
+def test_td_modes_in_make_targets_leave_outcome_untouched():
+    y = np.array([1.0, 0.0, 0.5], dtype=np.float32)
+    target, n = train.make_targets(y, None, "outcome")
+    assert target is y and n == 0
+    assert {"td", "nstep"} <= set(train.VALUE_TARGETS)
