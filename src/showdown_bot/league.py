@@ -71,6 +71,16 @@ class BotSpec:
         return dict(self.params).get(key, default)
 
 
+
+def _init_params(cls: type) -> set[str]:
+    """Constructor keywords of ``cls`` or any base (subclasses often forward **kwargs)."""
+    names: set[str] = set()
+    for klass in cls.__mro__:
+        init = klass.__dict__.get("__init__")
+        if init is not None:
+            names.update(inspect.signature(init).parameters)
+    return names
+
 def _split_spec_params(rest: str) -> list[str]:
     """Split on ':' but keep Windows drive letters (``C:\\x``) inside a value."""
     parts: list[str] = []
@@ -521,21 +531,21 @@ def _make_player(spec: BotSpec, cfg: LeagueConfig, recorder, concurrency: int, s
             kwargs["evaluator"] = spec.param("evaluator")
         scale = spec.param("scale", 1.0)
         if scale != 1:
-            if "evaluator_scale" not in inspect.signature(cls.__init__).parameters:
+            if "evaluator_scale" not in _init_params(cls):
                 raise ValueError(
                     f"{spec.label}: scale={scale:g} needs SearchPlayer(evaluator_scale=...), "
                     "which this checkout does not have (branch feat/589.16-leaf-scale)"
                 )
             kwargs["evaluator_scale"] = scale
         if spec.param("selection") is not None or spec.param("gamma") is not None:
-            if "selection" not in inspect.signature(cls.__init__).parameters:
+            if "selection" not in _init_params(cls):
                 raise ValueError(f"{spec.label}: selection/gamma need SearchPlayer(selection=...)")
             if spec.param("selection") is not None:
                 kwargs["selection"] = spec.param("selection")
             if spec.param("gamma") is not None:
                 kwargs["selection_gamma"] = spec.param("gamma")
         if spec.param("mode") is not None:
-            if "mode" not in inspect.signature(cls.__init__).parameters:
+            if "mode" not in _init_params(cls):
                 raise ValueError(f"{spec.label}: mode needs SearchPlayer(mode=...)")
             kwargs["mode"] = spec.param("mode")
         if cfg.search_workers:

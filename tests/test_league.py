@@ -160,14 +160,25 @@ def test_specs_in_games_and_results(tmp_path):
     assert json.loads((tmp_path / "results.json").read_text())["specs"] == res["specs"] == specs
 
 
-def test_scale_guard_without_evaluator_scale(tmp_path):
-    spec = league.parse_spec("n=search-net:evaluator=x.pev:scale=4")
-    cfg = league.LeagueConfig(out=tmp_path)
-    import inspect
+def test_init_params_sees_keywords_forwarded_by_subclasses():
+    class Base:
+        def __init__(self, evaluator_scale=1.0, selection="ucb1"):
+            pass
+
+    class Forwarding(Base):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+
+    class Plain:
+        def __init__(self, x=0):
+            pass
+
+    assert {"evaluator_scale", "selection"} <= league._init_params(Forwarding)
+    assert "evaluator_scale" not in league._init_params(Plain)
+
+    # the real search-net player (a forwarding subclass) accepts every search key
     from showdown_bot.players.search import SearchNetPlayer
-    if "evaluator_scale" not in inspect.signature(SearchNetPlayer.__init__).parameters:
-        with pytest.raises(ValueError, match="evaluator_scale"):
-            league._make_player(spec, cfg, None, 1, 0)
+    assert {"evaluator_scale", "selection", "mode"} <= league._init_params(SearchNetPlayer)
 
 
 def test_run_limited_respects_limit_and_order():
