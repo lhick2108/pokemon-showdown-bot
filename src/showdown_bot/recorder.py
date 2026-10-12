@@ -243,7 +243,13 @@ def build_truth_state(battle: Any, other: Any) -> str | None:
     entries = []
     for identifier, bmon in other.team.items():
         seen = battle.opponent_team.get(identifier) or by_species.get(to_id(bmon.species))
-        tera = getattr(bmon.tera_type, "name", None) or bmon.tera_type
+        # An own Pokemon that has not Terastallized has no ``tera_type`` in poke-env; its
+        # real type is only in the request it was built from.
+        tera = (
+            (getattr(bmon, "_last_request", None) or {}).get("teraType")
+            or getattr(bmon.tera_type, "name", None)
+            or bmon.tera_type
+        )
         sampled = SampledSet(
             species=bmon.species,
             level=int(bmon.level or 100),

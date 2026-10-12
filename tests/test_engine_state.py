@@ -367,3 +367,61 @@ def test_encore_without_a_known_last_move_is_dropped(data, sampler):
     built, _ = _build(battle, data, sampler)
     assert "encore" not in {v.lower() for v in built.state.side_two.volatile_statuses}
     assert pe.monte_carlo_tree_search(built.state, 20).total_visits > 0
+
+
+# --- choice / locked-move restriction on the opponent (bead 589.27) ----------
+
+_GARDEVOIR_MOVES = ("moonblast", "psyshock", "calmmind", "healingwish")
+
+
+def _opp_world_with_item(data, sampler, item, *, used_move=True):
+    battle = _opp_battle()
+    if used_move:
+        event(battle, "move", "p2a: Gardevoir", "Moonblast", "p1a: Great Tusk")
+    trackers = OpponentModel(data).update(battle)
+    slots = es.sample_opponent_team(battle, trackers, sampler, random.Random(1))
+    slots[0].sampled = SampledSet("gardevoir", 83, "", _GARDEVOIR_MOVES, "trace", item, "Fairy")
+    return es.build_state(battle, slots), battle
+
+
+def test_choice_item_locks_opponent_to_last_used_move(data, sampler):
+    built, _ = _opp_world_with_item(data, sampler, "Choice Specs")
+    moves = {m.id.lower(): m.disabled for m in built.state.side_two.pokemon[0].moves}
+    assert moves == {"moonblast": False, "psyshock": True, "calmmind": True, "healingwish": True}
+
+
+def test_non_choice_item_leaves_opponent_moves_free(data, sampler):
+    built, _ = _opp_world_with_item(data, sampler, "Life Orb")
+    assert not any(m.disabled for m in built.state.side_two.pokemon[0].moves)
+
+
+def test_choice_item_without_a_move_used_is_not_locked(data, sampler):
+    built, _ = _opp_world_with_item(data, sampler, "Choice Scarf", used_move=False)
+    assert not any(m.disabled for m in built.state.side_two.pokemon[0].moves)
+
+
+def test_locked_move_effect_locks_opponent_even_without_choice_item(data, sampler):
+    battle = _opp_battle()
+    event(battle, "move", "p2a: Gardevoir", "Moonblast", "p1a: Great Tusk")
+    mon = battle.opponent_active_pokemon
+    assert es._locked_move(mon, "lifeorb", _GARDEVOIR_MOVES) is None
+    mon._effects[es.Effect.LOCKED_MOVE] = 1
+    assert es._locked_move(mon, "lifeorb", _GARDEVOIR_MOVES) == "moonblast"
+
+
+def test_choice_lock_is_released_by_switching_out(data, sampler):
+    battle = _opp_battle()
+    event(battle, "move", "p2a: Gardevoir", "Moonblast", "p1a: Great Tusk")
+    event(battle, "switch", "p2a: Greninja", "Greninja, L84", "100/100")
+    event(battle, "switch", "p2a: Gardevoir", "Gardevoir, L83", "100/100")
+    mon = battle.opponent_active_pokemon
+    assert es._locked_move(mon, "choicespecs", _GARDEVOIR_MOVES) is None
+
+
+def test_choice_locked_world_searches_with_fewer_opponent_options(data, sampler):
+    import poke_engine as pe
+
+    built, _ = _opp_world_with_item(data, sampler, "Choice Specs")
+    result = pe.monte_carlo_tree_search(built.state, 20)
+    non_switch = {o.move_choice for o in result.side_two if not o.move_choice.startswith("switch ")}
+    assert non_switch <= {"moonblast", "moonblast-tera"}
