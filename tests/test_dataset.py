@@ -114,3 +114,26 @@ def test_search_value_none_when_no_world_has_visits(tmp_path, state_string):
     assert all(s.search_value is None for s in dataset.iter_samples(tmp_path))
     assert dataset.decision_search_value({"worlds": [{"avg_score": None, "total_visits": 5}]}) is None
     assert dataset.decision_search_value({}) is None
+
+
+def test_absolute_search_value_pure_function():
+    import math
+    # relative score 0.5 (no search improvement): q_abs is sigmoid(scale * eval)
+    assert abs(dataset.absolute_search_value(0.0, 0.5) - 0.5) < 1e-12
+    assert abs(dataset.absolute_search_value(80.0, 0.5) - 1 / (1 + math.exp(-1.0))) < 1e-9
+    # eval and search improvement add in logit space
+    q = dataset.absolute_search_value(-80.0, 1 / (1 + math.exp(-1.0)))
+    assert abs(q - 0.5) < 1e-9
+    # clipping keeps 0/1 scores finite
+    assert 0.0 < dataset.absolute_search_value(0.0, 0.0) < dataset.absolute_search_value(0.0, 1.0) < 1.0
+
+
+def test_search_value_abs_in_samples(tmp_path, state_string):
+    _write_q(tmp_path, state_string, [(100, [("a", 100, 70.0)])])
+    ev = pe.evaluate(pe.State.from_string(state_string))
+    expect = dataset.absolute_search_value(ev, 0.7)
+    s1, s2 = [list(dataset.iter_samples(tmp_path, sides=(1, 2), truth=False))[i] for i in (0, 1)]
+    assert abs(s1.search_value_abs - expect) < 1e-9 and abs(s2.search_value_abs - (1 - expect)) < 1e-9
+    assert s1.stock_eval == ev
+    truth = [s for s in dataset.iter_samples(tmp_path) if s.kind == "truth"][0]
+    assert abs(truth.search_value_abs - expect) < 1e-9

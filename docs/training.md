@@ -134,10 +134,33 @@ Boumaza & Scherrer 2026, arXiv:2609.09094). Caveat: q comes from the search
 that used the evaluator which generated the data, so with the stock evaluator
 it carries that evaluator's biases.
 
-Smoke run (gen0, 314 battles / 64.5k positions, MLP-64, one seed; val outcome
-BCE vs constant 0.693): outcome 0.580, blend 0.5 0.573, search 0.675; val
-q-z correlation 0.17. This is a single small run; **duel results for these
-models are pending**.
+**Absolute vs relative q.** The recorded `avg_score` is relative to the root:
+the stock MCTS score is `sigmoid(0.0125 * (e_leaf - e_root))`, so q is centred
+on 0.5 and measures search improvement, not win probability (first smoke run
+with relative q: search target barely beat the constant). `--q-kind absolute`
+(default) adds the root evaluation back:
+`q_abs = sigmoid(0.0125 * evaluate(state) + logit(clip(avg_score, 1e-4, 1-1e-4)))`
+(`--q-eval-scale` changes 0.0125). Per world it uses that world's state;
+the decision value is the mean over valid worlds; truth states use
+`evaluate(truth) + logit(decision mean score)`. `poke_engine.evaluate` is side
+one's view (checked: the fitted slope of z on it is positive, +0.62).
+`--q-kind relative` keeps the old behaviour for comparison.
+
+The report also prints the **stock-eval baseline**: a logistic regression of z
+on `0.0125 * evaluate` fitted on train, scored on the same val split. A net
+must beat this (not just ln 2).
+
+Full gen0 (604 battles, 123.6k positions, 60 val battles, MLP-64, seed 0,
+same split; BCE and accuracy vs the pure outcome z, constant = 0.693):
+
+| target | val outcome BCE | stock-eval logistic | accuracy |
+|---|---|---|---|
+| outcome | 0.534 | 0.511 | 0.700 |
+| blend 0.5 abs | 0.478 | 0.511 | 0.736 |
+| blend 0.75 abs | 0.464 | 0.511 | 0.761 |
+| search abs | 0.474 | 0.511 | 0.763 |
+
+Val corr(q_abs, z) = 0.607. Single seed; **duel results are pending**.
 
 ## Reading the results
 

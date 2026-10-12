@@ -31,6 +31,8 @@ KIND_WORLD = "world"
 KIND_TRUTH = "truth"
 
 Q_SOURCES = ("decision", "world")
+Q_KINDS = ("relative", "absolute")
+Q_EVAL_SCALE = 0.0125  # the stock MCTS score is sigmoid(0.0125 * (e_leaf - e_root))
 
 
 @dataclass
@@ -46,6 +48,10 @@ class Sample:
     # Search-based value estimate in [0, 1] from this sample's side's view (MCTS root
     # avg_score; side two gets 1 - q). None when no searched world had visits.
     search_value: float | None = None
+    # Absolute version: the recorded avg_score is relative to the root evaluation, so
+    # q_abs = sigmoid(scale * evaluate(state) + logit(avg_score)) (see absolute_search_value).
+    search_value_abs: float | None = None
+    stock_eval: float | None = None  # poke_engine.evaluate(state), always side one's view
 
     def as_tuple(self) -> tuple[list[float], float, dict[str, float] | None]:
         return self.features, self.value, self.policy
@@ -73,6 +79,20 @@ def _valid_score(world: dict[str, Any]) -> float | None:
     return float(score)
 
 
+def absolute_search_value(
+    stock_eval: float, avg_score: float, scale: float = Q_EVAL_SCALE
+) -> float:
+    """Absolute win probability from a root-relative search score.
+
+    ``avg_score`` is ``sigmoid(scale * (e_leaf - e_root))`` averaged, so adding back
+    the root's own evaluation gives ``sigmoid(scale * e_root + logit(avg_score))``.
+    ``stock_eval`` is ``poke_engine.evaluate`` (side one's view).
+    """
+    p = min(max(avg_score, 1e-4), 1 - 1e-4)
+    z = scale * stock_eval + math.log(p / (1 - p))
+    return 1.0 / (1.0 + math.exp(-z))
+
+
 def decision_search_value(decision: dict[str, Any]) -> float | None:
     """Mean ``avg_score`` over the decision's usable worlds (side one's view), or None."""
     scores = [q for q in map(_valid_score, decision.get("worlds", ())) if q is not None]
@@ -87,6 +107,7 @@ def iter_samples(
     truth: bool = True,
     stats: LoadStats | None = None,
     q_source: str = "decision",
+    q_eval_scale: float = Q_EVAL_SCALE,
 ) -> Iterator[Sample]:
     """Yield one ``Sample`` per stored state (every searched world, plus truth).
 
@@ -117,20 +138,47 @@ def iter_samples(
         for decision in game["decisions"]:
             policy = decision.get("policy") or None
             q_mean = decision_search_value(decision)
-            states: list[tuple[str, str, float | None]] = []
+            parsed: dict[str, Any] = {}
+
+            def parse(string: str):
+                if string not in parsed:
+                    try:
+                        parsed[string] = poke_engine.State.from_string(string)
+                    except (KeyboardInterrupt, SystemExit):
+                        raise
+                    except BaseException:  # includes pyo3 PanicException
+                        parsed[string] = None
+                return parsed[string]
+
+            # absolute q per usable world (needs the parsed world state)
+            world_abs: list[float | None] = []
+            for w in decision.get("worlds", ()):
+                score, st = _valid_score(w), parse(w["state"])
+                world_abs.append(
+                    None if score is None or st is None
+                    else absolute_search_value(poke_engine.evaluate(st), score, q_eval_scale)
+                )
+            valid_abs = [v for v in world_abs if v is not None]
+            abs_mean = sum(valid_abs) / len(valid_abs) if valid_abs else None
+            states: list[tuple[str, str, float | None, float | None]] = []
             if worlds:
-                states += [
-                    (KIND_WORLD, w["state"], _valid_score(w) if q_source == "world" else q_mean)
-                    for w in decision.get("worlds", ())
-                ]
+                for w, wa in zip(decision.get("worlds", ()), world_abs):
+                    own = q_source == "world"
+                    states.append((
+                        KIND_WORLD, w["state"], _valid_score(w) if own else q_mean,
+                        wa if own else abs_mean,
+                    ))
             if truth and decision.get("truth"):
-                states.append((KIND_TRUTH, decision["truth"]["state"], q_mean))
-            for kind, state_string, q in states:
-                try:
-                    state = poke_engine.State.from_string(state_string)
-                except (KeyboardInterrupt, SystemExit):
-                    raise
-                except BaseException:  # includes pyo3 PanicException (not an Exception)
+                tstring = decision["truth"]["state"]
+                tstate = parse(tstring)
+                t_abs = (
+                    None if tstate is None or q_mean is None
+                    else absolute_search_value(poke_engine.evaluate(tstate), q_mean, q_eval_scale)
+                )
+                states.append((KIND_TRUTH, tstring, q_mean, t_abs))
+            for kind, state_string, q, q_abs in states:
+                state = parse(state_string)
+                if state is None:
                     stats.bad_states += 1
                     continue
                 for side in sides:
@@ -144,6 +192,10 @@ def iter_samples(
                         turn=decision.get("turn"),
                         state=state_string,
                         search_value=None if q is None else (q if side == 1 else 1.0 - q),
+                        stock_eval=float(poke_engine.evaluate(state)),
+                        search_value_abs=(
+                            None if q_abs is None else (q_abs if side == 1 else 1.0 - q_abs)
+                        ),
                     )
 
 
