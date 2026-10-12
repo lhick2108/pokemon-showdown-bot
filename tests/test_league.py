@@ -233,3 +233,10 @@ def test_rate_only_on_fixture_dir(tmp_path):
     assert by["c"]["elo"] == pytest.approx(0, abs=1e-9)
     assert by["a"]["elo"] > by["b"]["elo"]
     assert json.loads((tmp_path / "results.json").read_text())["n_games"] == len(games)
+
+
+def test_parse_spec_mode_key():
+    spec = league.parse_spec("nash=search:mode=Nash:time_ms=50")
+    assert spec.param("mode") == "nash" and spec.param("time_ms") == 50
+    with pytest.raises(ValueError):
+        league.parse_spec("x=search:mode=bogus")

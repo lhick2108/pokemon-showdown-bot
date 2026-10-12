@@ -433,6 +433,7 @@ class MctsResult:
     side_one: List[MctsSideResult]
     side_two: List[MctsSideResult]
     iteration_count: int
+    joint: Optional[List[Tuple[int, int, int, float]]]
 
 FEATURE_VERSION: int
 FEATURE_LENGTH: int
@@ -502,6 +503,7 @@ def mcts(
     evaluator: Optional[Evaluator] = None,
     selection: str = "ucb1",
     gamma: float = 0.1,
+    return_joint: bool = False,
 ) -> MctsResult:
     """
     Perform Monte Carlo Tree Search on the given state.

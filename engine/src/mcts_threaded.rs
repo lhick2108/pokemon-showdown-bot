@@ -494,6 +494,7 @@ pub fn perform_mcts_shared_tree_with(
             .collect()
     };
     MctsResult {
+        joint: None,
         s1: side(&options.s1),
         s2: side(&options.s2),
         iteration_count: root.times_visited.load(Ordering::Acquire),

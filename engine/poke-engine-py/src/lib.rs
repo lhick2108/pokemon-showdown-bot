@@ -15,7 +15,7 @@ use poke_engine::features::{
     feature_names, features, FEATURE_LEN, FEATURE_VERSION,
 };
 use poke_engine::learned::{Evaluator, Scratch};
-use poke_engine::mcts::{perform_mcts_selecting, MctsResult, MctsSideResult};
+use poke_engine::mcts::{perform_mcts_joint, MctsResult, MctsSideResult};
 use poke_engine::selection::{SelectionConfig, SelectionMode};
 use poke_engine::mcts_threaded::perform_mcts_shared_tree_with;
 use poke_engine::pokemon::PokemonName;
@@ -883,6 +883,8 @@ struct PyMctsResult {
     s1: Vec<PyMctsSideResult>,
     s2: Vec<PyMctsSideResult>,
     iteration_count: u32,
+    /// (s1 index, s2 index, visits, mean score for side one); None unless return_joint
+    joint: Option<Vec<(usize, usize, u32, f32)>>,
 }
 
 impl PyMctsResult {
@@ -899,6 +901,9 @@ impl PyMctsResult {
                 .map(|r| PyMctsSideResult::from_mcts_side_result(r.clone(), &state.side_two))
                 .collect(),
             iteration_count: result.iteration_count,
+            joint: result
+                .joint
+                .map(|cells| cells.iter().map(|c| (c.s1, c.s2, c.visits, c.mean)).collect()),
         }
     }
 }
@@ -1081,7 +1086,7 @@ fn state_feature_names() -> Vec<String> {
 }
 
 #[pyfunction]
-#[pyo3(signature = (py_state, duration_ms, iterations, threads, evaluator=None, selection="ucb1", gamma=0.1))]
+#[pyo3(signature = (py_state, duration_ms, iterations, threads, evaluator=None, selection="ucb1", gamma=0.1, return_joint=false))]
 fn mcts(
     py_state: PyState,
     duration_ms: u64,
@@ -1090,6 +1095,7 @@ fn mcts(
     evaluator: Option<PyEvaluator>,
     selection: &str,
     gamma: f64,
+    return_joint: bool,
 ) -> PyResult<PyMctsResult> {
     let mode = SelectionMode::parse(selection).ok_or_else(|| {
         pyo3::exceptions::PyValueError::new_err(format!(
@@ -1104,6 +1110,11 @@ fn mcts(
     if mode != SelectionMode::Ucb1 && threads > 1 {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "selection exp3/rm is single-threaded only; the shared-tree search is ucb1 (use threads=1)",
+        ));
+    }
+    if return_joint && threads > 1 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "return_joint is single-threaded only (use threads=1)",
         ));
     }
     let selection_config = SelectionConfig { mode, gamma };
@@ -1125,7 +1136,7 @@ fn mcts(
             evaluator_ref,
         )
     } else {
-        perform_mcts_selecting(
+        perform_mcts_joint(
             &mut state,
             s1_options,
             s2_options,
@@ -1133,6 +1144,7 @@ fn mcts(
             iterations,
             evaluator_ref,
             &selection_config,
+            return_joint,
         )
     };
 

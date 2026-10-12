@@ -51,7 +51,7 @@ def result_from_battle(battle: Any) -> str:
 
 
 def world_record(
-    state: str, outcome: tuple
+    state: str, outcome: tuple, nash: dict[str, Any] | None = None
 ) -> dict[str, Any]:
     """One searched world: its State string and the MCTS root statistics."""
     total, options = outcome[0], outcome[1]
@@ -65,9 +65,11 @@ def world_record(
             for choice, visits, score in options
         ],
     }
-    if len(outcome) > 2:  # exp3 / rm: average-strategy share per move
+    if len(outcome) > 2 and outcome[2] is not None:  # exp3 / rm: average-strategy share
         for move, share in zip(record["moves"], outcome[2]):
             move["strategy"] = float(share)
+    if nash is not None:  # Nash mode: our equilibrium strategy and the game value
+        record["nash"] = nash
     return record
 
 

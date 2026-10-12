@@ -233,3 +233,32 @@ def test_selection_validation_and_threads():
     with pytest.raises(ValueError):
         monte_carlo_tree_search(state, iterations=10, selection="exp3", threads=2)
     assert monte_carlo_tree_search(state, iterations=500, threads=2).total_visits > 0
+
+
+def test_return_joint_matrix_is_consistent():
+    plain = monte_carlo_tree_search(make_state(), iterations=500)
+    assert plain.joint is None
+    for mode in ("ucb1", "exp3", "rm"):
+        result = monte_carlo_tree_search(
+            make_state(), iterations=4000, selection=mode, return_joint=True
+        )
+        k1, k2 = len(result.side_one), len(result.side_two)
+        assert result.joint
+        visited = sum(v for _, _, v, _ in result.joint)
+        assert result.total_visits - 1 <= visited <= result.total_visits
+        for i, j, visits, mean in result.joint:
+            assert 0 <= i < k1 and 0 <= j < k2 and visits > 0
+            assert 0.0 <= mean <= 1.0
+        for i, option in enumerate(result.side_one):  # rows sum to the option visits
+            assert sum(v for a, _, v, _ in result.joint if a == i) == option.visits
+        for j, option in enumerate(result.side_two):  # columns too
+            assert sum(v for _, b, v, _ in result.joint if b == j) == option.visits
+        # the visit-weighted mean of the cells is side one's root score
+        total = sum(v * m for _, _, v, m in result.joint)
+        by_option = sum(o.total_score for o in result.side_one)
+        assert total == pytest.approx(by_option, rel=1e-3, abs=1e-2)
+
+
+def test_return_joint_rejects_threads():
+    with pytest.raises(ValueError):
+        monte_carlo_tree_search(make_state(), iterations=10, threads=2, return_joint=True)

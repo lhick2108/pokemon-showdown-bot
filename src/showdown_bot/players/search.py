@@ -12,7 +12,9 @@ Each turn the player
    the plain average is the probability-weighted one); and
 5. selects a move: ``mode="mixed"`` (default, Foul Play's rule) samples
    proportionally among moves whose total is at least 75% of the best;
-   ``mode="argmax"`` takes the best move.
+   ``mode="argmax"`` takes the best move; ``mode="nash"`` solves each world's root
+   joint-action matrix game and samples from the visit-weighted average of our
+   equilibrium strategies (see docs/selection.md).
 
 Defaults equal Foul Play's: 100 ms per world, ``parallelism`` pool processes,
 K = 2 x parallelism worlds (4 x parallelism worlds at half the time when at most
@@ -27,7 +29,10 @@ only poke-env options), these environment variables:
     SHOWDOWN_SEARCH_PARALLELISM  pool processes (default 1)
     SHOWDOWN_SEARCH_WORLDS       fixed world count (default 2 x parallelism, 4x early)
     SHOWDOWN_SEARCH_THREADS      engine threads per world (default 1)
-    SHOWDOWN_SEARCH_MODE         "mixed" (default) or "argmax"
+    SHOWDOWN_SEARCH_MODE         "mixed" (default), "argmax" or "nash" (needs threads == 1)
+    SHOWDOWN_SEARCH_NASH_PSEUDOCOUNT
+                                 shrinkage pseudo-count c >= 0 for the joint matrix (default 5)
+    SHOWDOWN_SEARCH_NASH_FLOOR   drop Nash actions below this share, in [0, 1) (default 0.03)
     SHOWDOWN_SEARCH_SELECTION    engine tree-policy: "ucb1" (default), "exp3" or "rm";
                                  exp3/rm need threads == 1 (see docs/selection.md)
     SHOWDOWN_SEARCH_SELECTION_GAMMA
@@ -70,7 +75,7 @@ from poke_env.player import Player
 from poke_env.ps_client import AccountConfiguration
 from poke_env.player.battle_order import BattleOrder, DefaultBattleOrder
 
-from showdown_bot import engine_state, recorder as recorder_module
+from showdown_bot import engine_state, nash as nash_module, recorder as recorder_module
 from showdown_bot.players import _worker
 from showdown_bot.recorder import GameRecorder
 from showdown_bot.sets import OpponentModel, OpponentModelPlayerMixin, RandbatsData
@@ -82,6 +87,11 @@ _DEFAULT_CACHE_DIR = _REPO_ROOT / ".cache" / "randbats"
 
 MIXED = "mixed"
 ARGMAX = "argmax"
+NASH = "nash"
+MODES = (MIXED, ARGMAX, NASH)
+NASH_PSEUDOCOUNT_ENV = "SHOWDOWN_SEARCH_NASH_PSEUDOCOUNT"
+NASH_FLOOR_ENV = "SHOWDOWN_SEARCH_NASH_FLOOR"
+DEFAULT_NASH_FLOOR = 0.03
 MIXED_THRESHOLD = 0.75
 EVALUATOR_ENV = "SHOWDOWN_SEARCH_EVALUATOR"
 EVALUATOR_SCALE_ENV = "SHOWDOWN_SEARCH_EVALUATOR_SCALE"
@@ -135,6 +145,22 @@ def _env_gamma(name: str, default: float = 0.1) -> float:
     return value
 
 
+def _env_float(name: str, default: float, low: float, high: float) -> float:
+    """A float in ``[low, high)`` from the environment (``default`` if unset or bad)."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("Ignoring non-numeric %s=%r", name, raw)
+        return default
+    if not (math.isfinite(value) and low <= value < high):
+        logger.warning("Ignoring %s=%r (need %g <= value < %g)", name, raw, low, high)
+        return default
+    return value
+
+
 @dataclass(frozen=True)
 class SearchConfig:
     """Compute and selection settings (defaults equal Foul Play's)."""
@@ -149,11 +175,13 @@ class SearchConfig:
     evaluator_scale: float = 1.0  # learned leaf scale k (score = sigmoid(k * dz))
     selection: str = "ucb1"  # engine tree policy: ucb1 | exp3 | rm
     selection_gamma: float = 0.1  # exploration rate for exp3 / rm
+    nash_pseudocount: float = nash_module.DEFAULT_PSEUDOCOUNT  # mode="nash": cell shrinkage c
+    nash_floor: float = DEFAULT_NASH_FLOOR  # mode="nash": drop actions below this share
 
     @classmethod
     def from_env(cls) -> SearchConfig:
         mode = os.environ.get("SHOWDOWN_SEARCH_MODE", MIXED).strip().lower() or MIXED
-        if mode not in (MIXED, ARGMAX):
+        if mode not in MODES:
             logger.warning("Unknown SHOWDOWN_SEARCH_MODE=%r; using %s", mode, MIXED)
             mode = MIXED
         selection = os.environ.get(SELECTION_ENV, "ucb1").strip().lower() or "ucb1"
@@ -170,6 +198,10 @@ class SearchConfig:
             evaluator_scale=_env_scale(EVALUATOR_SCALE_ENV),
             selection=selection,
             selection_gamma=_env_gamma(SELECTION_GAMMA_ENV),
+            nash_pseudocount=_env_float(
+                NASH_PSEUDOCOUNT_ENV, nash_module.DEFAULT_PSEUDOCOUNT, 0.0, math.inf
+            ),
+            nash_floor=_env_float(NASH_FLOOR_ENV, DEFAULT_NASH_FLOOR, 0.0, 1.0),
         )
 
     def plan(self, early: bool) -> tuple[int, int]:
@@ -311,7 +343,7 @@ def aggregate_policy(results: list[WorldResult]) -> dict[str, float]:
     weight = 1.0 / len(usable)
     for result in usable:
         total, options = result[0], result[1]
-        if len(result) > 2:
+        if len(result) > 2 and result[2] is not None:
             shares = [float(s) for s in result[2]]
         else:
             visits_sum = sum(visits for _, visits, _ in options) or total
@@ -319,6 +351,51 @@ def aggregate_policy(results: list[WorldResult]) -> dict[str, float]:
         for (choice, _visits, _score), share in zip(options, shares):
             policy[choice] = policy.get(choice, 0.0) + weight * share
     return policy
+
+
+def nash_world(
+    result: WorldResult, pseudocount: float
+) -> tuple[dict[str, float], float, float] | None:
+    """Solve one world's root matrix game: ``(our strategy by choice, value, exploitability)``.
+
+    ``None`` when the world carries no joint matrix. The matrix is built per world
+    (the opponent's option set differs between sampled worlds, so matrices from
+    different worlds are never averaged).
+    """
+    if len(result) < 4 or result[3] is None or not result[1]:
+        return None
+    k2, cells = result[3]
+    options = result[1]
+    matrix = nash_module.shrunk_matrix(len(options), int(k2), cells, pseudocount)
+    solution = nash_module.solve_matrix_game(matrix)
+    strategy: dict[str, float] = {}
+    for (choice, _visits, _score), p in zip(options, solution.row):
+        strategy[choice] = strategy.get(choice, 0.0) + float(p)
+    return strategy, solution.value, solution.exploitability
+
+
+def aggregate_nash(
+    results: list[WorldResult], pseudocount: float, floor: float = 0.0
+) -> tuple[dict[str, float], list[dict[str, Any] | None]]:
+    """Nash policy over worlds, plus a per-world record (aligned with ``results``).
+
+    Each world's equilibrium strategy for us is averaged with weight = that world's
+    total root visits, then choices below ``floor`` are dropped and the rest
+    renormalised. Empty policy if no world carried a joint matrix.
+    """
+    weighted: list[tuple[float, dict[str, float]]] = []
+    records: list[dict[str, Any] | None] = []
+    for result in results:
+        solved = nash_world(result, pseudocount) if result[0] > 0 else None
+        if solved is None:
+            records.append(None)
+            continue
+        strategy, value, exploitability = solved
+        weighted.append((float(result[0]), strategy))
+        records.append(
+            {"strategy": strategy, "value": value, "exploitability": exploitability}
+        )
+    return nash_module.aggregate_strategies(weighted, floor), records
 
 
 def select_choice(
@@ -330,13 +407,18 @@ def select_choice(
     """Pick a choice from an aggregated policy.
 
     ``mixed``: sample proportionally among choices whose mass is at least
-    ``threshold`` x the best choice's. ``argmax``: the best choice.
+    ``threshold`` x the best choice's. ``argmax``: the best choice. ``nash``: sample
+    proportionally from the whole policy (it is already a mixed strategy).
     """
     if not policy:
         return None
     ranked = sorted(policy.items(), key=lambda item: item[1], reverse=True)
     if mode == ARGMAX:
         return ranked[0][0]
+    if mode == NASH:
+        if ranked[0][1] <= 0:
+            return ranked[0][0]
+        return rng.choices([c for c, _ in ranked], weights=[m for _, m in ranked])[0]
     best = ranked[0][1]
     considered = [item for item in ranked if item[1] >= best * threshold]
     return rng.choices(
@@ -365,6 +447,9 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         evaluator_scale: float | None = None,
         selection: str | None = None,
         selection_gamma: float | None = None,
+        mode: str | None = None,
+        nash_pseudocount: float | None = None,
+        nash_floor: float | None = None,
         **kwargs: Any,
     ):
         data = data or (opponent_model.data if opponent_model else default_randbats_data())
@@ -387,6 +472,20 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             self.config = dataclasses.replace(self.config, selection=str(selection).lower())
         if selection_gamma is not None:
             self.config = dataclasses.replace(self.config, selection_gamma=float(selection_gamma))
+        if mode is not None:
+            self.config = dataclasses.replace(self.config, mode=str(mode).lower())
+        if nash_pseudocount is not None:
+            self.config = dataclasses.replace(self.config, nash_pseudocount=float(nash_pseudocount))
+        if nash_floor is not None:
+            self.config = dataclasses.replace(self.config, nash_floor=float(nash_floor))
+        if self.config.mode not in MODES:
+            raise ValueError(f"mode must be one of {MODES}, got {self.config.mode!r}")
+        if self.config.mode == NASH and self.config.threads > 1:
+            raise ValueError("mode nash needs threads == 1 (the shared-tree search has no joint matrix)")
+        if not (math.isfinite(self.config.nash_pseudocount) and self.config.nash_pseudocount >= 0):
+            raise ValueError(f"nash_pseudocount must be finite and >= 0, got {self.config.nash_pseudocount}")
+        if not (math.isfinite(self.config.nash_floor) and 0 <= self.config.nash_floor < 1):
+            raise ValueError(f"nash_floor must be in [0, 1), got {self.config.nash_floor}")
         if self.config.selection not in SELECTIONS:
             raise ValueError(f"selection must be one of {SELECTIONS}, got {self.config.selection!r}")
         if not (math.isfinite(self.config.selection_gamma) and 0 < self.config.selection_gamma <= 1):
@@ -491,18 +590,34 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         self.stats.searched += 1
         if not results:
             raise RuntimeError("every world failed")
-        policy = aggregate_policy(results)
+        mode = self.config.mode
+        nash_records: list[dict[str, Any] | None] = []
+        policy: dict[str, float] = {}
+        if mode == NASH:
+            policy, nash_records = aggregate_nash(
+                results, self.config.nash_pseudocount, self.config.nash_floor
+            )
+            if not policy:  # no world carried a joint matrix: use the visit-share rule
+                logger.warning("No Nash policy in %s; using the mixed rule", battle.battle_tag)
+                mode = MIXED
+        if not policy:
+            policy = aggregate_policy(results)
         self.last_policy = policy
         assert built is not None
-        order = self._order_from_policy(policy, built, battle)
+        order = self._order_from_policy(policy, built, battle, mode)
         if recording:
             self._record_decision(
-                battle, order, policy, n_worlds, time_ms, started, truth_state, truth_status
+                battle, order, policy, n_worlds, time_ms, started, truth_state, truth_status,
+                nash_records if self.config.mode == NASH else None,
             )
         return order
 
     def _order_from_policy(
-        self, policy: dict[str, float], built: engine_state.BuiltState, battle: Any
+        self,
+        policy: dict[str, float],
+        built: engine_state.BuiltState,
+        battle: Any,
+        mode: str | None = None,
     ) -> BattleOrder | None:
         legal_policy: dict[str, float] = {}
         orders: dict[str, BattleOrder] = {}
@@ -512,7 +627,7 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
                 legal_policy[choice] = mass
                 orders[choice] = order
         choice = select_choice(
-            legal_policy, self.config.mode, self._rng, self.config.mixed_threshold
+            legal_policy, mode or self.config.mode, self._rng, self.config.mixed_threshold
         )
         self.last_choice = choice
         return orders[choice] if choice is not None else None
@@ -542,6 +657,7 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
                 executor, _worker.search_world, state, time_ms, self.config.threads,
                 self.config.evaluator, self.config.evaluator_scale,
                 self.config.selection, self.config.selection_gamma,
+                self.config.mode == NASH,
             )
             for state in state_strings
         ]
@@ -606,6 +722,7 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         started: float,
         truth_state: str | None,
         truth_status: str,
+        nash_records: list[dict[str, Any] | None] | None = None,
     ) -> None:
         try:
             recorder = self._recorder
@@ -618,7 +735,12 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
                     battle_format=self.format,
                     config=asdict(self.config),
                 )
-            worlds = [recorder_module.world_record(s, r) for s, r in self._paired]
+            worlds = [
+                recorder_module.world_record(
+                    s, r, nash_records[k] if nash_records and k < len(nash_records) else None
+                )
+                for k, (s, r) in enumerate(self._paired)
+            ]
             recorder.add_decision(
                 tag,
                 self.username,
@@ -627,6 +749,7 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
                     "side": "one",  # our side is always engine side one in every state
                     "worlds": worlds,
                     "policy": policy,
+                    "nash": policy if nash_records is not None else None,
                     "chosen": self.last_choice,
                     "order": order.message if order is not None else None,
                     "compute": {

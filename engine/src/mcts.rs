@@ -14,6 +14,9 @@ pub struct Node {
     pub root: bool,
     pub parent: *mut Node,
     pub times_visited: u32,
+    // sum of rollout scores (side one's view, [0, 1]) over every visit of this node;
+    // for a chance child of the root this is the joint-action cell's score
+    pub total_score: f32,
 
     // represents the instructions & s1/s2 moves that led to this node from the parent
     pub instructions: StateInstructions,
@@ -37,6 +40,7 @@ impl Node {
             parent: std::ptr::null_mut(),
             instructions: StateInstructions::default(),
             times_visited: 0,
+            total_score: 0.0,
             s1_choice: 0,
             s2_choice: 0,
             s1_options: None,
@@ -187,6 +191,7 @@ impl Node {
 
     pub unsafe fn backpropagate(&mut self, score: f32, state: &mut State) {
         self.times_visited += 1;
+        self.total_score += score;
         if self.root {
             return;
         }
@@ -267,10 +272,23 @@ impl MctsSideResult {
     }
 }
 
+/// One cell of the root's joint-action matrix: option indices into `MctsResult::s1` /
+/// `s2`, the number of iterations that went through the cell (summed over its chance
+/// outcomes) and the mean rollout score there, from side one's view in [0, 1].
+#[derive(Clone, Debug)]
+pub struct JointCell {
+    pub s1: usize,
+    pub s2: usize,
+    pub visits: u32,
+    pub mean: f32,
+}
+
 pub struct MctsResult {
     pub s1: Vec<MctsSideResult>,
     pub s2: Vec<MctsSideResult>,
     pub iteration_count: u32,
+    /// Root joint matrix (only cells that were expanded); `Some` only when requested.
+    pub joint: Option<Vec<JointCell>>,
 }
 
 fn mcts_iteration(
@@ -376,6 +394,30 @@ pub fn perform_mcts_selecting(
     evaluator: Option<&Evaluator>,
     sel: &SelectionConfig,
 ) -> MctsResult {
+    perform_mcts_joint(
+        state,
+        side_one_options,
+        side_two_options,
+        max_time,
+        max_iterations,
+        evaluator,
+        sel,
+        false,
+    )
+}
+
+/// Like `perform_mcts_selecting`; with `want_joint` the result also carries the root's
+/// joint-action matrix (`MctsResult::joint`), read off the root's chance children.
+pub fn perform_mcts_joint(
+    state: &mut State,
+    side_one_options: Vec<MoveChoice>,
+    side_two_options: Vec<MoveChoice>,
+    max_time: Duration,
+    max_iterations: u32,
+    evaluator: Option<&Evaluator>,
+    sel: &SelectionConfig,
+    want_joint: bool,
+) -> MctsResult {
     let mut leaf_eval = LeafEval::new(evaluator);
     let mut root_node = Node::new();
     unsafe {
@@ -433,7 +475,30 @@ pub fn perform_mcts_selecting(
             .collect()
     };
 
+    let joint = if want_joint {
+        let root_ptr = &root_node as *const Node as usize;
+        let mut cells: Vec<JointCell> = children
+            .iter()
+            .filter(|((ptr, _, _), _)| *ptr == root_ptr)
+            .map(|((_, i, j), nodes)| {
+                let visits: u32 = nodes.iter().map(|n| n.times_visited).sum();
+                let total: f32 = nodes.iter().map(|n| n.total_score).sum();
+                JointCell {
+                    s1: *i,
+                    s2: *j,
+                    visits,
+                    mean: if visits > 0 { total / visits as f32 } else { 0.0 },
+                }
+            })
+            .collect();
+        cells.sort_by_key(|c| (c.s1, c.s2));
+        Some(cells)
+    } else {
+        None
+    };
+
     MctsResult {
+        joint,
         s1: side_results(root_node.s1_options.as_ref().unwrap(), &root_node.s1_stats),
         s2: side_results(root_node.s2_options.as_ref().unwrap(), &root_node.s2_stats),
         iteration_count: root_node.times_visited,
