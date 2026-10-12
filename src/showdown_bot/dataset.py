@@ -30,6 +30,8 @@ VALUE_BY_RESULT = {recorder.RESULT_WIN: 1.0, recorder.RESULT_TIE: 0.5, recorder.
 KIND_WORLD = "world"
 KIND_TRUTH = "truth"
 
+Q_SOURCES = ("decision", "world")
+
 
 @dataclass
 class Sample:
@@ -41,6 +43,9 @@ class Sample:
     battle_tag: str
     turn: int | None
     state: str | None = None  # the engine State string the features were computed from
+    # Search-based value estimate in [0, 1] from this sample's side's view (MCTS root
+    # avg_score; side two gets 1 - q). None when no searched world had visits.
+    search_value: float | None = None
 
     def as_tuple(self) -> tuple[list[float], float, dict[str, float] | None]:
         return self.features, self.value, self.policy
@@ -60,6 +65,20 @@ def value_target(result: str, side: int = 1) -> float:
     return value if side == 1 else 1.0 - value
 
 
+def _valid_score(world: dict[str, Any]) -> float | None:
+    """A world's ``avg_score`` unless it had no visits or no score recorded."""
+    score = world.get("avg_score")
+    if score is None or not world.get("total_visits"):
+        return None
+    return float(score)
+
+
+def decision_search_value(decision: dict[str, Any]) -> float | None:
+    """Mean ``avg_score`` over the decision's usable worlds (side one's view), or None."""
+    scores = [q for q in map(_valid_score, decision.get("worlds", ())) if q is not None]
+    return sum(scores) / len(scores) if scores else None
+
+
 def iter_samples(
     root: str | Path,
     *,
@@ -67,8 +86,17 @@ def iter_samples(
     worlds: bool = True,
     truth: bool = True,
     stats: LoadStats | None = None,
+    q_source: str = "decision",
 ) -> Iterator[Sample]:
-    """Yield one ``Sample`` per stored state (every searched world, plus truth)."""
+    """Yield one ``Sample`` per stored state (every searched world, plus truth).
+
+    ``Sample.search_value`` is the search's value estimate q: the decision's mean
+    world ``avg_score`` (``q_source="decision"``, also used for truth states), or
+    for world samples that world's own ``avg_score`` (``q_source="world"``, falling
+    back to None if that world has no usable score; truth stays the decision mean).
+    """
+    if q_source not in Q_SOURCES:
+        raise ValueError(f"q_source must be one of {Q_SOURCES}")
     import poke_engine
 
     stats = stats if stats is not None else LoadStats()
@@ -88,12 +116,16 @@ def iter_samples(
         tag = game["header"].get("battle_tag", "")
         for decision in game["decisions"]:
             policy = decision.get("policy") or None
-            states: list[tuple[str, str]] = []
+            q_mean = decision_search_value(decision)
+            states: list[tuple[str, str, float | None]] = []
             if worlds:
-                states += [(KIND_WORLD, w["state"]) for w in decision.get("worlds", ())]
+                states += [
+                    (KIND_WORLD, w["state"], _valid_score(w) if q_source == "world" else q_mean)
+                    for w in decision.get("worlds", ())
+                ]
             if truth and decision.get("truth"):
-                states.append((KIND_TRUTH, decision["truth"]["state"]))
-            for kind, state_string in states:
+                states.append((KIND_TRUTH, decision["truth"]["state"], q_mean))
+            for kind, state_string, q in states:
                 try:
                     state = poke_engine.State.from_string(state_string)
                 except (KeyboardInterrupt, SystemExit):
@@ -111,6 +143,7 @@ def iter_samples(
                         battle_tag=tag,
                         turn=decision.get("turn"),
                         state=state_string,
+                        search_value=None if q is None else (q if side == 1 else 1.0 - q),
                     )
 
 

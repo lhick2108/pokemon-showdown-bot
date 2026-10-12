@@ -24,6 +24,14 @@ Weighting (``--weighting``)
     within the train and val sets. Early stopping uses the weighted val BCE;
     the report also gives unweighted numbers.
 
+Value target (``--value-target``)
+    ``outcome`` (default): the game outcome z. ``search``: q, the MCTS root
+    average score recorded per decision (``dataset.Sample.search_value``).
+    ``blend``: ``(1 - L) * z + L * q`` with ``--blend-lambda L``. Positions
+    without a usable q fall back to z. ``--q-source decision|world`` picks the
+    decision's mean over worlds (default) or each world's own score. Metrics are
+    reported against the training target and against the pure outcome z.
+
 Device: cuda when available, else cpu (``--device`` overrides).
 """
 
@@ -46,6 +54,7 @@ from showdown_bot import dataset
 
 WEIGHTINGS = ("sqrt", "game", "none")
 STATE_CHOICES = ("both", "truth", "worlds")
+VALUE_TARGETS = ("outcome", "search", "blend")
 N_BUCKETS = 10
 
 
@@ -61,6 +70,15 @@ class Data:
     w: np.ndarray  # (N,) float32 sample weights, mean 1
     tags: list[str]  # battle_tag per sample
     states: list[str | None]  # State string per sample (for export verification)
+    # Search value q per sample (NaN = unavailable) and the training target built
+    # from y and q. ``y`` is always the pure outcome; ``target`` None means y.
+    q: np.ndarray | None = None
+    target: np.ndarray | None = None
+
+    @property
+    def y_fit(self) -> np.ndarray:
+        """The labels the loss is computed against."""
+        return self.y if self.target is None else self.target
 
     def __len__(self) -> int:
         return len(self.y)
@@ -71,6 +89,8 @@ class Data:
         return Data(
             self.x[idx], self.y[idx], (w / mean).astype(np.float32),
             [self.tags[i] for i in idx], [self.states[i] for i in idx],
+            None if self.q is None else self.q[idx],
+            None if self.target is None else self.target[idx],
         )
 
 
@@ -87,17 +107,44 @@ def sample_weights(tags: list[str], weighting: str) -> np.ndarray:
     return (w / w.mean()).astype(np.float32)
 
 
-def load_data(paths: list[Path], states: str = "both", weighting: str = "sqrt") -> Data:
+def make_targets(
+    y: np.ndarray, q: np.ndarray | None, mode: str = "outcome", blend_lambda: float = 0.5
+) -> tuple[np.ndarray, int]:
+    """Training labels from outcome ``y`` and search value ``q`` (NaN = missing).
+
+    ``outcome`` returns ``y`` itself; ``search`` returns q; ``blend`` returns
+    ``(1 - L) * y + L * q``. Positions with missing q use ``y``. Returns
+    ``(target, n_fallback)``.
+    """
+    if mode not in VALUE_TARGETS:
+        raise ValueError(f"unknown value target {mode!r}")
+    if mode == "outcome" or q is None:
+        return y, 0
+    missing = np.isnan(q)
+    lam = 1.0 if mode == "search" else float(blend_lambda)
+    target = np.where(missing, y, (1 - lam) * y + lam * np.nan_to_num(q))
+    return target.astype(np.float32), int(missing.sum())
+
+
+def load_data(
+    paths: list[Path],
+    states: str = "both",
+    weighting: str = "sqrt",
+    value_target: str = "outcome",
+    blend_lambda: float = 0.5,
+    q_source: str = "decision",
+) -> Data:
     """Load every sample of the given run directories into memory."""
-    feats, ys, tags, strings = [], [], [], []
+    feats, ys, qs, tags, strings = [], [], [], [], []
     load = dataset.LoadStats()
     for path in paths:
         for s in dataset.iter_samples(
             path, sides=(1,), worlds=states in ("both", "worlds"),
-            truth=states in ("both", "truth"), stats=load,
+            truth=states in ("both", "truth"), stats=load, q_source=q_source,
         ):
             feats.append(s.features)
             ys.append(s.value)
+            qs.append(np.nan if s.search_value is None else s.search_value)
             tags.append(s.battle_tag)
             strings.append(s.state)
     if load.bad_states:
@@ -106,7 +153,15 @@ def load_data(paths: list[Path], states: str = "both", weighting: str = "sqrt") 
         raise SystemExit("no samples found in " + ", ".join(map(str, paths)))
     x = np.asarray(feats, dtype=np.float32)
     y = np.asarray(ys, dtype=np.float32)
-    return Data(x, y, sample_weights(tags, weighting), tags, strings)
+    q = np.asarray(qs, dtype=np.float32)
+    target, n_fallback = make_targets(y, q, value_target, blend_lambda)
+    if value_target != "outcome":
+        print(f"value target {value_target}: {n_fallback} of {len(y)} samples have no search "
+              f"value and fall back to the outcome")
+    return Data(
+        x, y, sample_weights(tags, weighting), tags, strings, q,
+        None if value_target == "outcome" else target,
+    )
 
 
 def split_by_battle(
@@ -219,8 +274,8 @@ def fit(
     """AdamW on weighted BCE; early stopping on weighted val BCE (best weights restored)."""
     torch.manual_seed(seed)
     model.to(device)
-    xt, yt, wt = (torch.from_numpy(a).to(device) for a in (train.x, train.y, train.w))
-    xv, yv, wv = (torch.from_numpy(a).to(device) for a in (val.x, val.y, val.w))
+    xt, yt, wt = (torch.from_numpy(a).to(device) for a in (train.x, train.y_fit, train.w))
+    xv, yv, wv = (torch.from_numpy(a).to(device) for a in (val.x, val.y_fit, val.w))
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     gen = torch.Generator().manual_seed(seed)
     best_loss, best_state, best_epoch, stale = float("inf"), None, 0, 0
@@ -310,6 +365,16 @@ def verify_export(model: nn.Module, path: Path, states: list[str], tol: float = 
 # ---------------------------------------------------------------------------
 
 
+def q_z_correlation(data: Data) -> tuple[float, int]:
+    """Pearson correlation of search value q and outcome z over positions with a q."""
+    if data.q is None:
+        return float("nan"), 0
+    m = ~np.isnan(data.q)
+    if m.sum() < 2 or data.q[m].std() == 0 or data.y[m].std() == 0:
+        return float("nan"), int(m.sum())
+    return float(np.corrcoef(data.q[m], data.y[m])[0, 1]), int(m.sum())
+
+
 def report(model: nn.Module, train: Data, val: Data, device: torch.device) -> dict[str, float]:
     model.to(device)
     t = {k: torch.from_numpy(getattr(train, k)).to(device) for k in ("x", "y", "w")}
@@ -325,9 +390,16 @@ def report(model: nn.Module, train: Data, val: Data, device: torch.device) -> di
             val.y, np.ones_like(val.w), train.y, np.ones_like(train.w)
         ),
     }
+    soft = train.target is not None
+    if soft:
+        out["train_target_bce_w"] = weighted_bce(lt, torch.from_numpy(train.y_fit).to(device), t["w"])
+        out["val_target_bce_w"] = weighted_bce(lv, torch.from_numpy(val.y_fit).to(device), v["w"])
+        out["base_val_target_bce_w"] = constant_baseline_bce(
+            val.y_fit, val.w, train.y_fit, train.w)
+    out["val_qz_corr"], n_q = q_z_correlation(val)
     lv_np = lv.cpu().numpy()
     out["val_acc"], n_dec = decisive_accuracy(lv_np, val.y)
-    print("\n=== metrics (best epoch) ===")
+    print("\n=== metrics (best epoch); BCE below is against the pure game outcome z ===")
     print(f"train BCE   weighted {out['train_bce_w']:.4f}   unweighted {out['train_bce']:.4f}")
     print(f"val BCE     weighted {out['val_bce_w']:.4f}   unweighted {out['val_bce']:.4f}")
     print(f"constant-predictor val BCE (train mean)  weighted {out['base_val_bce_w']:.4f}   "
@@ -336,6 +408,12 @@ def report(model: nn.Module, train: Data, val: Data, device: torch.device) -> di
           f"weighted {out['base_val_bce_w'] - out['val_bce_w']:+.4f}  "
           f"unweighted {out['base_val_bce'] - out['val_bce']:+.4f}")
     print(f"val accuracy on decisive positions: {out['val_acc']:.3f}  ({n_dec} positions)")
+    if soft:
+        print(f"training-target BCE  train weighted {out['train_target_bce_w']:.4f}   "
+              f"val weighted {out['val_target_bce_w']:.4f}   (constant predictor "
+              f"{out['base_val_target_bce_w']:.4f}; soft targets have entropy > 0, so "
+              f"compare to the constant, not 0)")
+    print(f"val q-z correlation: {out['val_qz_corr']:.3f}  ({n_q} positions with a search value)")
     print("calibration on val (predicted P(win) bucket: n, mean predicted, observed outcome)")
     for lo, hi, n, mp, mo in calibration_buckets(lv_np, val.y):
         if n:
@@ -352,6 +430,12 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--out", type=Path, required=True, help="output .pev path")
     p.add_argument("--states", choices=STATE_CHOICES, default="both")
     p.add_argument("--weighting", choices=WEIGHTINGS, default="sqrt")
+    p.add_argument("--value-target", choices=VALUE_TARGETS, default="outcome",
+                   help="outcome z (default), search value q, or blend (1-L)*z + L*q")
+    p.add_argument("--blend-lambda", type=float, default=0.5,
+                   help="weight L of q in the blend target (default 0.5)")
+    p.add_argument("--q-source", choices=dataset.Q_SOURCES, default="decision",
+                   help="q for world samples: decision mean (default) or the world's own score")
     p.add_argument("--val-fraction", type=float, default=0.1)
     p.add_argument("--epochs", type=int, default=60)
     p.add_argument("--patience", type=int, default=6)
@@ -375,7 +459,16 @@ def main(argv=None) -> int:
     torch.manual_seed(args.seed)
     device = select_device(args.device)
     print(f"device: {device}")
-    data = load_data(args.data, args.states, args.weighting)
+    if not 0.0 <= args.blend_lambda <= 1.0:
+        print("--blend-lambda must be in [0, 1]", file=sys.stderr)
+        return 2
+    target_desc = args.value_target + (
+        f" (lambda={args.blend_lambda}, q-source={args.q_source})" if args.value_target == "blend"
+        else f" (q-source={args.q_source})" if args.value_target == "search" else "")
+    print(f"value target: {target_desc}")
+    data = load_data(
+        args.data, args.states, args.weighting, args.value_target, args.blend_lambda, args.q_source
+    )
     tr_idx, va_idx = split_by_battle(data.tags, args.val_fraction, args.seed)
     if len(va_idx) == 0 or len(tr_idx) == 0:
         print("need at least two battles for a train/val split", file=sys.stderr)
@@ -400,6 +493,7 @@ def main(argv=None) -> int:
     worst = verify_export(result.model, args.out, check)
     print(f"\nexported {args.out}  ({args.out.stat().st_size} bytes); verified on {len(check)} "
           f"val states, max |evaluate - torch logit| = {worst:.2e}")
+    print(f"value target: {target_desc}")
     print(f"total time {time.perf_counter() - started:.1f} s")
     return 0
 
