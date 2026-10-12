@@ -1,0 +1,121 @@
+//! Timing harness for the learned leaf evaluator.
+//! usage: cargo run --release --example bench_net -- <states.txt> <model.pev> [iters_per_state] [reps]
+use poke_engine::engine::evaluate::evaluate;
+use poke_engine::features::{features_into, FEATURE_LEN};
+use poke_engine::learned::{Evaluator, Scratch};
+use poke_engine::mcts::perform_mcts_with;
+use poke_engine::state::{SideReference, State};
+use std::hint::black_box;
+use std::time::{Duration, Instant};
+
+fn main() {
+    let a: Vec<String> = std::env::args().collect();
+    let text = std::fs::read_to_string(&a[1]).unwrap();
+    let ev = if a[2].starts_with("zero") {
+        // net compute with w2 = 0 and stock_coef = 0.0125: identical search tree to stock,
+        // so the it/s ratio isolates the pure evaluation overhead
+        let h: usize = a[2][4..].parse().unwrap();
+        let w1: Vec<f32> = (0..h * FEATURE_LEN).map(|i| ((i * 7919) % 1000) as f32 / 1000.0 - 0.5).collect();
+        Evaluator::mlp(h, w1, vec![0.1; h], vec![0.0; h], 0.0)
+            .unwrap()
+            .with_stock_coef(0.0125)
+            .unwrap()
+    } else {
+        Evaluator::from_bytes(&std::fs::read(&a[2]).unwrap()).unwrap()
+    };
+    let iters: u32 = a.get(3).map(|s| s.parse().unwrap()).unwrap_or(20000);
+    let reps: usize = a.get(4).map(|s| s.parse().unwrap()).unwrap_or(3);
+    let states: Vec<State> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(State::deserialize)
+        .collect();
+    println!(
+        "{} states, model hidden={} residual={}",
+        states.len(),
+        ev.hidden_size(),
+        ev.is_residual()
+    );
+
+    {
+        let mut sc2 = Scratch::new();
+        let mut md = 0.0f32;
+        for s in &states {
+            let mut sc = Scratch::new(); // a Scratch caches per-team stats: one per state
+            md = md.max((ev.logit(s, &mut sc) - ev.logit_reference(s, &mut sc2)).abs());
+        }
+        println!("max |fast - reference| over states: {md:e}");
+    }
+    // micro: per-call cost
+    let n = 200;
+    let mut buf = vec![0.0f32; FEATURE_LEN];
+    let mut scratch = Scratch::new();
+    let mut h = Vec::new();
+    let micro = |name: &str, f: &mut dyn FnMut(&State) -> f32| {
+        let mut best = f64::MAX;
+        for _ in 0..7 {
+            let t = Instant::now();
+            let mut acc = 0.0;
+            // same state repeatedly (as inside one MCTS search) so the per-Scratch cache hits
+            for s in &states {
+                for _ in 0..n {
+                    acc += f(s);
+                }
+            }
+            black_box(acc);
+            best = best.min(t.elapsed().as_nanos() as f64 / (n * states.len()) as f64);
+        }
+        println!("  {name:<14} {best:8.1} ns/call (min of 7)");
+    };
+    micro("stock evaluate", &mut |s| evaluate(black_box(s)));
+    let mut buf2 = buf.clone();
+    micro("features_into", &mut |s| {
+        features_into(black_box(s), SideReference::SideOne, &mut buf2);
+        buf2[0]
+    });
+    features_into(&states[0], SideReference::SideOne, &mut buf);
+    micro("mlp(feats)", &mut |_| {
+        ev.logit_from_features(black_box(&buf), &mut h)
+    });
+    micro("ev.logit_ref", &mut |s| ev.logit_reference(black_box(s), &mut scratch));
+    micro("ev.logit", &mut |s| ev.logit(black_box(s), &mut scratch));
+
+    // MCTS it/s: per state, interleave stock / net `reps` times and keep the fastest of each
+    let mut tot = [0f64; 2];
+    let mut its_tot = [0u64; 2];
+    for s in &states {
+        let mut best = [f64::MAX; 2];
+        let mut its = [0u64; 2];
+        for _ in 0..reps {
+            for k in 0..2 {
+                let mut st = s.clone();
+                let (o1, o2) = st.root_get_all_options();
+                let t = Instant::now();
+                let res = perform_mcts_with(
+                    &mut st,
+                    o1,
+                    o2,
+                    Duration::ZERO,
+                    iters,
+                    if k == 1 { Some(&ev) } else { None },
+                );
+                let dt = t.elapsed().as_secs_f64();
+                if dt < best[k] {
+                    best[k] = dt;
+                    its[k] = res.iteration_count as u64;
+                }
+            }
+        }
+        for k in 0..2 {
+            tot[k] += best[k];
+            its_tot[k] += its[k];
+        }
+    }
+    let best = [its_tot[0] as f64 / tot[0], its_tot[1] as f64 / tot[1]];
+    println!(
+        "best stock {:.0}  net {:.0}  ratio {:.3}",
+        best[0],
+        best[1],
+        best[1] / best[0]
+    );
+}

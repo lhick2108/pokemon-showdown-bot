@@ -39,9 +39,16 @@
 //! ```
 
 use crate::engine::evaluate::evaluate;
-use crate::features::{features_into, FEATURE_LEN, FEATURE_VERSION};
-use crate::state::{SideReference, State};
+use crate::engine::items::Items;
+use crate::engine::state::{PokemonVolatileStatus as V, Terrain, Weather};
+use crate::features::{
+    features_into, FEATURE_LEN, FEATURE_VERSION, PER_POKEMON, PER_SIDE, TEAM_SLOTS,
+};
+use crate::state::{PokemonStatus, PokemonType, Side, SideReference, State};
 use std::convert::TryInto;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_MODEL_ID: AtomicU64 = AtomicU64::new(1);
 
 pub const MAGIC: &[u8; 4] = b"PEVN";
 /// Format written for non-residual evaluators.
@@ -71,6 +78,10 @@ enum Model {
 #[derive(Debug, Clone)]
 pub struct Evaluator {
     model: Model,
+    /// Identifies the weights; keys the per-`Scratch` static-feature cache.
+    id: u64,
+    /// CPU supports AVX2 (runtime-detected; enables a wider build of the fast MLP path).
+    avx2: bool,
     /// If true the leaf score is `sigmoid(z_leaf - z_root)`, else `sigmoid(z_leaf)`.
     pub relative_to_root: bool,
     /// Multiplies the logit (gap) before the sigmoid. Default 1.0.
@@ -83,13 +94,44 @@ pub struct Evaluator {
 pub struct Scratch {
     feats: Vec<f32>,
     hidden: Vec<f32>,
+    /// Fast MLP path: model id the cache below belongs to (0 = none).
+    cache_model: u64,
+    /// Cache lines, `CACHE_WAYS` per `[side][team index][slot]` set: the
+    /// first-layer contribution of a Pokemon's slow-changing features (types,
+    /// tera type, terastallized, item flag, stats) for variant 0 = fainted and
+    /// 1 = alive (adds the `alive` row). `hidden` floats each.
+    cache_vals: Vec<f32>,
+    /// Key (types, tera, terastallized, item flag) each line was computed from;
+    /// `u32::MAX` = empty. The stats are NOT part of the key: they are fixed for
+    /// the life of a search, so a `Scratch` must not be reused for states whose
+    /// team stats differ without calling `Scratch::reset()` (every search and
+    /// `Evaluator::logit` wrapper in this crate uses a fresh one).
+    cache_keys: Vec<u32>,
+    /// 1 / max(maxhp, 1) per line (hp fraction = hp * recip, no division per leaf).
+    cache_recip: Vec<f32>,
+    /// Next way to evict, per set.
+    cache_next: Vec<u8>,
 }
 
+const CACHE_SETS: usize = 2 * TEAM_SLOTS * TEAM_SLOTS;
+/// 2 ways: a tera / item-loss toggle on the active Pokemon flips its key mid-search.
+const CACHE_WAYS: usize = 2;
+
 impl Scratch {
+    /// Forget cached per-Pokemon contributions (required if team stats changed).
+    pub fn reset(&mut self) {
+        self.cache_model = 0;
+    }
+
     pub fn new() -> Scratch {
         Scratch {
             feats: vec![0.0; FEATURE_LEN],
             hidden: Vec::new(),
+            cache_model: 0,
+            cache_vals: Vec::new(),
+            cache_keys: Vec::new(),
+            cache_next: Vec::new(),
+            cache_recip: Vec::new(),
         }
     }
 }
@@ -98,6 +140,260 @@ impl Default for Scratch {
     fn default() -> Self {
         Scratch::new()
     }
+}
+
+fn detect_avx2() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        is_x86_feature_detected!("avx2")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn mlp_avx2<const H: usize>(
+    ev: &Evaluator,
+    w1t: &[f32],
+    b1: &[f32],
+    w2: &[f32],
+    b2: f32,
+    state: &State,
+    scratch: &mut Scratch,
+) -> f32 {
+    ev.mlp_fast::<H>(w1t, b1, w2, b2, state, scratch)
+}
+
+#[inline(always)]
+fn add_row<const H: usize>(acc: &mut [f32; H], w1t: &[f32], feat: usize) {
+    let row: &[f32; H] = w1t[feat * H..feat * H + H].try_into().unwrap();
+    for j in 0..H {
+        acc[j] += row[j];
+    }
+}
+
+#[inline(always)]
+fn axpy_row<const H: usize>(acc: &mut [f32; H], x: f32, w1t: &[f32], feat: usize) {
+    let row: &[f32; H] = w1t[feat * H..feat * H + H].try_into().unwrap();
+    for j in 0..H {
+        acc[j] += x * row[j];
+    }
+}
+
+#[inline(always)]
+fn type_idx(t: PokemonType) -> Option<usize> {
+    let i = t as usize;
+    if i < 18 {
+        Some(i)
+    } else {
+        None
+    }
+}
+
+/// Slow-changing features of one Pokemon (types, tera, terastallized, item flag, stats),
+/// accumulated into `out`.
+fn static_contrib<const H: usize>(
+    out: &mut [f32; H],
+    w1t: &[f32],
+    base: usize,
+    p: &crate::state::Pokemon,
+) {
+    let t0 = type_idx(p.types.0);
+    let t1 = type_idx(p.types.1);
+    if let Some(t) = t0 {
+        add_row::<H>(out, w1t, base + 8 + t);
+    }
+    if let Some(t) = t1 {
+        if t0 != Some(t) {
+            add_row::<H>(out, w1t, base + 8 + t);
+        }
+    }
+    if let Some(t) = type_idx(p.tera_type) {
+        add_row::<H>(out, w1t, base + 26 + t);
+    }
+    if p.tera_type == PokemonType::STELLAR {
+        add_row::<H>(out, w1t, base + 44);
+    }
+    if p.terastallized {
+        add_row::<H>(out, w1t, base + 45);
+    }
+    if p.item != Items::NONE {
+        add_row::<H>(out, w1t, base + 46);
+    }
+    const STAT_SCALE: f32 = crate::features::STAT_SCALE;
+    axpy_row::<H>(out, p.maxhp as f32 / STAT_SCALE, w1t, base + 47);
+    axpy_row::<H>(out, p.attack as f32 / STAT_SCALE, w1t, base + 48);
+    axpy_row::<H>(out, p.defense as f32 / STAT_SCALE, w1t, base + 49);
+    axpy_row::<H>(out, p.special_attack as f32 / STAT_SCALE, w1t, base + 50);
+    axpy_row::<H>(out, p.special_defense as f32 / STAT_SCALE, w1t, base + 51);
+    axpy_row::<H>(out, p.speed as f32 / STAT_SCALE, w1t, base + 52);
+}
+
+#[inline(always)]
+fn mlp_side<const H: usize>(
+    acc: &mut [f32; H],
+    w1t: &[f32],
+    side: &Side,
+    side_no: usize,
+    sc: &mut Scratch,
+) {
+    let side_base = side_no * PER_SIDE;
+    let active = side.active_index as usize;
+    let mut alive_count = 0i8;
+    // slot order: the active Pokemon first, then the rest in team order
+    let mut order = [0usize; TEAM_SLOTS];
+    order[0] = active;
+    let mut n = 1;
+    for k in 0..TEAM_SLOTS {
+        if k != active {
+            order[n] = k;
+            n += 1;
+        }
+    }
+    {
+        for slot in 0..TEAM_SLOTS {
+            let k = order[slot];
+            let p = &side.pokemon.pkmn[k];
+            let base = side_base + slot * PER_POKEMON;
+            // slow-changing part, cached per (side, team index, slot) set
+            let key = (p.types.0 as u32)
+                | (p.types.1 as u32) << 8
+                | (p.tera_type as u32) << 16
+                | (p.terastallized as u32) << 24
+                | ((p.item != Items::NONE) as u32) << 25;
+            let set = (side_no * TEAM_SLOTS + k) * TEAM_SLOTS + slot;
+            let line0 = set * CACHE_WAYS;
+            let line = if sc.cache_keys[line0] == key {
+                line0
+            } else if sc.cache_keys[line0 + 1] == key {
+                line0 + 1
+            } else {
+                let way = sc.cache_next[set] as usize;
+                sc.cache_next[set] = (way ^ 1) as u8;
+                let line = line0 + way;
+                let mut v = [0.0f32; H];
+                static_contrib::<H>(&mut v, w1t, base, p);
+                let o = line * 2 * H;
+                sc.cache_vals[o..o + H].copy_from_slice(&v);
+                add_row::<H>(&mut v, w1t, base + 1);
+                sc.cache_vals[o + H..o + 2 * H].copy_from_slice(&v);
+                sc.cache_keys[line] = key;
+                sc.cache_recip[line] = 1.0 / p.maxhp.max(1) as f32;
+                line
+            };
+            let o = (line * 2 + (p.hp > 0) as usize) * H;
+            let vals: &[f32; H] = sc.cache_vals[o..o + H].try_into().unwrap();
+            for j in 0..H {
+                acc[j] += vals[j];
+            }
+            alive_count += (p.hp > 0) as i8;
+            // hp fraction (0 when fainted)
+            let hpf = (p.hp.max(0) as f32 * sc.cache_recip[line]).min(1.0);
+            axpy_row::<H>(acc, hpf, w1t, base);
+            if p.status != PokemonStatus::NONE {
+                add_row::<H>(acc, w1t, base + 1 + p.status as usize);
+            }
+        }
+    }
+
+    // side extras
+    let ex = side_base + TEAM_SLOTS * PER_POKEMON;
+    let boosts = [
+        side.attack_boost,
+        side.defense_boost,
+        side.special_attack_boost,
+        side.special_defense_boost,
+        side.speed_boost,
+        side.accuracy_boost,
+        side.evasion_boost,
+    ];
+    if boosts.iter().any(|b| *b != 0) {
+        for (i, b) in boosts.iter().enumerate() {
+            axpy_row::<H>(acc, *b as f32 / 6.0, w1t, ex + i);
+        }
+    }
+    let vs = &side.volatile_statuses;
+    if !vs.is_empty() {
+        const VOLS: [V; 16] = [
+            V::LEECHSEED,
+            V::SUBSTITUTE,
+            V::CONFUSION,
+            V::TAUNT,
+            V::ENCORE,
+            V::YAWN,
+            V::TORMENT,
+            V::DISABLE,
+            V::AQUARING,
+            V::INGRAIN,
+            V::CURSE,
+            V::NIGHTMARE,
+            V::SALTCURE,
+            V::SYRUPBOMB,
+            V::HEALBLOCK,
+            V::PARTIALLYTRAPPED,
+        ];
+        for (i, v) in VOLS.iter().enumerate() {
+            if vs.contains(v) {
+                add_row::<H>(acc, w1t, ex + 7 + i);
+            }
+        }
+        if vs.contains(&V::PERISH4)
+            || vs.contains(&V::PERISH3)
+            || vs.contains(&V::PERISH2)
+            || vs.contains(&V::PERISH1)
+        {
+            add_row::<H>(acc, w1t, ex + 7 + 16);
+        }
+        for (i, v) in [V::FOCUSENERGY, V::MUSTRECHARGE, V::LOCKEDMOVE].iter().enumerate() {
+            if vs.contains(v) {
+                add_row::<H>(acc, w1t, ex + 7 + 17 + i);
+            }
+        }
+    }
+    let c = &side.side_conditions;
+    let sc0 = ex + 27;
+    if c.stealth_rock > 0 {
+        add_row::<H>(acc, w1t, sc0);
+    }
+    if c.spikes != 0 {
+        axpy_row::<H>(acc, c.spikes as f32 / 3.0, w1t, sc0 + 1);
+    }
+    if c.toxic_spikes != 0 {
+        axpy_row::<H>(acc, c.toxic_spikes as f32 / 2.0, w1t, sc0 + 2);
+    }
+    for (i, v) in [
+        c.sticky_web,
+        c.reflect,
+        c.light_screen,
+        c.aurora_veil,
+        c.safeguard,
+        c.tailwind,
+        c.mist,
+        c.lucky_chant,
+        c.healing_wish,
+        c.lunar_dance,
+        c.protect,
+    ].iter().copied().enumerate()
+    {
+        if v > 0 {
+            add_row::<H>(acc, w1t, sc0 + 3 + i);
+        }
+    }
+    let misc = ex + 41;
+    if side.wish.0 > 0 {
+        add_row::<H>(acc, w1t, misc);
+    }
+    if side.future_sight.0 > 0 {
+        add_row::<H>(acc, w1t, misc + 1);
+    }
+    if side.force_switch {
+        add_row::<H>(acc, w1t, misc + 2);
+    }
+    axpy_row::<H>(acc, alive_count as f32 / TEAM_SLOTS as f32, w1t, misc + 3);
 }
 
 #[inline]
@@ -117,6 +413,8 @@ impl Evaluator {
         }
         Ok(Evaluator {
             model: Model::Linear { w, b },
+            id: NEXT_MODEL_ID.fetch_add(1, Ordering::Relaxed),
+            avx2: detect_avx2(),
             relative_to_root: true,
             leaf_scale: 1.0,
             stock_coef: None,
@@ -163,6 +461,8 @@ impl Evaluator {
                 w2,
                 b2,
             },
+            id: NEXT_MODEL_ID.fetch_add(1, Ordering::Relaxed),
+            avx2: detect_avx2(),
             relative_to_root: true,
             leaf_scale: 1.0,
             stock_coef: None,
@@ -253,13 +553,142 @@ impl Evaluator {
     }
 
     /// z = logit of P(side one wins) at `state`.
+    ///
+    /// MLPs with hidden size 8 / 16 / 32 / 64 take a sparse fast path that
+    /// accumulates first-layer weight rows straight from the state (no dense
+    /// feature vector); results match `logit_reference` to f32 rounding.
     pub fn logit(&self, state: &State, scratch: &mut Scratch) -> f32 {
+        let net = match &self.model {
+            Model::Mlp { hidden, w1t, b1, w2, b2 } => {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    if self.avx2 {
+                        // SAFETY: `avx2` is only set when the CPU reports AVX2.
+                        unsafe {
+                            match *hidden {
+                                8 => mlp_avx2::<8>(self, w1t, b1, w2, *b2, state, scratch),
+                                16 => mlp_avx2::<16>(self, w1t, b1, w2, *b2, state, scratch),
+                                32 => mlp_avx2::<32>(self, w1t, b1, w2, *b2, state, scratch),
+                                64 => mlp_avx2::<64>(self, w1t, b1, w2, *b2, state, scratch),
+                                _ => return self.logit_reference(state, scratch),
+                            }
+                        }
+                    } else {
+                        if !matches!(*hidden, 8 | 16 | 32 | 64) {
+                            return self.logit_reference(state, scratch);
+                        }
+                        self.mlp_dispatch(*hidden, w1t, b1, w2, *b2, state, scratch)
+                    }
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    if !matches!(*hidden, 8 | 16 | 32 | 64) {
+                        return self.logit_reference(state, scratch);
+                    }
+                    self.mlp_dispatch(*hidden, w1t, b1, w2, *b2, state, scratch)
+                }
+            }
+            Model::Linear { .. } => return self.logit_reference(state, scratch),
+        };
+        match self.stock_coef {
+            Some(c) => c * evaluate(state) + net,
+            None => net,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mlp_dispatch(
+        &self,
+        hidden: usize,
+        w1t: &[f32],
+        b1: &[f32],
+        w2: &[f32],
+        b2: f32,
+        state: &State,
+        scratch: &mut Scratch,
+    ) -> f32 {
+        match hidden {
+            8 => self.mlp_fast::<8>(w1t, b1, w2, b2, state, scratch),
+            16 => self.mlp_fast::<16>(w1t, b1, w2, b2, state, scratch),
+            32 => self.mlp_fast::<32>(w1t, b1, w2, b2, state, scratch),
+            64 => self.mlp_fast::<64>(w1t, b1, w2, b2, state, scratch),
+            _ => f32::NAN, // unreachable: callers only pass supported sizes
+        }
+    }
+
+    /// Reference implementation: dense `features_into` + `logit_from_features`.
+    pub fn logit_reference(&self, state: &State, scratch: &mut Scratch) -> f32 {
         features_into(state, SideReference::SideOne, &mut scratch.feats);
         let net = self.logit_from_features(&scratch.feats, &mut scratch.hidden);
         match self.stock_coef {
             Some(c) => c * evaluate(state) + net,
             None => net,
         }
+    }
+
+    #[inline(always)]
+    fn mlp_fast<const H: usize>(
+        &self,
+        w1t: &[f32],
+        b1: &[f32],
+        w2: &[f32],
+        b2: f32,
+        state: &State,
+        scratch: &mut Scratch,
+    ) -> f32 {
+        if scratch.cache_model != self.id || scratch.cache_vals.len() != CACHE_SETS * CACHE_WAYS * 2 * H {
+            scratch.cache_model = self.id;
+            scratch.cache_vals.clear();
+            scratch.cache_vals.resize(CACHE_SETS * CACHE_WAYS * 2 * H, 0.0);
+            scratch.cache_keys.clear();
+            scratch.cache_keys.resize(CACHE_SETS * CACHE_WAYS, u32::MAX);
+            scratch.cache_recip.clear();
+            scratch.cache_recip.resize(CACHE_SETS * CACHE_WAYS, 1.0);
+            scratch.cache_next.clear();
+            scratch.cache_next.resize(CACHE_SETS, 0);
+        }
+        let mut acc = [0.0f32; H];
+        acc.copy_from_slice(&b1[..H]);
+        mlp_side::<H>(&mut acc, w1t, &state.side_one, 0, scratch);
+        mlp_side::<H>(&mut acc, w1t, &state.side_two, 1, scratch);
+
+        let field = 2 * PER_SIDE;
+        let weather = state.get_weather();
+        for (k, w) in [
+            Weather::SUN,
+            Weather::RAIN,
+            Weather::SAND,
+            Weather::HAIL,
+            Weather::SNOW,
+            Weather::HARSHSUN,
+            Weather::HEAVYRAIN,
+        ].iter().copied().enumerate()
+        {
+            if weather == w {
+                add_row::<H>(&mut acc, w1t, field + k);
+            }
+        }
+        let terrain = state.get_terrain();
+        for (k, t) in [
+            Terrain::ELECTRICTERRAIN,
+            Terrain::PSYCHICTERRAIN,
+            Terrain::MISTYTERRAIN,
+            Terrain::GRASSYTERRAIN,
+        ].iter().copied().enumerate()
+        {
+            if terrain == t {
+                add_row::<H>(&mut acc, w1t, field + 7 + k);
+            }
+        }
+        if state.trick_room.active {
+            add_row::<H>(&mut acc, w1t, field + 11);
+        }
+
+        let mut z = b2;
+        for j in 0..H {
+            z += acc[j].max(0.0) * w2[j];
+        }
+        z
     }
 
     /// Leaf score in [0, 1] from the leaf and root logits.
@@ -665,6 +1094,96 @@ mod tests {
         let ev = Evaluator::linear(vec![0.0; FEATURE_LEN], 0.0).unwrap();
         for bad in [0.0f32, -1.0, f32::NAN, f32::INFINITY] {
             assert!(ev.clone().with_leaf_scale(bad).is_err(), "{bad}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod fast_path_tests {
+    use super::*;
+    use crate::engine::state::PokemonVolatileStatus as V;
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u32 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 33) as u32
+        }
+        fn unit(&mut self) -> f32 {
+            (self.next() % 20001) as f32 / 10000.0 - 1.0
+        }
+    }
+
+    fn random_mlp(h: usize, seed: u64) -> Evaluator {
+        let mut r = Lcg(seed);
+        let w1: Vec<f32> = (0..h * FEATURE_LEN).map(|_| r.unit() * 0.5).collect();
+        let b1: Vec<f32> = (0..h).map(|_| r.unit() * 0.3).collect();
+        let w2: Vec<f32> = (0..h).map(|_| r.unit()).collect();
+        Evaluator::mlp(h, w1, b1, w2, 0.1)
+            .unwrap()
+            .with_stock_coef(0.0125)
+            .unwrap()
+    }
+
+    #[test]
+    fn fast_path_matches_reference() {
+        let text = include_str!("../data/gen9randombattle.txt");
+        let states: Vec<State> = text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(State::deserialize)
+            .collect();
+        assert!(states.len() > 50);
+        let mut rng = Lcg(7);
+        for &h in &[8usize, 16, 32, 64] {
+            let ev = random_mlp(h, 100 + h as u64);
+            let mut maxdiff = 0.0f32;
+            for s0 in &states {
+                // one Scratch per team (stats fixed), reused over mutated variants so the cache is exercised
+                let mut scratch = Scratch::new();
+                for round in 0..4 {
+                    let mut s = s0.clone();
+                    if round > 0 {
+                        // mutate dynamic and static fields
+                        for side in [&mut s.side_one, &mut s.side_two] {
+                            for p in side.pokemon.pkmn.iter_mut() {
+                                if rng.next() % 3 == 0 {
+                                    p.hp = (rng.next() % (p.maxhp.max(1) as u32 + 1)) as i16;
+                                }
+                                if rng.next() % 5 == 0 {
+                                    p.status = unsafe { std::mem::transmute::<u8, PokemonStatus>((rng.next() % 7) as u8) };
+                                }
+                                if rng.next() % 7 == 0 {
+                                    p.terastallized = !p.terastallized;
+                                    p.types.1 = p.types.0;
+                                }
+                                if rng.next() % 9 == 0 {
+                                    p.item = Items::NONE;
+                                }
+                            }
+                            side.attack_boost = (rng.next() % 13) as i8 - 6;
+                            side.speed_boost = (rng.next() % 13) as i8 - 6;
+                            side.side_conditions.spikes = (rng.next() % 4) as i8;
+                            side.side_conditions.reflect = (rng.next() % 2) as i8;
+                            side.wish.0 = (rng.next() % 2) as i8;
+                            side.force_switch = rng.next() % 4 == 0;
+                            if rng.next() % 2 == 0 {
+                                side.volatile_statuses.insert(V::SUBSTITUTE);
+                                side.volatile_statuses.insert(V::PERISH2);
+                                side.volatile_statuses.insert(V::LOCKEDMOVE);
+                            }
+                            if rng.next() % 3 == 0 {
+                                side.active_index = unsafe { std::mem::transmute::<u8, crate::state::PokemonIndex>((rng.next() % 6) as u8) };
+                            }
+                        }
+                        s.trick_room.active = rng.next() % 4 == 0;
+                    }
+                    let a = ev.logit(&s, &mut scratch);
+                    let b = ev.logit_reference(&s, &mut Scratch::new());
+                    maxdiff = maxdiff.max((a - b).abs());
+                }
+            }
+            assert!(maxdiff <= 1e-5, "hidden {}: max abs diff {}", h, maxdiff);
         }
     }
 }
