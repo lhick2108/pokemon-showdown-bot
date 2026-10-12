@@ -28,7 +28,10 @@ Value target (``--value-target``)
     ``outcome`` (default): the game outcome z. ``search``: q, the MCTS root
     average score recorded per decision (``dataset.Sample.search_value``).
     ``blend``: ``(1 - L) * z + L * q`` with ``--blend-lambda L``. Positions
-    without a usable q fall back to z. ``--q-source decision|world`` picks the
+    without a usable q fall back to z. ``--q-kind absolute|relative`` (default absolute): the recorded score is
+    relative to the root evaluation, so absolute q adds it back,
+    ``sigmoid(scale*eval(state) + logit(avg_score))``, ``--q-eval-scale``
+    (0.0125). ``--q-source decision|world`` picks the
     decision's mean over worlds (default) or each world's own score. Metrics are
     reported against the training target and against the pure outcome z.
 
@@ -74,6 +77,7 @@ class Data:
     # from y and q. ``y`` is always the pure outcome; ``target`` None means y.
     q: np.ndarray | None = None
     target: np.ndarray | None = None
+    stock_eval: np.ndarray | None = None  # poke_engine.evaluate per sample (side one)
 
     @property
     def y_fit(self) -> np.ndarray:
@@ -91,6 +95,7 @@ class Data:
             [self.tags[i] for i in idx], [self.states[i] for i in idx],
             None if self.q is None else self.q[idx],
             None if self.target is None else self.target[idx],
+            None if self.stock_eval is None else self.stock_eval[idx],
         )
 
 
@@ -133,18 +138,23 @@ def load_data(
     value_target: str = "outcome",
     blend_lambda: float = 0.5,
     q_source: str = "decision",
+    q_kind: str = "absolute",
+    q_eval_scale: float = dataset.Q_EVAL_SCALE,
 ) -> Data:
     """Load every sample of the given run directories into memory."""
-    feats, ys, qs, tags, strings = [], [], [], [], []
+    feats, ys, qs, evals, tags, strings = [], [], [], [], [], []
     load = dataset.LoadStats()
     for path in paths:
         for s in dataset.iter_samples(
             path, sides=(1,), worlds=states in ("both", "worlds"),
             truth=states in ("both", "truth"), stats=load, q_source=q_source,
+            q_eval_scale=q_eval_scale,
         ):
             feats.append(s.features)
             ys.append(s.value)
-            qs.append(np.nan if s.search_value is None else s.search_value)
+            q = s.search_value_abs if q_kind == "absolute" else s.search_value
+            qs.append(np.nan if q is None else q)
+            evals.append(s.stock_eval)
             tags.append(s.battle_tag)
             strings.append(s.state)
     if load.bad_states:
@@ -161,6 +171,7 @@ def load_data(
     return Data(
         x, y, sample_weights(tags, weighting), tags, strings, q,
         None if value_target == "outcome" else target,
+        np.asarray(evals, dtype=np.float32),
     )
 
 
@@ -375,6 +386,34 @@ def q_z_correlation(data: Data) -> tuple[float, int]:
     return float(np.corrcoef(data.q[m], data.y[m])[0, 1]), int(m.sum())
 
 
+def stock_eval_logistic_bce(
+    train: Data, val: Data, scale: float = dataset.Q_EVAL_SCALE
+) -> tuple[float, float, float]:
+    """The "stock eval as predictor" baseline on pure outcome z.
+
+    Fits ``P = sigmoid(a * scale * eval + b)`` on train (weighted, Newton) and
+    returns ``(val weighted BCE, a, b)``. NaN when evaluations are unavailable.
+    """
+    if train.stock_eval is None or val.stock_eval is None:
+        return float("nan"), float("nan"), float("nan")
+    xt = np.clip(scale * train.stock_eval.astype(np.float64), -30, 30)
+    A = np.stack([xt, np.ones_like(xt)], 1)
+    w = train.w.astype(np.float64)
+    beta = np.zeros(2)
+    for _ in range(50):
+        p = 1 / (1 + np.exp(-A @ beta))
+        grad = A.T @ (w * (p - train.y))
+        hess = (A * (w * p * (1 - p))[:, None]).T @ A + 1e-9 * np.eye(2)
+        step = np.linalg.solve(hess, grad)
+        beta -= step
+        if np.abs(step).max() < 1e-9:
+            break
+    xv = np.clip(scale * val.stock_eval.astype(np.float64), -30, 30)
+    logits = torch.from_numpy(beta[0] * xv + beta[1]).float()
+    bce = weighted_bce(logits, torch.from_numpy(val.y), torch.from_numpy(val.w))
+    return bce, float(beta[0]), float(beta[1])
+
+
 def report(model: nn.Module, train: Data, val: Data, device: torch.device) -> dict[str, float]:
     model.to(device)
     t = {k: torch.from_numpy(getattr(train, k)).to(device) for k in ("x", "y", "w")}
@@ -396,6 +435,7 @@ def report(model: nn.Module, train: Data, val: Data, device: torch.device) -> di
         out["val_target_bce_w"] = weighted_bce(lv, torch.from_numpy(val.y_fit).to(device), v["w"])
         out["base_val_target_bce_w"] = constant_baseline_bce(
             val.y_fit, val.w, train.y_fit, train.w)
+    out["stock_logistic_val_bce_w"], slope, icpt = stock_eval_logistic_bce(train, val)
     out["val_qz_corr"], n_q = q_z_correlation(val)
     lv_np = lv.cpu().numpy()
     out["val_acc"], n_dec = decisive_accuracy(lv_np, val.y)
@@ -407,6 +447,8 @@ def report(model: nn.Module, train: Data, val: Data, device: torch.device) -> di
     print(f"val BCE improvement over constant: "
           f"weighted {out['base_val_bce_w'] - out['val_bce_w']:+.4f}  "
           f"unweighted {out['base_val_bce'] - out['val_bce']:+.4f}")
+    print(f"stock-eval logistic baseline val BCE weighted {out['stock_logistic_val_bce_w']:.4f}  "
+          f"(P = sigmoid({slope:.3f}*0.0125*eval + {icpt:.3f}); the net must beat this)")
     print(f"val accuracy on decisive positions: {out['val_acc']:.3f}  ({n_dec} positions)")
     if soft:
         print(f"training-target BCE  train weighted {out['train_target_bce_w']:.4f}   "
@@ -434,6 +476,10 @@ def _parser() -> argparse.ArgumentParser:
                    help="outcome z (default), search value q, or blend (1-L)*z + L*q")
     p.add_argument("--blend-lambda", type=float, default=0.5,
                    help="weight L of q in the blend target (default 0.5)")
+    p.add_argument("--q-kind", choices=dataset.Q_KINDS, default="absolute",
+                   help="q = root-relative avg_score, or absolute (adds back the root's stock eval)")
+    p.add_argument("--q-eval-scale", type=float, default=dataset.Q_EVAL_SCALE,
+                   help="coefficient of the stock eval in the search score (default 0.0125)")
     p.add_argument("--q-source", choices=dataset.Q_SOURCES, default="decision",
                    help="q for world samples: decision mean (default) or the world's own score")
     p.add_argument("--val-fraction", type=float, default=0.1)
@@ -463,11 +509,14 @@ def main(argv=None) -> int:
         print("--blend-lambda must be in [0, 1]", file=sys.stderr)
         return 2
     target_desc = args.value_target + (
-        f" (lambda={args.blend_lambda}, q-source={args.q_source})" if args.value_target == "blend"
-        else f" (q-source={args.q_source})" if args.value_target == "search" else "")
+        f" (lambda={args.blend_lambda}, q-kind={args.q_kind}, q-source={args.q_source}, "
+        f"q-eval-scale={args.q_eval_scale})" if args.value_target == "blend"
+        else f" (q-kind={args.q_kind}, q-source={args.q_source}, q-eval-scale={args.q_eval_scale})"
+        if args.value_target == "search" else "")
     print(f"value target: {target_desc}")
     data = load_data(
-        args.data, args.states, args.weighting, args.value_target, args.blend_lambda, args.q_source
+        args.data, args.states, args.weighting, args.value_target, args.blend_lambda, args.q_source,
+        args.q_kind, args.q_eval_scale,
     )
     tr_idx, va_idx = split_by_battle(data.tags, args.val_fraction, args.seed)
     if len(va_idx) == 0 or len(tr_idx) == 0:
