@@ -2,7 +2,7 @@ use crate::engine::generate_instructions::generate_instructions_from_move_pair;
 use crate::engine::state::MoveChoice;
 use crate::instruction::StateInstructions;
 use crate::learned::{Evaluator, LeafEval};
-use crate::selection::{SelectionConfig, SelectionMode, SideStats};
+use crate::selection::{SelectionConfig, NodeStats, SelectionMode, SideStats};
 use crate::state::State;
 use rand::prelude::*;
 use rand::rng;
@@ -29,8 +29,7 @@ pub struct Node {
     pub s2_options: Option<Vec<MoveNode>>,
 
     // Exp3 / regret-matching state; always None under ucb1
-    pub s1_stats: Option<Box<SideStats>>,
-    pub s2_stats: Option<Box<SideStats>>,
+    pub stats: Option<Box<NodeStats>>,
 }
 
 impl Node {
@@ -45,8 +44,7 @@ impl Node {
             s2_choice: 0,
             s1_options: None,
             s2_options: None,
-            s1_stats: None,
-            s2_stats: None,
+            stats: None,
         }
     }
     unsafe fn populate(&mut self, s1_options: Vec<MoveChoice>, s2_options: Vec<MoveChoice>) {
@@ -102,16 +100,13 @@ impl Node {
                 self.maximize_ucb_for_side(self.s2_options.as_ref().unwrap()),
             )
         } else {
-            if self.s1_stats.is_none() {
+            if self.stats.is_none() {
                 let k1 = self.s1_options.as_ref().unwrap().len();
                 let k2 = self.s2_options.as_ref().unwrap().len();
-                self.s1_stats = Some(Box::new(SideStats::new(sel, k1)));
-                self.s2_stats = Some(Box::new(SideStats::new(sel, k2)));
+                self.stats = Some(Box::new(NodeStats::new(sel, k1, k2)));
             }
-            (
-                self.s1_stats.as_mut().unwrap().select(rng),
-                self.s2_stats.as_mut().unwrap().select(rng),
-            )
+            let st = self.stats.as_mut().unwrap();
+            (st.s1.select(rng), st.s2.select(rng))
         };
         let key = (self as *mut Node as usize, s1_mc_index, s2_mc_index);
         match children.get_mut(&key) {
@@ -200,16 +195,16 @@ impl Node {
             &mut (*self.parent).s1_options.as_mut().unwrap()[self.s1_choice as usize];
         parent_s1_movenode.total_score += score;
         parent_s1_movenode.visits += 1;
-        if let Some(stats) = (*self.parent).s1_stats.as_mut() {
-            stats.update(self.s1_choice as usize, score as f64);
+        if let Some(stats) = (*self.parent).stats.as_mut() {
+            stats.s1.update(self.s1_choice as usize, score);
         }
 
         let parent_s2_movenode =
             &mut (*self.parent).s2_options.as_mut().unwrap()[self.s2_choice as usize];
         parent_s2_movenode.total_score += 1.0 - score;
         parent_s2_movenode.visits += 1;
-        if let Some(stats) = (*self.parent).s2_stats.as_mut() {
-            stats.update(self.s2_choice as usize, (1.0 - score) as f64);
+        if let Some(stats) = (*self.parent).stats.as_mut() {
+            stats.s2.update(self.s2_choice as usize, 1.0 - score);
         }
 
         state.reverse_instructions(&self.instructions.instruction_list);
@@ -442,7 +437,7 @@ pub fn perform_mcts_joint(
         sel,
     );
 
-    let side_results = |options: &[MoveNode], stats: &Option<Box<SideStats>>| -> Vec<MctsSideResult> {
+    let side_results = |options: &[MoveNode], stats: Option<&SideStats>| -> Vec<MctsSideResult> {
         let total_visits: f32 = options.iter().map(|v| v.visits as f32).sum();
         let strategy: Vec<f32> = match stats {
             Some(st) => {
@@ -499,8 +494,8 @@ pub fn perform_mcts_joint(
 
     MctsResult {
         joint,
-        s1: side_results(root_node.s1_options.as_ref().unwrap(), &root_node.s1_stats),
-        s2: side_results(root_node.s2_options.as_ref().unwrap(), &root_node.s2_stats),
+        s1: side_results(root_node.s1_options.as_ref().unwrap(), root_node.stats.as_ref().map(|n| &n.s1)),
+        s2: side_results(root_node.s2_options.as_ref().unwrap(), root_node.stats.as_ref().map(|n| &n.s2)),
         iteration_count: root_node.times_visited,
     }
 }
