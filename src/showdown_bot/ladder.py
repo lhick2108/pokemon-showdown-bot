@@ -164,6 +164,15 @@ def with_ladder_hooks(
         cap_s = move_cap_s
         cap_hits = 0
 
+        async def _handle_battle_message(self, split_messages):
+            # keep every |request| (our full real sets) in order, before poke-env consumes it
+            try:
+                capture_requests(self.__dict__.setdefault("battle_requests", {}), split_messages,
+                                 getattr(self, "battles", {}))
+            except Exception:
+                logger.exception("could not capture request")
+            return await super()._handle_battle_message(split_messages)
+
         async def choose_move(self, battle):
             try:
                 return await asyncio.wait_for(super().choose_move(battle), self.cap_s)
@@ -285,6 +294,39 @@ def append_game(path: Path, game: LadderGame) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(game.to_dict()) + "\n")
+
+
+def capture_requests(store: dict, split_messages: Sequence[Sequence[str]], battles: Mapping) -> None:
+    """Remember each ``|request|`` JSON of a battle chunk as ``(position, raw_json)``.
+
+    ``position`` is the number of protocol events poke-env had recorded when the request
+    arrived, so the request can be re-inserted at the right place of the replay log.
+    Only the request payload is kept (never other websocket traffic): it holds our team
+    (moves, PP, item, ability, tera type, stats, HP) and the account name, no credentials.
+    """
+    if not split_messages or not split_messages[0] or not split_messages[0][0].startswith(">"):
+        return
+    tag = split_messages[0][0][1:]
+    battle = battles.get(tag)
+    position = len(getattr(battle, "_replay_data", None) or [])
+    for msg in split_messages[1:]:
+        if len(msg) >= 3 and msg[1] == "request" and msg[2].strip():
+            json.loads(msg[2])  # must be valid JSON, else not ours to keep
+            store.setdefault(tag, []).append((position, msg[2]))
+
+
+def log_with_requests(events: Sequence[str], requests: Sequence[tuple[int, str]]) -> str:
+    """Protocol events with ``|request|{json}`` lines interleaved at their recorded position."""
+    out: list[str] = []
+    pending = sorted(requests, key=lambda r: r[0])
+    i = 0
+    for index, event in enumerate(events):
+        while i < len(pending) and pending[i][0] <= index:
+            out.append("|request|" + pending[i][1])
+            i += 1
+        out.append(event)
+    out.extend("|request|" + raw for _, raw in pending[i:])
+    return "\n".join(out)
 
 
 def safe_filename(text: str) -> str:
