@@ -102,14 +102,17 @@ class Data:
     q: np.ndarray | None = None
     target: np.ndarray | None = None
     stock_eval: np.ndarray | None = None  # poke_engine.evaluate per sample (side one)
-    # residual mode: the last column of ``x`` is the raw stock evaluate(state)
+    # residual mode: the last column of ``x`` is the raw stock evaluate(state), unless
+    # ``e_sep`` holds it (used with float16 features, which cannot carry a large eval)
     residual: bool = False
+    e_sep: np.ndarray | None = None
+    feature_version: int = 1
 
     @property
     def e(self) -> np.ndarray:
         """Raw stock evaluation per sample (residual data only)."""
         assert self.residual
-        return self.x[:, -1]
+        return self.e_sep if self.e_sep is not None else self.x[:, -1]
 
     @property
     def y_fit(self) -> np.ndarray:
@@ -129,6 +132,8 @@ class Data:
             None if self.target is None else self.target[idx],
             None if self.stock_eval is None else self.stock_eval[idx],
             self.residual,
+            None if self.e_sep is None else self.e_sep[idx],
+            self.feature_version,
         )
 
 
@@ -177,11 +182,17 @@ def load_data(
     td_lambda: float = 0.7,
     td_n: int = 1,
     td_mu: float = 0.0,
+    feature_version: int = 1,
+    x_dtype: str = "float32",
 ) -> Data:
     """Load every sample of the given run directories into memory.
 
-    ``residual`` appends the raw stock ``evaluate(state)`` as the last column of ``x``.
+    ``residual`` appends the raw stock ``evaluate(state)`` as the last column of ``x``
+    (with ``x_dtype="float16"`` it is kept in a separate float32 array instead).
+    ``feature_version`` selects the engine feature layout (1 or 2); float16 halves the memory
+    of the (N, n_in) matrix, which matters for the 2.1k-wide version 2.
     """
+    np_dtype = np.dtype(x_dtype)
     feats, ys, qs, evals, tags, strings = [], [], [], [], [], []
     gids, didx, dqs = [], [], []
     load = dataset.LoadStats()
@@ -189,9 +200,9 @@ def load_data(
         for s in dataset.iter_samples(
             path, sides=(1,), worlds=states in ("both", "worlds"),
             truth=states in ("both", "truth"), stats=load, q_source=q_source,
-            q_eval_scale=q_eval_scale,
+            q_eval_scale=q_eval_scale, feature_version=feature_version,
         ):
-            feats.append(np.asarray(s.features, dtype=np.float32))  # a list of Python floats costs ~8x the memory
+            feats.append(np.asarray(s.features, dtype=np_dtype))  # a list of Python floats costs ~8x the memory
             ys.append(s.value)
             q = s.search_value_abs if q_kind == "absolute" else s.search_value
             qs.append(np.nan if q is None else q)
@@ -208,8 +219,11 @@ def load_data(
         raise SystemExit("no samples found in " + ", ".join(map(str, paths)))
     x = np.stack(feats)
     del feats
-    if residual:
+    e_sep = None
+    if residual and np_dtype == np.float32:
         x = np.concatenate([x, np.asarray(evals, dtype=np.float32)[:, None]], axis=1)
+    elif residual:
+        e_sep = np.asarray(evals, dtype=np.float32)
     y = np.asarray(ys, dtype=np.float32)
     q = np.asarray(qs, dtype=np.float32)
     if value_target in ("td", "nstep"):
@@ -227,7 +241,7 @@ def load_data(
     return Data(
         x, y, sample_weights(tags, weighting), tags, strings, q,
         None if value_target == "outcome" else target,
-        np.asarray(evals, dtype=np.float32), residual,
+        np.asarray(evals, dtype=np.float32), residual, e_sep, feature_version,
     )
 
 
@@ -318,12 +332,24 @@ def fit_stock_logistic(
     return float(beta[0]), float(beta[1])
 
 
-def logits_of(model: nn.Module, x: torch.Tensor, batch: int = 8192) -> torch.Tensor:
+def model_input(x: torch.Tensor, e: torch.Tensor | None = None) -> torch.Tensor:
+    """Float32 network input: features (possibly float16), plus the stock eval column if given."""
+    x = x.float()
+    return x if e is None else torch.cat([x, e[:, None]], dim=1)
+
+
+def logits_of(
+    model: nn.Module, x: torch.Tensor, e: torch.Tensor | None = None, batch: int = 8192
+) -> torch.Tensor:
+    """Logits for features ``x``; ``e`` is the separately stored stock eval (float16 data)."""
     model.eval()
     if len(x) == 0:
         return torch.zeros(0)
     with torch.no_grad():
-        return torch.cat([model(x[i:i + batch]).squeeze(-1) for i in range(0, len(x), batch)])
+        return torch.cat([
+            model(model_input(x[i:i + batch], None if e is None else e[i:i + batch])).squeeze(-1)
+            for i in range(0, len(x), batch)
+        ])
 
 
 def weighted_bce(logits: torch.Tensor, y: torch.Tensor, w: torch.Tensor | None = None) -> float:
@@ -405,6 +431,8 @@ def fit(
     model.to(device)
     xt, yt, wt = (torch.from_numpy(a).to(device) for a in (train.x, train.y_fit, train.w))
     xv, yv, wv = (torch.from_numpy(a).to(device) for a in (val.x, val.y_fit, val.w))
+    et = None if train.e_sep is None else torch.from_numpy(train.e_sep).to(device)
+    ev = None if val.e_sep is None else torch.from_numpy(val.e_sep).to(device)
     decayed = [p for n_, p in model.named_parameters() if p.requires_grad and n_ != "a"]
     groups = [{"params": decayed}]
     if isinstance(model, ResidualNet) and model.a.requires_grad:
@@ -419,7 +447,7 @@ def fit(
         perm = torch.randperm(n, generator=gen).to(device)
         for i in range(0, n, batch_size):
             b = perm[i:i + batch_size]
-            xb, yb = xt[b], yt[b]
+            xb, yb = model_input(xt[b], None if et is None else et[b]), yt[b]
             if augmenter is not None:
                 xb, yb = augmenter(xb, yb)
             loss = nn.functional.binary_cross_entropy_with_logits(
@@ -429,8 +457,8 @@ def fit(
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
-        tr = weighted_bce(logits_of(model, xt), yt, wt)
-        va = weighted_bce(logits_of(model, xv), yv, wv)
+        tr = weighted_bce(logits_of(model, xt, et), yt, wt)
+        va = weighted_bce(logits_of(model, xv, ev), yv, wv)
         history.append((epoch, tr, va))
         log(f"epoch {epoch:3d}  train {tr:.4f}  val {va:.4f}")
         if va < best_loss - 1e-5:
@@ -450,14 +478,15 @@ def fit(
 # ---------------------------------------------------------------------------
 
 
-def export_pev(model: nn.Module, out: Path) -> None:
+def export_pev(model: nn.Module, out: Path, feature_version: int = 1) -> None:
     """Write the model with ``poke_engine.write_mlp`` / ``write_linear``.
 
     Weight layout is torch's: ``W1`` is ``[hidden][n_in]`` row-major, which is
-    what learned.rs reads.
+    what learned.rs reads. ``feature_version`` is recorded in the file header.
     """
     import poke_engine
 
+    kw = {} if feature_version == 1 else {"feature_version": feature_version}
     out.parent.mkdir(parents=True, exist_ok=True)
     model = model.to("cpu")
     stock_coef = 0.0
@@ -469,7 +498,7 @@ def export_pev(model: nn.Module, out: Path) -> None:
     if isinstance(model, nn.Linear):
         poke_engine.write_linear(
             str(out), model.weight.detach().reshape(-1).tolist(), float(model.bias.item()),
-            stock_coef=stock_coef,
+            stock_coef=stock_coef, **kw,
         )
         return
     l1, l2 = model[0], model[-1]
@@ -479,7 +508,7 @@ def export_pev(model: nn.Module, out: Path) -> None:
         l1.bias.detach().tolist(),
         l2.weight.detach().reshape(-1).tolist(),
         float(l2.bias.item()),
-        stock_coef=stock_coef,
+        stock_coef=stock_coef, **kw,
     )
 
 
@@ -493,7 +522,12 @@ def verify_export(model: nn.Module, path: Path, states: list[str], tol: float = 
     evaluator = poke_engine.Evaluator.load(str(path))
     model = model.to("cpu")
     parsed = [poke_engine.State.from_string(s) for s in states]
-    rows = [poke_engine.state_features(s, 1) for s in parsed]
+    version = getattr(evaluator, "feature_version", 1)
+    rows = [
+        poke_engine.state_features(s, 1) if version == 1
+        else poke_engine.state_features(s, 1, version)
+        for s in parsed
+    ]
     if isinstance(model, ResidualNet):
         rows = [r + [poke_engine.evaluate(s)] for r, s in zip(rows, parsed)]
         if not evaluator.residual or abs(evaluator.stock_coef - model.stock_coef) > 1e-7:
@@ -554,7 +588,9 @@ def report(model: nn.Module, train: Data, val: Data, device: torch.device) -> di
     model.to(device)
     t = {k: torch.from_numpy(getattr(train, k)).to(device) for k in ("x", "y", "w")}
     v = {k: torch.from_numpy(getattr(val, k)).to(device) for k in ("x", "y", "w")}
-    lt, lv = logits_of(model, t["x"]), logits_of(model, v["x"])
+    et = None if train.e_sep is None else torch.from_numpy(train.e_sep).to(device)
+    ev = None if val.e_sep is None else torch.from_numpy(val.e_sep).to(device)
+    lt, lv = logits_of(model, t["x"], et), logits_of(model, v["x"], ev)
     out = {
         "train_bce_w": weighted_bce(lt, t["y"], t["w"]),
         "val_bce_w": weighted_bce(lv, v["y"], v["w"]),
@@ -645,6 +681,12 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="auto", help="auto (cuda if available), cpu or cuda")
+    p.add_argument("--features", choices=("v1", "v2"), default="v1",
+                   help="engine feature layout: v1 (738 values) or v2 (v1 + item / ability / "
+                        "move-property features, see docs/features-v2.md)")
+    p.add_argument("--x-dtype", choices=("float32", "float16"), default=None,
+                   help="in-memory dtype of the feature matrix (default float32 for v1, "
+                        "float16 for v2: halves RAM / GPU memory)")
     return p
 
 
@@ -677,10 +719,17 @@ def main(argv=None) -> int:
         else f" (n={args.td_n}, mu={mu}, q-kind={args.q_kind})" if args.value_target == "nstep"
         else "")
     print(f"value target: {target_desc}")
+    feature_version = 2 if args.features == "v2" else 1
+    x_dtype = args.x_dtype or ("float16" if feature_version == 2 else "float32")
+    if feature_version == 2 and (args.augment_bench or args.augment_sides):
+        print("--augment-* supports only --features v1", file=sys.stderr)
+        return 2
+    print(f"features: {args.features}, x dtype {x_dtype}")
     data = load_data(
         args.data, args.states, args.weighting, args.value_target, args.blend_lambda, args.q_source,
         args.q_kind, args.q_eval_scale, residual=args.residual,
         td_lambda=args.td_lambda, td_n=args.td_n, td_mu=mu,
+        feature_version=feature_version, x_dtype=x_dtype,
     )
     tr_idx, va_idx = split_by_battle(data.tags, args.val_fraction, args.seed)
     if len(va_idx) == 0 or len(tr_idx) == 0:
@@ -692,7 +741,7 @@ def main(argv=None) -> int:
           f"train {len(train)} samples / {len(set(train.tags))} battles; "
           f"val {len(val)} samples / {len(set(val.tags))} battles; "
           f"mean value {float(data.y.mean()):.3f}")
-    n_feat = data.x.shape[1] - (1 if args.residual else 0)
+    n_feat = data.x.shape[1] - (1 if args.residual and data.e_sep is None else 0)
     res_init = None
     if args.residual:
         a0, b0 = fit_stock_logistic(train.e, train.y_fit, train.w, args.stock_coef_init)
@@ -725,7 +774,7 @@ def main(argv=None) -> int:
         print(f"learned a = {float(result.model.a.item()):.4f}  "
               f"(stock_coef = {result.model.stock_coef:.6f})")
     report(result.model, train, val, device)
-    export_pev(result.model, args.out)
+    export_pev(result.model, args.out, feature_version)
     rng = random.Random(args.seed)
     pool = [s for s in val.states if s]
     check = rng.sample(pool, min(100, len(pool)))

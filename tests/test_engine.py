@@ -262,3 +262,74 @@ def test_return_joint_matrix_is_consistent():
 def test_return_joint_rejects_threads():
     with pytest.raises(ValueError):
         monte_carlo_tree_search(make_state(), iterations=10, threads=2, return_joint=True)
+
+
+# ---- feature version 2 (589.42) ---------------------------------------------
+
+
+def _v2_state() -> State:
+    one = _pokemon(
+        "corviknight", ("flying", "steel"), (400, 250, 300, 150, 200, 200),
+        ("roost", "swordsdance", "bravebird", "defog"),
+    )
+    one = Pokemon(**{**{k: getattr(one, k) for k in (
+        "id", "level", "types", "base_types", "hp", "maxhp", "ability", "base_ability",
+        "attack", "defense", "special_attack", "special_defense", "speed", "status",
+        "tera_type", "moves")}, "item": "lifeorb"})
+    two = _pokemon(
+        "ferrothorn", ("grass", "steel"), (400, 200, 300, 100, 250, 50),
+        ("stealthrock", "leechseed", "powerwhip", "protect"),
+    )
+    return State(side_one=Side(pokemon=[one]), side_two=Side(pokemon=[two]))
+
+
+def test_feature_versions_and_lengths():
+    assert poke_engine.FEATURE_VERSIONS == [1, 2]
+    assert poke_engine.feature_length() == FEATURE_LENGTH == DOCUMENTED_FEATURE_LENGTH
+    assert poke_engine.feature_length(2) == poke_engine.FEATURE_LENGTH_V2 > FEATURE_LENGTH
+    assert 1500 < poke_engine.FEATURE_LENGTH_V2 < 3000
+    assert len(state_feature_names(2)) == poke_engine.FEATURE_LENGTH_V2
+    assert state_feature_names(2)[:FEATURE_LENGTH] == state_feature_names(1)
+    with pytest.raises(ValueError):
+        state_features(make_state(), 1, 7)
+
+
+def test_v2_features_extend_v1_with_identity_features():
+    state = _v2_state()
+    v1, v2 = state_features(state, 1), state_features(state, 1, 2)
+    assert v2[:FEATURE_LENGTH] == v1 and len(v2) == poke_engine.FEATURE_LENGTH_V2
+    names = state_feature_names(2)
+
+    def at(n):
+        return v2[names.index(n)]
+
+    assert at("own.p0.item.lifeorb") == 1.0 and at("own.p0.item.leftovers") == 0.0
+    assert at("own.p0.mv.recovery") == 1.0 and at("own.p0.mv.hazard_removal") == 1.0
+    assert at("own.p0.mv.setup.attack") == 1.0
+    assert at("opp.p0.mv.hazard_setter") == 1.0 and at("opp.p0.mv.protect") == 1.0
+    assert at("opp.p0.mv.leechseed") == 1.0
+    assert at("own.active.moves_first") == 1.0
+    flipped = state_features(state, 2, 2)
+    assert flipped[names.index("opp.p0.item.lifeorb")] == 1.0
+
+
+def test_v2_evaluator_roundtrip(tmp_path):
+    n = poke_engine.FEATURE_LENGTH_V2
+    names = state_feature_names(2)
+    w1 = [0.0] * (2 * n)
+    w1[names.index("own.p0.mv.recovery")] = 1.5  # hidden 0
+    w1[n + names.index("opp.p0.mv.hazard_setter")] = -2.0  # hidden 1
+    path = tmp_path / "v2.pev"
+    write_mlp(str(path), w1, [0.0, 1.0], [1.0, 1.0], 0.1, feature_version=2)
+    raw = path.read_bytes()
+    assert int.from_bytes(raw[8:12], "little") == 2 and int.from_bytes(raw[16:20], "little") == n
+    ev = Evaluator.load(str(path))
+    assert ev.feature_version == 2 and ev.hidden_size == 2
+    # hidden0 = relu(1.5) = 1.5; hidden1 = relu(-2 + 1) = 0
+    assert ev.evaluate(_v2_state()) == pytest.approx(1.5 + 0.1)
+    # a v2 file with v1-sized weights is rejected up front
+    with pytest.raises(ValueError):
+        write_mlp(str(path), [0.0] * (2 * FEATURE_LENGTH), [0.0, 0.0], [1.0, 1.0], feature_version=2)
+    plain = tmp_path / "v1.pev"
+    write_linear(str(plain), [0.0] * FEATURE_LENGTH, 0.5)
+    assert Evaluator.load(str(plain)).feature_version == 1

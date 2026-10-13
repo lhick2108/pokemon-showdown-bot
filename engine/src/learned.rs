@@ -42,8 +42,10 @@ use crate::engine::evaluate::evaluate;
 use crate::engine::items::Items;
 use crate::engine::state::{PokemonVolatileStatus as V, Terrain, Weather};
 use crate::features::{
-    features_into, FEATURE_LEN, FEATURE_VERSION, PER_POKEMON, PER_SIDE, TEAM_SLOTS,
+    feature_len, features_versioned_into, FEATURE_LEN, FEATURE_LEN_V2, FEATURE_VERSION_1,
+    FEATURE_VERSION_2, PER_POKEMON, PER_SIDE, TEAM_SLOTS,
 };
+use crate::features_v2::{self, Sink};
 use crate::state::{PokemonStatus, PokemonType, Side, SideReference, State};
 use std::convert::TryInto;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -80,6 +82,8 @@ pub struct Evaluator {
     model: Model,
     /// Identifies the weights; keys the per-`Scratch` static-feature cache.
     id: u64,
+    /// Feature version the weights were trained with (1 or 2); the input length follows from it.
+    feat_ver: u32,
     /// CPU supports AVX2 (runtime-detected; enables a wider build of the fast MLP path).
     avx2: bool,
     /// If true the leaf score is `sigmoid(z_leaf - z_root)`, else `sigmoid(z_leaf)`.
@@ -106,7 +110,7 @@ pub struct Scratch {
     /// the life of a search, so a `Scratch` must not be reused for states whose
     /// team stats differ without calling `Scratch::reset()` (every search and
     /// `Evaluator::logit` wrapper in this crate uses a fresh one).
-    cache_keys: Vec<u32>,
+    cache_keys: Vec<[u64; 2]>,
     /// 1 / max(maxhp, 1) per line (hp fraction = hp * recip, no division per leaf).
     cache_recip: Vec<f32>,
     /// Next way to evict, per set.
@@ -125,7 +129,7 @@ impl Scratch {
 
     pub fn new() -> Scratch {
         Scratch {
-            feats: vec![0.0; FEATURE_LEN],
+            feats: vec![0.0; FEATURE_LEN_V2],
             hidden: Vec::new(),
             cache_model: 0,
             cache_vals: Vec::new(),
@@ -156,7 +160,7 @@ fn detect_avx2() -> bool {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn mlp_avx2<const H: usize>(
+unsafe fn mlp_avx2<const H: usize, const V2: bool>(
     ev: &Evaluator,
     w1t: &[f32],
     b1: &[f32],
@@ -165,7 +169,23 @@ unsafe fn mlp_avx2<const H: usize>(
     state: &State,
     scratch: &mut Scratch,
 ) -> f32 {
-    ev.mlp_fast::<H>(w1t, b1, w2, b2, state, scratch)
+    ev.mlp_fast::<H, V2>(w1t, b1, w2, b2, state, scratch)
+}
+
+/// Adds first-layer weight rows for the (absolute-index) features it receives.
+struct AccSink<'a, const H: usize> {
+    acc: &'a mut [f32; H],
+    w1t: &'a [f32],
+}
+impl<'a, const H: usize> Sink for AccSink<'a, H> {
+    #[inline(always)]
+    fn one(&mut self, idx: usize) {
+        add_row::<H>(self.acc, self.w1t, idx);
+    }
+    #[inline(always)]
+    fn val(&mut self, idx: usize, v: f32) {
+        axpy_row::<H>(self.acc, v, self.w1t, idx);
+    }
 }
 
 #[inline(always)]
@@ -234,7 +254,7 @@ fn static_contrib<const H: usize>(
 }
 
 #[inline(always)]
-fn mlp_side<const H: usize>(
+fn mlp_side<const H: usize, const V2: bool>(
     acc: &mut [f32; H],
     w1t: &[f32],
     side: &Side,
@@ -260,11 +280,18 @@ fn mlp_side<const H: usize>(
             let p = &side.pokemon.pkmn[k];
             let base = side_base + slot * PER_POKEMON;
             // slow-changing part, cached per (side, team index, slot) set
-            let key = (p.types.0 as u32)
-                | (p.types.1 as u32) << 8
-                | (p.tera_type as u32) << 16
-                | (p.terastallized as u32) << 24
-                | ((p.item != Items::NONE) as u32) << 25;
+            let key: [u64; 2] = if V2 {
+                features_v2::static_key(p)
+            } else {
+                [
+                    (p.types.0 as u64)
+                        | (p.types.1 as u64) << 8
+                        | (p.tera_type as u64) << 16
+                        | (p.terastallized as u64) << 24
+                        | ((p.item != Items::NONE) as u64) << 25,
+                    0,
+                ]
+            };
             let set = (side_no * TEAM_SLOTS + k) * TEAM_SLOTS + slot;
             let line0 = set * CACHE_WAYS;
             let line = if sc.cache_keys[line0] == key {
@@ -277,6 +304,13 @@ fn mlp_side<const H: usize>(
                 let line = line0 + way;
                 let mut v = [0.0f32; H];
                 static_contrib::<H>(&mut v, w1t, base, p);
+                if V2 {
+                    features_v2::static_block(
+                        &mut AccSink::<H> { acc: &mut v, w1t },
+                        features_v2::mon_base(side_no, slot),
+                        p,
+                    );
+                }
                 let o = line * 2 * H;
                 sc.cache_vals[o..o + H].copy_from_slice(&v);
                 add_row::<H>(&mut v, w1t, base + 1);
@@ -402,18 +436,25 @@ pub fn logistic(x: f32) -> f32 {
 }
 
 impl Evaluator {
-    /// value = w . features + b
+    /// value = w . features + b (feature version 1)
     pub fn linear(w: Vec<f32>, b: f32) -> Result<Evaluator, String> {
-        if w.len() != FEATURE_LEN {
+        Evaluator::linear_v(FEATURE_VERSION_1, w, b)
+    }
+
+    /// value = w . features + b over the features of `feat_ver` (1 or 2).
+    pub fn linear_v(feat_ver: u32, w: Vec<f32>, b: f32) -> Result<Evaluator, String> {
+        let n_in = feature_len(feat_ver).ok_or_else(|| format!("unknown feature version {feat_ver}"))?;
+        if w.len() != n_in {
             return Err(format!(
-                "linear weights have length {}, expected FEATURE_LEN = {}",
+                "linear weights have length {}, expected {} (feature version {feat_ver})",
                 w.len(),
-                FEATURE_LEN
+                n_in
             ));
         }
         Ok(Evaluator {
             model: Model::Linear { w, b },
             id: NEXT_MODEL_ID.fetch_add(1, Ordering::Relaxed),
+            feat_ver,
             avx2: detect_avx2(),
             relative_to_root: true,
             leaf_scale: 1.0,
@@ -421,7 +462,7 @@ impl Evaluator {
         })
     }
 
-    /// value = w2 . relu(W1 x + b1) + b2, with `w1` row-major `[hidden][FEATURE_LEN]`.
+    /// value = w2 . relu(W1 x + b1) + b2, with `w1` row-major `[hidden][FEATURE_LEN]` (version 1).
     pub fn mlp(
         hidden: usize,
         w1: Vec<f32>,
@@ -429,14 +470,27 @@ impl Evaluator {
         w2: Vec<f32>,
         b2: f32,
     ) -> Result<Evaluator, String> {
+        Evaluator::mlp_v(FEATURE_VERSION_1, hidden, w1, b1, w2, b2)
+    }
+
+    /// MLP over the features of `feat_ver`; `w1` is row-major `[hidden][feature_len(feat_ver)]`.
+    pub fn mlp_v(
+        feat_ver: u32,
+        hidden: usize,
+        w1: Vec<f32>,
+        b1: Vec<f32>,
+        w2: Vec<f32>,
+        b2: f32,
+    ) -> Result<Evaluator, String> {
+        let n_in = feature_len(feat_ver).ok_or_else(|| format!("unknown feature version {feat_ver}"))?;
         if hidden == 0 {
             return Err("hidden size must be > 0".to_string());
         }
-        if w1.len() != hidden * FEATURE_LEN {
+        if w1.len() != hidden * n_in {
             return Err(format!(
-                "w1 has length {}, expected hidden * FEATURE_LEN = {}",
+                "w1 has length {}, expected hidden * n_in = {} (feature version {feat_ver})",
                 w1.len(),
-                hidden * FEATURE_LEN
+                hidden * n_in
             ));
         }
         if b1.len() != hidden || w2.len() != hidden {
@@ -449,8 +503,8 @@ impl Evaluator {
         }
         let mut w1t = vec![0.0f32; w1.len()];
         for j in 0..hidden {
-            for i in 0..FEATURE_LEN {
-                w1t[i * hidden + j] = w1[j * FEATURE_LEN + i];
+            for i in 0..n_in {
+                w1t[i * hidden + j] = w1[j * n_in + i];
             }
         }
         Ok(Evaluator {
@@ -462,11 +516,22 @@ impl Evaluator {
                 b2,
             },
             id: NEXT_MODEL_ID.fetch_add(1, Ordering::Relaxed),
+            feat_ver,
             avx2: detect_avx2(),
             relative_to_root: true,
             leaf_scale: 1.0,
             stock_coef: None,
         })
+    }
+
+    /// Feature version of the weights (1 or 2).
+    pub fn feature_version(&self) -> u32 {
+        self.feat_ver
+    }
+
+    /// Length of the feature vector the weights consume.
+    pub fn n_in(&self) -> usize {
+        feature_len(self.feat_ver).unwrap_or(FEATURE_LEN)
     }
 
     pub fn with_relative_to_root(mut self, relative: bool) -> Evaluator {
@@ -560,16 +625,21 @@ impl Evaluator {
     pub fn logit(&self, state: &State, scratch: &mut Scratch) -> f32 {
         let net = match &self.model {
             Model::Mlp { hidden, w1t, b1, w2, b2 } => {
+                let v2 = self.feat_ver == FEATURE_VERSION_2;
                 #[cfg(target_arch = "x86_64")]
                 {
                     if self.avx2 {
                         // SAFETY: `avx2` is only set when the CPU reports AVX2.
                         unsafe {
-                            match *hidden {
-                                8 => mlp_avx2::<8>(self, w1t, b1, w2, *b2, state, scratch),
-                                16 => mlp_avx2::<16>(self, w1t, b1, w2, *b2, state, scratch),
-                                32 => mlp_avx2::<32>(self, w1t, b1, w2, *b2, state, scratch),
-                                64 => mlp_avx2::<64>(self, w1t, b1, w2, *b2, state, scratch),
+                            match (*hidden, v2) {
+                                (8, false) => mlp_avx2::<8, false>(self, w1t, b1, w2, *b2, state, scratch),
+                                (16, false) => mlp_avx2::<16, false>(self, w1t, b1, w2, *b2, state, scratch),
+                                (32, false) => mlp_avx2::<32, false>(self, w1t, b1, w2, *b2, state, scratch),
+                                (64, false) => mlp_avx2::<64, false>(self, w1t, b1, w2, *b2, state, scratch),
+                                (8, true) => mlp_avx2::<8, true>(self, w1t, b1, w2, *b2, state, scratch),
+                                (16, true) => mlp_avx2::<16, true>(self, w1t, b1, w2, *b2, state, scratch),
+                                (32, true) => mlp_avx2::<32, true>(self, w1t, b1, w2, *b2, state, scratch),
+                                (64, true) => mlp_avx2::<64, true>(self, w1t, b1, w2, *b2, state, scratch),
                                 _ => return self.logit_reference(state, scratch),
                             }
                         }
@@ -577,7 +647,7 @@ impl Evaluator {
                         if !matches!(*hidden, 8 | 16 | 32 | 64) {
                             return self.logit_reference(state, scratch);
                         }
-                        self.mlp_dispatch(*hidden, w1t, b1, w2, *b2, state, scratch)
+                        self.mlp_dispatch(*hidden, v2, w1t, b1, w2, *b2, state, scratch)
                     }
                 }
                 #[cfg(not(target_arch = "x86_64"))]
@@ -585,7 +655,7 @@ impl Evaluator {
                     if !matches!(*hidden, 8 | 16 | 32 | 64) {
                         return self.logit_reference(state, scratch);
                     }
-                    self.mlp_dispatch(*hidden, w1t, b1, w2, *b2, state, scratch)
+                    self.mlp_dispatch(*hidden, v2, w1t, b1, w2, *b2, state, scratch)
                 }
             }
             Model::Linear { .. } => return self.logit_reference(state, scratch),
@@ -600,6 +670,7 @@ impl Evaluator {
     fn mlp_dispatch(
         &self,
         hidden: usize,
+        v2: bool,
         w1t: &[f32],
         b1: &[f32],
         w2: &[f32],
@@ -607,19 +678,24 @@ impl Evaluator {
         state: &State,
         scratch: &mut Scratch,
     ) -> f32 {
-        match hidden {
-            8 => self.mlp_fast::<8>(w1t, b1, w2, b2, state, scratch),
-            16 => self.mlp_fast::<16>(w1t, b1, w2, b2, state, scratch),
-            32 => self.mlp_fast::<32>(w1t, b1, w2, b2, state, scratch),
-            64 => self.mlp_fast::<64>(w1t, b1, w2, b2, state, scratch),
+        match (hidden, v2) {
+            (8, false) => self.mlp_fast::<8, false>(w1t, b1, w2, b2, state, scratch),
+            (16, false) => self.mlp_fast::<16, false>(w1t, b1, w2, b2, state, scratch),
+            (32, false) => self.mlp_fast::<32, false>(w1t, b1, w2, b2, state, scratch),
+            (64, false) => self.mlp_fast::<64, false>(w1t, b1, w2, b2, state, scratch),
+            (8, true) => self.mlp_fast::<8, true>(w1t, b1, w2, b2, state, scratch),
+            (16, true) => self.mlp_fast::<16, true>(w1t, b1, w2, b2, state, scratch),
+            (32, true) => self.mlp_fast::<32, true>(w1t, b1, w2, b2, state, scratch),
+            (64, true) => self.mlp_fast::<64, true>(w1t, b1, w2, b2, state, scratch),
             _ => f32::NAN, // unreachable: callers only pass supported sizes
         }
     }
 
-    /// Reference implementation: dense `features_into` + `logit_from_features`.
+    /// Reference implementation: dense feature vector + `logit_from_features`.
     pub fn logit_reference(&self, state: &State, scratch: &mut Scratch) -> f32 {
-        features_into(state, SideReference::SideOne, &mut scratch.feats);
-        let net = self.logit_from_features(&scratch.feats, &mut scratch.hidden);
+        features_versioned_into(state, SideReference::SideOne, self.feat_ver, &mut scratch.feats);
+        let n_in = self.n_in();
+        let net = self.logit_from_features(&scratch.feats[..n_in], &mut scratch.hidden);
         match self.stock_coef {
             Some(c) => c * evaluate(state) + net,
             None => net,
@@ -627,7 +703,7 @@ impl Evaluator {
     }
 
     #[inline(always)]
-    fn mlp_fast<const H: usize>(
+    fn mlp_fast<const H: usize, const V2: bool>(
         &self,
         w1t: &[f32],
         b1: &[f32],
@@ -641,7 +717,7 @@ impl Evaluator {
             scratch.cache_vals.clear();
             scratch.cache_vals.resize(CACHE_SETS * CACHE_WAYS * 2 * H, 0.0);
             scratch.cache_keys.clear();
-            scratch.cache_keys.resize(CACHE_SETS * CACHE_WAYS, u32::MAX);
+            scratch.cache_keys.resize(CACHE_SETS * CACHE_WAYS, [u64::MAX; 2]);
             scratch.cache_recip.clear();
             scratch.cache_recip.resize(CACHE_SETS * CACHE_WAYS, 1.0);
             scratch.cache_next.clear();
@@ -649,8 +725,8 @@ impl Evaluator {
         }
         let mut acc = [0.0f32; H];
         acc.copy_from_slice(&b1[..H]);
-        mlp_side::<H>(&mut acc, w1t, &state.side_one, 0, scratch);
-        mlp_side::<H>(&mut acc, w1t, &state.side_two, 1, scratch);
+        mlp_side::<H, V2>(&mut acc, w1t, &state.side_one, 0, scratch);
+        mlp_side::<H, V2>(&mut acc, w1t, &state.side_two, 1, scratch);
 
         let field = 2 * PER_SIDE;
         let weather = state.get_weather();
@@ -683,6 +759,13 @@ impl Evaluator {
         if state.trick_room.active {
             add_row::<H>(&mut acc, w1t, field + 11);
         }
+        if V2 {
+            features_v2::dynamic_blocks(
+                &mut AccSink::<H> { acc: &mut acc, w1t },
+                state,
+                SideReference::SideOne,
+            );
+        }
 
         let mut z = b2;
         for j in 0..H {
@@ -709,7 +792,7 @@ impl Evaluator {
             &mut out,
             if self.is_residual() { FORMAT_VERSION_RESIDUAL } else { FORMAT_VERSION },
         );
-        push(&mut out, FEATURE_VERSION);
+        push(&mut out, self.feat_ver);
         let pushf = |out: &mut Vec<u8>, xs: &[f32]| {
             for x in xs {
                 out.extend_from_slice(&x.to_le_bytes());
@@ -718,7 +801,7 @@ impl Evaluator {
         match &self.model {
             Model::Linear { w, b } => {
                 push(&mut out, KIND_LINEAR);
-                push(&mut out, FEATURE_LEN as u32);
+                push(&mut out, self.n_in() as u32);
                 push(&mut out, 0);
                 pushf(&mut out, w);
                 pushf(&mut out, &[*b]);
@@ -731,11 +814,11 @@ impl Evaluator {
                 b2,
             } => {
                 push(&mut out, KIND_MLP);
-                push(&mut out, FEATURE_LEN as u32);
+                push(&mut out, self.n_in() as u32);
                 push(&mut out, *hidden as u32);
                 // back to row-major [hidden][n_in]
                 for j in 0..*hidden {
-                    for i in 0..FEATURE_LEN {
+                    for i in 0..self.n_in() {
                         pushf(&mut out, &[w1t[i * hidden + j]]);
                     }
                 }
@@ -764,17 +847,15 @@ impl Evaluator {
             return Err(format!("unsupported weights format version {format}"));
         }
         let feat_ver = u32_at(8);
-        if feat_ver != FEATURE_VERSION {
-            return Err(format!(
-                "weights were trained with FEATURE_VERSION {feat_ver}, this engine has {FEATURE_VERSION}"
-            ));
-        }
+        let expected_in = feature_len(feat_ver).ok_or_else(|| {
+            format!("weights were trained with unknown FEATURE_VERSION {feat_ver} (this engine knows 1 and 2)")
+        })?;
         let kind = u32_at(12);
         let n_in = u32_at(16) as usize;
         let hidden = u32_at(20) as usize;
-        if n_in != FEATURE_LEN {
+        if n_in != expected_in {
             return Err(format!(
-                "weights expect {n_in} inputs, this engine has FEATURE_LEN = {FEATURE_LEN}"
+                "weights expect {n_in} inputs, FEATURE_VERSION {feat_ver} has {expected_in}"
             ));
         }
         let mut stock_coef = None;
@@ -814,10 +895,11 @@ impl Evaluator {
             .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
             .collect();
         let ev = if kind == KIND_LINEAR {
-            Evaluator::linear(floats[..n_in].to_vec(), floats[n_in])
+            Evaluator::linear_v(feat_ver, floats[..n_in].to_vec(), floats[n_in])
         } else {
             let a = hidden * n_in;
-            Evaluator::mlp(
+            Evaluator::mlp_v(
+                feat_ver,
                 hidden,
                 floats[..a].to_vec(),
                 floats[a..a + hidden].to_vec(),
@@ -1057,6 +1139,38 @@ mod tests {
     }
 
     #[test]
+    fn feature_version_2_roundtrip_and_isolation() {
+        use crate::features::FEATURE_LEN_V2;
+        let hidden = 3;
+        let mut w1 = vec![0.0; hidden * FEATURE_LEN_V2];
+        w1[FEATURE_LEN_V2 + 700] = 0.5;
+        w1[FEATURE_LEN_V2 * 2 + FEATURE_LEN_V2 - 1] = 1.5;
+        let ev = Evaluator::mlp_v(2, hidden, w1.clone(), vec![0.1; hidden], vec![1.0, 2.0, 3.0], 0.2)
+            .unwrap()
+            .with_stock_coef(0.01)
+            .unwrap();
+        assert_eq!(ev.feature_version(), 2);
+        let bytes = ev.to_bytes();
+        assert_eq!(&bytes[8..12], &2u32.to_le_bytes());
+        assert_eq!(&bytes[16..20], &(FEATURE_LEN_V2 as u32).to_le_bytes());
+        let back = Evaluator::from_bytes(&bytes).unwrap();
+        assert_eq!(back.feature_version(), 2);
+        assert_eq!(back.stock_coef, Some(0.01));
+        let s = state_with_hp(70, 30);
+        let mut sc = Scratch::new();
+        assert_eq!(ev.logit(&s, &mut sc), back.logit(&s, &mut Scratch::new()));
+        // wrong input length for the declared version is rejected
+        assert!(Evaluator::mlp_v(2, hidden, vec![0.0; hidden * FEATURE_LEN], vec![0.0; hidden], vec![0.0; hidden], 0.0).is_err());
+        assert!(Evaluator::linear_v(3, vec![], 0.0).is_err());
+        let mut bad = bytes.clone();
+        bad[8..12].copy_from_slice(&3u32.to_le_bytes());
+        assert!(Evaluator::from_bytes(&bad).is_err());
+        let mut bad = bytes.clone();
+        bad[16..20].copy_from_slice(&(FEATURE_LEN as u32).to_le_bytes()); // v2 header with v1 n_in
+        assert!(Evaluator::from_bytes(&bad).is_err());
+    }
+
+    #[test]
     fn corrupt_v2_rejected() {
         let ev = Evaluator::linear(vec![0.0; FEATURE_LEN], 0.0)
             .unwrap()
@@ -1114,12 +1228,13 @@ mod fast_path_tests {
         }
     }
 
-    fn random_mlp(h: usize, seed: u64) -> Evaluator {
+    fn random_mlp(ver: u32, h: usize, seed: u64) -> Evaluator {
         let mut r = Lcg(seed);
-        let w1: Vec<f32> = (0..h * FEATURE_LEN).map(|_| r.unit() * 0.5).collect();
+        let n_in = feature_len(ver).unwrap();
+        let w1: Vec<f32> = (0..h * n_in).map(|_| r.unit() * 0.2).collect();
         let b1: Vec<f32> = (0..h).map(|_| r.unit() * 0.3).collect();
         let w2: Vec<f32> = (0..h).map(|_| r.unit()).collect();
-        Evaluator::mlp(h, w1, b1, w2, 0.1)
+        Evaluator::mlp_v(ver, h, w1, b1, w2, 0.1)
             .unwrap()
             .with_stock_coef(0.0125)
             .unwrap()
@@ -1135,8 +1250,12 @@ mod fast_path_tests {
             .collect();
         assert!(states.len() > 50);
         let mut rng = Lcg(7);
-        for &h in &[8usize, 16, 32, 64] {
-            let ev = random_mlp(h, 100 + h as u64);
+        let combos: Vec<(u32, usize)> = [1u32, 2]
+            .iter()
+            .flat_map(|&v| [8usize, 16, 32, 64].iter().map(move |&h| (v, h)))
+            .collect();
+        for &(ver, h) in &combos {
+            let ev = random_mlp(ver, h, 100 + h as u64 + 1000 * ver as u64);
             let mut maxdiff = 0.0f32;
             for s0 in &states {
                 // one Scratch per team (stats fixed), reused over mutated variants so the cache is exercised
@@ -1160,7 +1279,23 @@ mod fast_path_tests {
                                 if rng.next() % 9 == 0 {
                                     p.item = Items::NONE;
                                 }
+                                // v2 inputs: item / ability identity, move set, pp
+                                if rng.next() % 4 == 0 {
+                                    p.item = features_v2::ITEM_LIST[rng.next() as usize % features_v2::ITEM_LIST.len()];
+                                }
+                                if rng.next() % 4 == 0 {
+                                    p.ability = features_v2::ABILITY_LIST[rng.next() as usize % features_v2::ABILITY_LIST.len()];
+                                }
+                                if rng.next() % 4 == 0 {
+                                    std::mem::swap(&mut p.moves.m0, &mut p.moves.m2);
+                                }
+                                if rng.next() % 4 == 0 {
+                                    p.moves.m1.pp = (rng.next() % 20) as i8;
+                                    p.moves.m3.pp = 0;
+                                }
                             }
+                            side.side_conditions.light_screen = (rng.next() % 6) as i8;
+                            side.side_conditions.tailwind = (rng.next() % 5) as i8;
                             side.attack_boost = (rng.next() % 13) as i8 - 6;
                             side.speed_boost = (rng.next() % 13) as i8 - 6;
                             side.side_conditions.spikes = (rng.next() % 4) as i8;
@@ -1177,13 +1312,15 @@ mod fast_path_tests {
                             }
                         }
                         s.trick_room.active = rng.next() % 4 == 0;
+                        s.trick_room.turns_remaining = (rng.next() % 6) as i8;
+                        s.terrain.turns_remaining = (rng.next() % 6) as i8;
                     }
                     let a = ev.logit(&s, &mut scratch);
                     let b = ev.logit_reference(&s, &mut Scratch::new());
                     maxdiff = maxdiff.max((a - b).abs());
                 }
             }
-            assert!(maxdiff <= 1e-5, "hidden {}: max abs diff {}", h, maxdiff);
+            assert!(maxdiff <= 1e-5, "version {} hidden {}: max abs diff {}", ver, h, maxdiff);
         }
     }
 }

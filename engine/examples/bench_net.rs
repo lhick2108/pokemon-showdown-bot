@@ -14,9 +14,11 @@ fn main() {
     let ev = if a[2].starts_with("zero") {
         // net compute with w2 = 0 and stock_coef = 0.0125: identical search tree to stock,
         // so the it/s ratio isolates the pure evaluation overhead
-        let h: usize = a[2][4..].parse().unwrap();
-        let w1: Vec<f32> = (0..h * FEATURE_LEN).map(|i| ((i * 7919) % 1000) as f32 / 1000.0 - 0.5).collect();
-        Evaluator::mlp(h, w1, vec![0.1; h], vec![0.0; h], 0.0)
+        let (hs, ver) = match a[2][4..].split_once('v') { Some((h, v)) => (h, v.parse::<u32>().unwrap()), None => (&a[2][4..], 1) };
+        let h: usize = hs.parse().unwrap();
+        let n_in = poke_engine::features::feature_len(ver).unwrap();
+        let w1: Vec<f32> = (0..h * n_in).map(|i| ((i * 7919) % 1000) as f32 / 1000.0 - 0.5).collect();
+        Evaluator::mlp_v(ver, h, w1, vec![0.1; h], vec![0.0; h], 0.0)
             .unwrap()
             .with_stock_coef(0.0125)
             .unwrap()
@@ -31,8 +33,9 @@ fn main() {
         .map(State::deserialize)
         .collect();
     println!(
-        "{} states, model hidden={} residual={}",
+        "{} states, model v{} hidden={} residual={}",
         states.len(),
+        ev.feature_version(),
         ev.hidden_size(),
         ev.is_residual()
     );

@@ -301,3 +301,39 @@ def test_td_modes_in_make_targets_leave_outcome_untouched():
     target, n = train.make_targets(y, None, "outcome")
     assert target is y and n == 0
     assert {"td", "nstep"} <= set(train.VALUE_TARGETS)
+
+
+# ---- feature version 2 (589.42) ---------------------------------------------
+
+
+@pytest.mark.parametrize("residual", [False, True])
+def test_v2_export_round_trip(tmp_path, state_strings, residual):
+    n = pe.feature_length(2)
+    torch.manual_seed(4)
+    model = train.build_model("mlp", n, 16, (0.8, 0.1) if residual else None)
+    with torch.no_grad():
+        for p in model.parameters():
+            p.add_(torch.randn_like(p) * 0.2)
+    out = tmp_path / "v2.pev"
+    train.export_pev(model, out, feature_version=2)
+    assert pe.Evaluator.load(str(out)).feature_version == 2
+    assert train.verify_export(model, out, state_strings, tol=1e-3) < 1e-3
+
+
+def test_float16_data_keeps_the_stock_eval_separate(state_strings):
+    states = [pe.State.from_string(s) for s in state_strings]
+    x = np.array([pe.state_features(s, 1, 2) for s in states], dtype=np.float16)
+    e = np.array([pe.evaluate(s) for s in states], dtype=np.float32)
+    n = len(x)
+    y = (np.arange(n) % 2).astype(np.float32)
+    data = train.Data(
+        x, y, np.ones(n, dtype=np.float32), [f"b{i}" for i in range(n)], list(state_strings),
+        stock_eval=e, residual=True, e_sep=e, feature_version=2,
+    )
+    assert np.array_equal(data.e, e) and data.x.shape[1] == pe.feature_length(2)
+    sub = data.subset(np.arange(0, n, 2))
+    assert sub.e_sep.shape == (len(sub),) and sub.x.dtype == np.float16
+    a0, b0 = train.fit_stock_logistic(data.e, y, data.w)
+    model = train.build_model("mlp", pe.feature_length(2), 4, (a0, b0), freeze_a=True)
+    res = train.fit(model, data, data, device=torch.device("cpu"), epochs=2, log=lambda *_: None)
+    assert res.history[0][2] < 1.5

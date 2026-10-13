@@ -17,6 +17,7 @@ pub mod engine;
 
 pub mod choices;
 pub mod features;
+pub mod features_v2;
 pub mod instruction;
 pub mod io;
 pub mod learned;

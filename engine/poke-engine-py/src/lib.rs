@@ -12,7 +12,8 @@ use poke_engine::engine::items::Items;
 use poke_engine::engine::state::{MoveChoice, PokemonVolatileStatus, Terrain, Weather};
 use poke_engine::instruction::{Instruction, StateInstructions};
 use poke_engine::features::{
-    feature_names, features, FEATURE_LEN, FEATURE_VERSION,
+    feature_len, feature_names_versioned, features_versioned, FEATURE_LEN, FEATURE_LEN_V2,
+    FEATURE_VERSION,
 };
 use poke_engine::learned::{Evaluator, Scratch};
 use poke_engine::mcts::{perform_mcts_joint, MctsResult, MctsSideResult};
@@ -975,15 +976,16 @@ impl PyEvaluator {
 
     /// value = weights . state_features + bias
     #[staticmethod]
-    #[pyo3(signature = (weights, bias=0.0, relative_to_root=true, leaf_scale=1.0, stock_coef=0.0))]
+    #[pyo3(signature = (weights, bias=0.0, relative_to_root=true, leaf_scale=1.0, stock_coef=0.0, feature_version=1))]
     fn linear(
         weights: Vec<f32>,
         bias: f32,
         relative_to_root: bool,
         leaf_scale: f32,
         stock_coef: f32,
+        feature_version: u32,
     ) -> PyResult<PyEvaluator> {
-        let ev = with_residual(Evaluator::linear(weights, bias).map_err(value_err)?, stock_coef)?
+        let ev = with_residual(Evaluator::linear_v(feature_version, weights, bias).map_err(value_err)?, stock_coef)?
             .with_relative_to_root(relative_to_root)
             .with_leaf_scale(leaf_scale)
             .map_err(value_err)?;
@@ -992,7 +994,7 @@ impl PyEvaluator {
 
     /// value = w2 . relu(W1 x + b1) + b2; `w1` is flat row-major [hidden][FEATURE_LENGTH].
     #[staticmethod]
-    #[pyo3(signature = (w1, b1, w2, b2=0.0, relative_to_root=true, leaf_scale=1.0, stock_coef=0.0))]
+    #[pyo3(signature = (w1, b1, w2, b2=0.0, relative_to_root=true, leaf_scale=1.0, stock_coef=0.0, feature_version=1))]
     fn mlp(
         w1: Vec<f32>,
         b1: Vec<f32>,
@@ -1001,9 +1003,10 @@ impl PyEvaluator {
         relative_to_root: bool,
         leaf_scale: f32,
         stock_coef: f32,
+        feature_version: u32,
     ) -> PyResult<PyEvaluator> {
         let hidden = b1.len();
-        let ev = with_residual(Evaluator::mlp(hidden, w1, b1, w2, b2).map_err(value_err)?, stock_coef)?
+        let ev = with_residual(Evaluator::mlp_v(feature_version, hidden, w1, b1, w2, b2).map_err(value_err)?, stock_coef)?
             .with_relative_to_root(relative_to_root)
             .with_leaf_scale(leaf_scale)
             .map_err(value_err)?;
@@ -1029,6 +1032,12 @@ impl PyEvaluator {
     #[getter]
     fn leaf_scale(&self) -> f32 {
         self.inner.leaf_scale
+    }
+
+    /// Feature version the weights consume (1 or 2).
+    #[getter]
+    fn feature_version(&self) -> u32 {
+        self.inner.feature_version()
     }
 
     #[getter]
@@ -1088,21 +1097,38 @@ fn eval_low_hp_knee() -> f32 {
 
 /// The fixed-length feature vector of `state` from `side`'s perspective (1 or 2).
 #[pyfunction]
-#[pyo3(signature = (py_state, side=1))]
-fn state_features(py_state: PyState, side: u8) -> PyResult<Vec<f32>> {
+#[pyo3(signature = (py_state, side=1, version=None))]
+fn state_features(py_state: PyState, side: u8, version: Option<u32>) -> PyResult<Vec<f32>> {
     let side_ref = match side {
         1 => SideReference::SideOne,
         2 => SideReference::SideTwo,
         _ => return Err(value_err(format!("side must be 1 or 2, got {side}"))),
     };
+    let version = check_version(version)?;
     let state: State = py_state.into();
-    Ok(features(&state, side_ref))
+    Ok(features_versioned(&state, side_ref, version))
+}
+
+fn check_version(version: Option<u32>) -> PyResult<u32> {
+    let v = version.unwrap_or(FEATURE_VERSION);
+    if feature_len(v).is_none() {
+        return Err(value_err(format!("unknown feature version {v} (known: 1, 2)")));
+    }
+    Ok(v)
 }
 
 /// Names of the features, same order as `state_features`.
 #[pyfunction]
-fn state_feature_names() -> Vec<String> {
-    feature_names()
+#[pyo3(signature = (version=None))]
+fn state_feature_names(version: Option<u32>) -> PyResult<Vec<String>> {
+    Ok(feature_names_versioned(check_version(version)?))
+}
+
+/// Length of the feature vector of `version` (default: `FEATURE_VERSION`).
+#[pyfunction]
+#[pyo3(signature = (version=None))]
+fn feature_length(version: Option<u32>) -> PyResult<usize> {
+    Ok(feature_len(check_version(version)?).unwrap())
 }
 
 #[pyfunction]
@@ -1359,6 +1385,9 @@ fn py_poke_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(state_feature_names, m)?)?;
     m.add("FEATURE_VERSION", FEATURE_VERSION)?;
     m.add("FEATURE_LENGTH", FEATURE_LEN)?;
+    m.add("FEATURE_LENGTH_V2", FEATURE_LEN_V2)?;
+    m.add("FEATURE_VERSIONS", vec![1u32, 2u32])?;
+    m.add_function(wrap_pyfunction!(feature_length, m)?)?;
     m.add_class::<PyEvaluator>()?;
     m.add_class::<PyState>()?;
     m.add_class::<PySide>()?;

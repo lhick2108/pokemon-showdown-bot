@@ -121,6 +121,7 @@ def iter_samples(
     q_source: str = "decision",
     q_eval_scale: float = Q_EVAL_SCALE,
     with_stock_eval: bool = False,
+    feature_version: int | None = None,
 ) -> Iterator[Sample]:
     """Yield one ``Sample`` per stored state (every searched world, plus truth).
 
@@ -133,6 +134,8 @@ def iter_samples(
         raise ValueError(f"q_source must be one of {Q_SOURCES}")
     import poke_engine
 
+    # None = the engine's default feature version (old engines have no ``version`` argument)
+    feat_kwargs = {} if feature_version in (None, 1) else {"version": feature_version}
     stats = stats if stats is not None else LoadStats()
     for path in recorder.iter_game_files(root):
         try:
@@ -201,7 +204,7 @@ def iter_samples(
                 stock_eval = float(poke_engine.evaluate(state))  # always filled (absolute q needs it)
                 for side in sides:
                     yield Sample(
-                        features=poke_engine.state_features(state, side),
+                        features=poke_engine.state_features(state, side, **feat_kwargs),
                         value=value_target(result, side),
                         policy=policy if side == 1 else None,
                         kind=kind,

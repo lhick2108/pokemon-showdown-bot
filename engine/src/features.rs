@@ -10,7 +10,12 @@ use crate::engine::items::Items;
 use crate::engine::state::{PokemonVolatileStatus as V, Terrain, Weather};
 use crate::state::{Pokemon, PokemonStatus, PokemonType, Side, SideReference, State};
 
+/// Default feature version of this build (what `features` / `FEATURE_LEN` describe). Version 2
+/// (`FEATURE_VERSION_2`, see `features_v2.rs`) is the v1 layout plus identity / move-property
+/// extras; select it explicitly with `features_versioned_into`.
 pub const FEATURE_VERSION: u32 = 1;
+pub const FEATURE_VERSION_1: u32 = 1;
+pub const FEATURE_VERSION_2: u32 = 2;
 
 /// Pokemon slots encoded per side (slot 0 is the active Pokemon).
 pub const TEAM_SLOTS: usize = 6;
@@ -148,6 +153,17 @@ pub const PER_SIDE: usize = TEAM_SLOTS * PER_POKEMON + PER_SIDE_EXTRAS;
 pub const FIELD_LEN: usize = WEATHER_NAMES.len() + TERRAIN_NAMES.len() + 1;
 /// Total length of the feature vector.
 pub const FEATURE_LEN: usize = 2 * PER_SIDE + FIELD_LEN;
+pub const FEATURE_LEN_V1: usize = FEATURE_LEN;
+pub use crate::features_v2::FEATURE_LEN_V2;
+
+/// Length of the feature vector of `version` (1 or 2), None for unknown versions.
+pub fn feature_len(version: u32) -> Option<usize> {
+    match version {
+        FEATURE_VERSION_1 => Some(FEATURE_LEN_V1),
+        FEATURE_VERSION_2 => Some(FEATURE_LEN_V2),
+        _ => None,
+    }
+}
 
 struct Out<'a> {
     buf: &'a mut [f32],
@@ -328,6 +344,38 @@ pub fn features_into(state: &State, side: SideReference, out: &mut [f32]) {
     }
     o.flag(state.trick_room.active);
     debug_assert_eq!(o.i, FEATURE_LEN);
+}
+
+/// Writes the feature vector of `version` (1 or 2) into the first `feature_len(version)`
+/// entries of `out`. Panics on an unknown version or a too short `out`.
+pub fn features_versioned_into(state: &State, side: SideReference, version: u32, out: &mut [f32]) {
+    match version {
+        FEATURE_VERSION_1 => features_into(state, side, out),
+        FEATURE_VERSION_2 => {
+            features_into(state, side, out);
+            crate::features_v2::extras_into(state, side, &mut out[..FEATURE_LEN_V2]);
+        }
+        _ => panic!("unknown feature version {}", version),
+    }
+}
+
+/// The feature vector of `version` from `side`'s perspective.
+pub fn features_versioned(state: &State, side: SideReference, version: u32) -> Vec<f32> {
+    let n = feature_len(version).unwrap_or_else(|| panic!("unknown feature version {}", version));
+    let mut v = vec![0.0; n];
+    features_versioned_into(state, side, version, &mut v);
+    v
+}
+
+/// Feature names of `version`, same order as `features_versioned`.
+pub fn feature_names_versioned(version: u32) -> Vec<String> {
+    let mut names = feature_names();
+    match version {
+        FEATURE_VERSION_1 => {}
+        FEATURE_VERSION_2 => names.extend(crate::features_v2::extra_names()),
+        _ => panic!("unknown feature version {}", version),
+    }
+    names
 }
 
 /// The feature vector of `state` from `side`'s perspective.

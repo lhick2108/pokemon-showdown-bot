@@ -65,3 +65,6 @@ Slot `k` starts at index `53 * k`.
 Species / ability / item identity, move sets and PP, last used move, turn
 counters (screen/weather duration), substitute HP. Adding any of these is a
 `FEATURE_VERSION` bump.
+
+Feature version 2 (v1 plus item/ability/move-property features, 2191 values) is documented in docs/features-v2.md.
+
