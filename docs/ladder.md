@@ -50,3 +50,12 @@ a running battle to the new connection and it is played out.
 `--games N` stops after N games. Ctrl-C stops early: a battle in progress is
 forfeited (logged) and the summary is still written. The `/timer` of the server
 also applies; a decision never takes longer than `--move-cap`.
+
+## Analysing a game with our real sets
+
+`logs/<battle>.log` interleaves every `|request|{json}` the server sent us (our full team: moves, PP, item, ability, tera type, stats, HP) at the position it arrived. Replay a turn with exact sets, or print what the bot saw and decided live:
+
+    python scripts/replay_log.py data/ladder/<run>/logs/<battle>.log --turn 11
+    python scripts/replay_log.py data/ladder/<run>/logs/<battle>.log --turn 11 --from-record data/ladder/<run>/records [--research --time-ms 300 --evaluator X.pev]
+
+`--moves` / `--item` only matter for old logs without requests. poke-env tracks our PP from the protocol (as live), not from the request pp.

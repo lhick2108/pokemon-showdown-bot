@@ -71,7 +71,11 @@ class Run:
         game = ladder.game_from_battle(battle, player.username)
         log = self.out / "logs" / f"{ladder.safe_filename(battle.battle_tag)}.log"
         log.parent.mkdir(parents=True, exist_ok=True)
-        log.write_text(battle._build_replay_log() + "\n", encoding="utf-8")
+        reqs = getattr(player, "battle_requests", {}).get(battle.battle_tag, [])
+        events = [f">{battle.battle_tag}", *battle._build_replay_events()]
+        # +1: the header line shifts event positions
+        text = ladder.log_with_requests(events, [(pos + 1, raw) for pos, raw in reqs])
+        log.write_text(text + "\n", encoding="utf-8")
         game.log_file = str(log.relative_to(self.out))
         ladder.append_game(self.out / "games.jsonl", game)
         self.games.append(game)
