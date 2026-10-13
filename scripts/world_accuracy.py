@@ -6,6 +6,14 @@ exact opposing team ("truth"). For each decision this script lines up the reveal
 opposing Pokemon in each world with the truth and reports per-field mismatch rates.
 
     python scripts/world_accuracy.py data/selfplay/gen0 [--max-files N] [--top 12]
+    python scripts/world_accuracy.py <dir> --by [turn reveals onfield] [--gaps]   # bead 589.34
+
+``--by`` prints error rates bucketed by turn, by facts revealed about the Pokemon (moves seen, item known,
+ability known) and by turns on the field; recordings made after 589.34 carry the tracker's own view
+(``opp_facts``: revealed facts, number of consistent sets, entropy, candidate groups), older ones fall back to
+proxies (moves seen = PP used, "known" = every world agrees). ``--gaps`` adds the worst species/items, confidently
+wrong beliefs and the sets the tracker wrongly ruled out. Ditto is skipped (its truth holds the copied set), and
+turn-1 truth states carry no moves (peer request not yet seen), so read turn-1 move columns with care.
 
 Definitions
 -----------
@@ -122,7 +130,7 @@ def parse(text: str):
     return pe.State.from_string(text)
 
 
-def analyse_decision(decision: dict, counts: dict[str, Counts], stats: Counter) -> None:
+def analyse_decision(decision: dict, counts: dict[str, Counts], stats: Counter, bd: Breakdown | None = None) -> None:
     truth_text = (decision.get("truth") or {}).get("state")
     worlds = decision.get("worlds") or []
     if not truth_text or len(worlds) < 2:
@@ -144,6 +152,8 @@ def analyse_decision(decision: dict, counts: dict[str, Counts], stats: Counter) 
     stats["revealed_slots"] += revealed
     t_by_species = {str(m.id).lower(): m for m in truth.side_two.pokemon}
     t_active = truth.side_two.pokemon[int(truth.side_two.active_index)]
+    if bd is not None:
+        observe_breakdown(bd, decision, ws, truth, revealed, t_by_species)
 
     # ---- field / side level (every world vs truth) ---------------------------
     for w in ws:
@@ -293,6 +303,271 @@ def analyse_decision(decision: dict, counts: dict[str, Counts], stats: Counter) 
             c.add_conf(key, value != str(getattr(t_mon, key)).lower(), True)
 
 
+TURN_BUCKETS = ((1, 1, "1"), (2, 3, "2-3"), (4, 6, "4-6"), (7, 10, "7-10"), (11, 20, "11-20"), (21, 10**9, "21+"))
+FIELD_BUCKETS = ((0, 0, "0 (bench)"), (1, 1, "1"), (2, 2, "2"), (3, 4, "3-4"), (5, 8, "5-8"), (9, 10**9, "9+"))
+
+
+def bucket(value: int, table) -> str:
+    for lo, hi, name in table:
+        if lo <= value <= hi:
+            return name
+    return table[-1][2]
+
+
+class Agg:
+    """Per-bucket sums over (revealed mon x world) observations."""
+
+    def __init__(self) -> None:
+        self.v: Counter = Counter()
+
+    def __getitem__(self, key: str) -> float:
+        return self.v[key]
+
+
+class Breakdown:
+    """Accuracy per bucket along turn / reveals / turns-on-field (bead 589.34)."""
+
+    def __init__(self) -> None:
+        self.tables: dict[str, dict[str, Agg]] = defaultdict(lambda: defaultdict(Agg))
+        self.gap_item: Counter = Counter()
+        self.gap_item_total: Counter = Counter()
+        self.gap_species_total: Counter = Counter()
+        self.gap_species_bad: Counter = Counter()
+        self.gap_conf: Counter = Counter()
+        self.gap_conf_pair: Counter = Counter()
+        self.gap_ability_pair: Counter = Counter()
+        self.gap_moves: Counter = Counter()
+        self.have_facts = 0
+        self.no_facts = 0
+        self.onfield: dict[tuple, set] = defaultdict(set)
+        # residual ambiguity among well-revealed mons (>=2 moves seen, turn >= 7), from tracker facts
+        self.amb_n = 0
+        # truth set missing from the tracker's candidates ("unsupported")
+        self.unsup_total = 0
+        self.unsup_comp: Counter = Counter()
+        self.unsup_item: Counter = Counter()
+        self.unsup_abil: Counter = Counter()
+        self.unsup_moves: Counter = Counter()
+        self.amb_vary: Counter = Counter()
+        self.amb_species_n: Counter = Counter()
+        self.amb_species_h: defaultdict = defaultdict(float)
+        self.amb_species_vary: defaultdict = defaultdict(Counter)
+
+    def add(self, dims: dict[str, str], obs: dict[str, float]) -> None:
+        for dim, key in dims.items():
+            agg = self.tables[dim][key]
+            for name, val in obs.items():
+                agg.v[name] += val
+
+
+def observe_breakdown(bd: Breakdown, decision: dict, ws, truth, revealed: int, t_by_species) -> None:
+    facts = decision.get("opp_facts") or []
+    turn = int(decision.get("turn") or 0)
+    game = decision.get("_game", "")
+    if revealed:
+        bd.onfield[(game, str(ws[0].side_two.pokemon[0].id).lower())].add(turn)
+    n_worlds = len(ws)
+    for i in range(revealed):
+        sid = str(ws[0].side_two.pokemon[i].id).lower()
+        t_mon = t_by_species.get(sid)
+        if t_mon is None or sid == "ditto":
+            continue  # Ditto: the truth state holds the transformed mon's moves/ability (measurement artefact)
+        t_moves = moves_of(t_mon)
+        known = {m for m, pp in t_moves.items() if pp < _max_pp(m)}
+        fact = facts[i] if i < len(facts) and "moves" in facts[i] else None
+        t_item, t_abil, t_tera = (str(getattr(t_mon, k)).lower() for k in ("item", "ability", "tera_type"))
+        t_tera_done = bool(t_mon.terastallized)
+        items = [str(w.side_two.pokemon[i].item).lower() for w in ws]
+        abils = [str(w.side_two.pokemon[i].ability).lower() for w in ws]
+        w_moves = [moves_of(w.side_two.pokemon[i]) for w in ws]
+        w_tera = [str(w.side_two.pokemon[i].tera_type).lower() for w in ws]
+        item_agree = len(set(items)) == 1
+        abil_agree = len(set(abils)) == 1
+        moves_agree = len({frozenset(m) for m in w_moves}) == 1
+        sig = {(items[k], abils[k], frozenset(w_moves[k])) for k in range(n_worlds)}
+        if fact is not None:
+            bd.have_facts += 1
+            moves_seen = len(fact["moves"])
+            item_known = fact["item"] is not None
+            abil_known = fact["ability"] is not None
+            suffix = ""
+        else:
+            bd.no_facts += 1
+            moves_seen = len(known)
+            item_known, abil_known = item_agree, abil_agree  # proxy: every world holds the same value
+            suffix = " (proxy: worlds agree)"
+        on_field = len(bd.onfield[(game, sid)])
+        dims = {
+            "turn": bucket(turn, TURN_BUCKETS),
+            "moves seen": str(min(moves_seen, 4)),
+            "item known" + suffix: "yes" if item_known else "no",
+            "ability known" + suffix: "yes" if abil_known else "no",
+            "turns on field": bucket(on_field, FIELD_BUCKETS),
+        }
+        for k in range(n_worlds):
+            item_bad = items[k] != t_item
+            abil_bad = abils[k] != t_abil
+            overlap = len(set(w_moves[k]) & set(t_moves))
+            moves_ex = overlap == len(t_moves) and len(w_moves[k]) == len(t_moves)
+            tera_bad = w_tera[k] != t_tera and t_tera != "typeless"
+            bd.add(dims, {
+                "n": 1, "item": item_bad, "item_class": item_class(items[k]) != item_class(t_item),
+                "ability": abil_bad, "tera_n": t_tera_done, "tera_bad": tera_bad and t_tera_done,
+                "slots_wrong": len(t_moves) - overlap, "moves_exact": moves_ex,
+                "full_exact": (not item_bad) and (not abil_bad) and moves_ex,
+                "distinct": len(sig) / n_worlds,
+            })
+        item_conf_bad = item_agree and items[0] != t_item
+        full_conf = item_agree and abil_agree and moves_agree
+        full_conf_bad = full_conf and (
+            items[0] != t_item or abils[0] != t_abil or frozenset(w_moves[0]) != frozenset(t_moves)
+        )
+        obs = {"dec_n": 1, "conf_item_n": item_agree, "conf_item_bad": item_conf_bad,
+               "conf_full_n": full_conf, "conf_full_bad": full_conf_bad}
+        if fact is not None:
+            obs.update(facts_n=1, n_sets=fact.get("n_sets", 0), entropy=fact.get("entropy", 0.0),
+                       n_sets_nt=fact.get("n_sets_nt", fact.get("n_sets", 0)),
+                       entropy_nt=fact.get("entropy_nt", fact.get("entropy", 0.0)))
+        if fact is not None and fact.get("groups"):
+            norm = lambda x: "".join(ch for ch in str(x).lower() if ch.isalnum())  # noqa: E731
+            t_key = (norm(t_item), norm(t_abil), tuple(sorted(norm(m) for m in t_moves)))
+            p_truth, collision, total_p = 0.0, 0.0, 0.0
+            for g_item, g_abil, g_moves, prob in fact["groups"]:
+                key = (norm(g_item), norm(g_abil), tuple(sorted(norm(m) for m in g_moves.split("/"))))
+                total_p += prob
+                collision += prob * prob
+                if (key[0] == t_key[0] or t_key[0] in ("none", "")) and (key[1] == t_key[1] or t_key[1] in ("none", "")) and key[2] == t_key[2]:  # truth item none = consumed/knocked off
+                    p_truth += prob
+            if total_p > 0 and p_truth == 0:
+                best = None
+                for g_item, g_abil, g_moves, prob in fact["groups"]:
+                    gm = tuple(sorted(norm(m) for m in g_moves.split("/")))
+                    comps = (norm(g_item) == t_key[0] or t_key[0] in ("none", ""), norm(g_abil) == t_key[1] or t_key[1] in ("none", ""), gm == t_key[2])
+                    score = (sum(comps), prob)
+                    if best is None or score > best[0]:
+                        best = (score, comps, norm(g_item), norm(g_abil), gm)
+                _, comps, g_item, g_abil, gm = best
+                bd.unsup_total += 1
+                bd.unsup_comp[tuple(n for n, ok in zip(("item", "ability", "moves"), comps) if not ok)] += 1
+                if not comps[0]:
+                    bd.unsup_item[(sid, t_key[0], g_item)] += 1
+                if not comps[1]:
+                    bd.unsup_abil[(sid, t_key[1], g_abil)] += 1
+                if not comps[2]:
+                    bd.unsup_moves[(sid, "truth-only " + ",".join(sorted(set(t_key[2]) - set(gm))),
+                                    "cand-only " + ",".join(sorted(set(gm) - set(t_key[2]))))] += 1
+            if total_p > 0:
+                obs.update(grp_n=1, grp_support=p_truth > 0, grp_ptruth=p_truth / total_p,
+                           grp_ideal_ok=collision / (total_p * total_p))
+        bd.add(dims, obs)
+        if fact is not None and "vary" in fact and moves_seen >= 2 and turn >= 7:
+            bd.amb_n += 1
+            bd.amb_species_n[sid] += 1
+            bd.amb_species_h[sid] += fact.get("entropy_nt", 0.0)
+            for dim, count in fact["vary"].items():
+                if count > 1:
+                    bd.amb_vary[dim] += 1
+                    bd.amb_species_vary[sid][dim] += 1
+        if moves_seen >= 3:  # well-revealed mons
+            bd.gap_species_total[sid] += n_worlds
+            bd.gap_species_bad[sid] += sum(x != t_item for x in items)
+            bd.gap_item_total[t_item] += n_worlds
+            bd.gap_item[t_item] += sum(x != t_item for x in items)
+            for x in items:
+                if x != t_item:
+                    bd.gap_conf_pair[(sid, t_item, x)] += 1
+            if item_conf_bad:
+                bd.gap_conf[(sid, t_item, items[0])] += 1
+            for x in abils:
+                if x != t_abil:
+                    bd.gap_ability_pair[(sid, t_abil, x)] += 1
+        for m in known - set(w_moves[0]):
+            bd.gap_moves[(sid, m)] += 1
+
+
+def print_breakdown(bd: Breakdown, dims: list[str]) -> None:
+    src = (f"tracker facts on {bd.have_facts} mon-decisions" if bd.have_facts
+           else "NO tracker facts (older recording): reveal facts are proxies")
+    print(f"\n#### breakdowns ({src}; {bd.no_facts} mon-decisions without facts)")
+    order = {"turn": [b[2] for b in TURN_BUCKETS], "turns on field": [b[2] for b in FIELD_BUCKETS]}
+    for dim, rows in bd.tables.items():
+        if not any(d in dim for d in dims):
+            continue
+        print(f"\n== by {dim} ==")
+        print(f"{'bucket':14s} {'mon-dec':>8s} {'item%':>6s} {'iclass%':>7s} {'abil%':>6s} {'teraPost%':>9s} {'mvSlotErr':>9s} "
+              f"{'mvExact%':>8s} {'FULLerr%':>8s} {'confItem%':>9s} {'confFull%':>9s} {'nSets':>7s} {'H':>6s} {'nSetsNT':>7s} {'H_NT':>6s} {'distinct/w':>10s} {'support%':>8s} {'P(truth)':>8s} {'idealErr%':>9s}")
+        for key in order.get(dim) or sorted(rows):
+            a = rows.get(key)
+            if a is None or not a["n"]:
+                continue
+            n = a["n"]
+
+            def pct(x: float, y: float) -> float:
+                return 100 * x / y if y else float("nan")
+
+            nsets = a["n_sets"] / a["facts_n"] if a["facts_n"] else float("nan")
+            ent = a["entropy"] / a["facts_n"] if a["facts_n"] else float("nan")
+            nsnt = a["n_sets_nt"] / a["facts_n"] if a["facts_n"] else float("nan")
+            entnt = a["entropy_nt"] / a["facts_n"] if a["facts_n"] else float("nan")
+            print(f"{key:14s} {int(a['dec_n']):8d} {pct(a['item'], n):6.1f} {pct(a['item_class'], n):7.1f} {pct(a['ability'], n):6.1f} "
+                  f"{pct(a['tera_bad'], a['tera_n']):9.1f} {a['slots_wrong'] / n:9.2f} {pct(a['moves_exact'], n):8.1f} "
+                  f"{100 - pct(a['full_exact'], n):8.1f} {pct(a['conf_item_bad'], a['conf_item_n']):9.1f} "
+                  f"{pct(a['conf_full_bad'], a['conf_full_n']):9.1f} {nsets:7.1f} {ent:6.2f} {nsnt:7.1f} {entnt:6.2f} {a['distinct'] / n:10.2f} "
+                  f"{pct(a['grp_support'], a['grp_n']):8.1f} {a['grp_ptruth'] / a['grp_n'] if a['grp_n'] else float('nan'):8.3f} "
+                  f"{100 - pct(a['grp_ideal_ok'], a['grp_n']):9.1f}")
+    print("\nsupport% = share of mon-decisions where the truth's exact (item, ability, moves) set is among the tracker's "
+          "remaining candidates (100 - support% = wrongly excluded: a bug/missing-rule signal). P(truth) = probability "
+          "the tracker's posterior gives the true set. idealErr% = expected FULLerr% of a perfectly calibrated sampler "
+          "from the tracker's posterior (compare with FULLerr%: equal = information-limited).")
+    print("\nFULLerr% = 100 - P(item, ability and move set all exactly right). teraPost% = tera error only where the "
+          "truth already terastallized (tera before that is unknowable). confItem%/confFull% = share of decisions "
+          "where all worlds agree but differ from truth (denominator: all-agree decisions).")
+
+
+def print_gaps(bd: Breakdown, top: int) -> None:
+    if bd.unsup_total:
+        print(f"\n#### truth set NOT among the tracker's candidates: {bd.unsup_total} mon-decisions; nearest candidate differs in:")
+        for comp, c in bd.unsup_comp.most_common():
+            print(f"   {'+'.join(comp) or '(none?)':24s} {c:6d}  ({100 * c / bd.unsup_total:.0f}%)")
+        print("-- item (species, truth -> nearest candidate):")
+        for (sid, t, g), c in bd.unsup_item.most_common(top):
+            print(f"   {sid:16s} {t:16s} -> {g:16s} {c}")
+        print("-- ability (species, truth -> nearest candidate):")
+        for (sid, t, g), c in bd.unsup_abil.most_common(top):
+            print(f"   {sid:16s} {t:16s} -> {g:16s} {c}")
+        print("-- moves (species, truth-only moves, candidate-only moves):")
+        for (sid, a, b), c in bd.unsup_moves.most_common(top):
+            print(f"   {sid:16s} {a:40s} {b:40s} {c}")
+    if bd.amb_n:
+        print(f"\n#### residual ambiguity (tracker's remaining consistent sets), mons with >=2 moves seen at turn>=7: n={bd.amb_n}")
+        print("   share of mon-decisions where the remaining sets still differ in: "
+              + ", ".join(f"{d} {100 * bd.amb_vary[d] / bd.amb_n:.0f}%" for d in ("item", "ability", "tera", "moves")))
+        print("-- species with the most residual entropy (bits, tera ignored), n>=15:")
+        rows = [(bd.amb_species_h[sp] / n, n, sp) for sp, n in bd.amb_species_n.items() if n >= 15]
+        for h, n, sp in sorted(rows, reverse=True)[:top]:
+            vary = ", ".join(f"{d} {100 * c / n:.0f}%" for d, c in bd.amb_species_vary[sp].most_common())
+            print(f"   {sp:16s} n={n:5d} H={h:5.2f}  differs in: {vary}")
+    print("\n#### gaps among well-revealed mons (>=3 moves seen), item errors counted per world")
+    print("-- by truth item (absolute error counts):")
+    for item, bad in bd.gap_item.most_common(top):
+        print(f"   {item:18s} err {bad:7d} / {bd.gap_item_total[item]:7d} = {100 * bad / bd.gap_item_total[item]:5.1f}%")
+    print("-- by species (absolute error counts):")
+    for sid, bad in bd.gap_species_bad.most_common(top):
+        print(f"   {sid:18s} err {bad:7d} / {bd.gap_species_total[sid]:7d} = {100 * bad / bd.gap_species_total[sid]:5.1f}%")
+    print("-- top (species, truth item -> world item):")
+    for (sid, t, w), c in bd.gap_conf_pair.most_common(top * 2):
+        print(f"   {sid:16s} {t:16s} -> {w:16s} {c}")
+    print("-- CONFIDENTLY wrong item (all worlds agree, wrong), (species, truth -> believed):")
+    for (sid, t, w), c in bd.gap_conf.most_common(top * 2):
+        print(f"   {sid:16s} {t:16s} -> {w:16s} {c}")
+    print("-- ability errors (species, truth -> world):")
+    for (sid, t, w), c in bd.gap_ability_pair.most_common(top):
+        print(f"   {sid:16s} {t:16s} -> {w:16s} {c}")
+    print("-- PP-used moves absent from world 0 (species, move):")
+    for (sid, m), c in bd.gap_moves.most_common(top):
+        print(f"   {sid:16s} {m:16s} {c}")
+
+
 _PP_CACHE: dict[str, int] = {}
 
 
@@ -316,6 +591,8 @@ def iter_decisions(files, rng: random.Random, per_file_cap: int | None):
             print(f"skip {path}: {exc}", file=sys.stderr)
             continue
         decisions = [r for r in rows if r.get("type") == "decision" and r.get("truth")]
+        for r in decisions:
+            r["_game"] = str(path)
         if per_file_cap and len(decisions) > per_file_cap:
             decisions = rng.sample(decisions, per_file_cap)
         yield from decisions
@@ -358,6 +635,10 @@ def main() -> None:
     parser.add_argument("--per-file", type=int, default=None, help="max decisions sampled per file")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--top", type=int, default=12)
+    parser.add_argument("--by", nargs="*", default=None, choices=["turn", "reveals", "onfield", "all"],
+                        help="breakdowns: turn / reveals (moves seen, item known, ability known) / "
+                             "onfield (turns on field); bare --by = all")
+    parser.add_argument("--gaps", action="store_true", help="worst species/items/confident-wrong lists (needs --by)")
     args = parser.parse_args()
     root = Path(args.root)
     files = [root] if root.is_file() else sorted(root.glob("*.jsonl.gz"))
@@ -366,14 +647,25 @@ def main() -> None:
         files = rng.sample(files, min(args.max_files, len(files)))
     counts: dict[str, Counts] = defaultdict(Counts)
     stats: Counter = Counter()
+    bd = Breakdown() if args.by is not None else None
     for decision in iter_decisions(files, rng, args.per_file):
         try:
-            analyse_decision(decision, counts, stats)
+            analyse_decision(decision, counts, stats, bd)
         except Exception as exc:
             stats["errors"] += 1
             if stats["errors"] <= 3:
                 print(f"decision failed: {exc!r}", file=sys.stderr)
-    report(counts, stats, args.top)
+    if bd is None:
+        report(counts, stats, args.top)
+    else:
+        names = {"turn": ["turn"], "reveals": ["moves seen", "item known", "ability known"],
+                 "onfield": ["turns on field"],
+                 "all": ["turn", "moves seen", "item known", "ability known", "turns on field"]}
+        dims = [d for k in (args.by or ["all"]) for d in names[k]]
+        print(f"decisions with truth: {stats['decisions']}  worlds: {stats['worlds']}")
+        print_breakdown(bd, dims)
+        if args.gaps:
+            print_gaps(bd, args.top)
     if stats["errors"]:
         print(f"\n{stats['errors']} decisions failed to analyse")
 

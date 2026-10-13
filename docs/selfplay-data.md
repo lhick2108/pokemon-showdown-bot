@@ -50,6 +50,7 @@ Each line is one JSON object with a `type`: `game` (first line), `decision`
 | `compute` | `search_time_ms` per world, `worlds_requested`, `worlds_searched`, `parallelism`, `threads`, total `iterations`, `wall_ms` |
 | `truth` | `{"state": "<State string>"}` or null (see below) |
 | `truth_status` | `ok`, `no-peer`, `turn-mismatch`, `error`, or `disabled` |
+| `opp_facts` | (added by 589.34; absent in older recordings) one row per revealed opposing Pokemon, active first (same order as the worlds): `species`, tracker `moves` / `item` / `ability` / `tera` revealed so far, `n_constraints`, `n_sets` (full randbats sets still consistent), `entropy` (bits, count-weighted), `n_sets_nt` / `entropy_nt` (same with the Tera type ignored), `vary` (how many distinct items / abilities / teras / move sets remain) and `groups` (up to 40 `[item, ability, "move/move/..", probability]` remaining candidates). `scripts/world_accuracy.py --by` turns these into accuracy-by-turn / by-reveals tables. |
 
 World entry: `state` (the engine `State.to_string()` that was searched, sampled
 opponent team included), `total_visits`, `avg_score` (root total score / total

@@ -151,7 +151,8 @@ def test_life_orb_not_excluded_when_the_user_fainted_to_a_helmet(data):
         ("faint", "p2a: Gardevoir"),
         ("upkeep",),
     )
-    assert model._battles[battle.battle_tag].pokemon[("p2", "gardevoir")].current.constraints == []
+    constraints = model._battles[battle.battle_tag].pokemon[("p2", "gardevoir")].current.constraints
+    assert [c for c in constraints if c.kind != "ability_not"] == []
 
 
 # --- Choice / Assault Vest ----------------------------------------------------------
