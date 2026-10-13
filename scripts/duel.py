@@ -31,6 +31,7 @@ from pathlib import Path
 from poke_env.ps_client import AccountConfiguration, LocalhostServerConfiguration
 
 from showdown_bot import bench
+from showdown_bot import teams as teams_module
 from showdown_bot.players.search import (
     MODES, SELECTIONS, SearchConfig, SearchNetPlayer, SearchPlayer, get_pool,
 )
@@ -102,6 +103,15 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--games", type=bench._positive_int, default=100)
     p.add_argument("--pairs", type=bench._positive_int, default=4, help="parallel pairs")
     p.add_argument("--format", default="gen9randombattle")
+    p.add_argument("--teams", choices=teams_module.MODES, default="random",
+                   help="random: fresh random teams every game (default). swap: team pair (T1, T2), "
+                        "game 1 net=T1/stock=T2, game 2 teams swap seats and bots. mirror: both "
+                        "sides get the same team, net plays it from both seats. swap/mirror play "
+                        "in the gen9randombattlefixed server format (needs the custom-formats "
+                        "install of scripts/start_server.ps1), need an even --games, and report a "
+                        "paired CI over team pairs")
+    p.add_argument("--team-seed", type=int, default=0,
+                   help="seed of the generated teams (--teams swap/mirror); same seed, same teams")
     p.add_argument("--search-time-ms", type=bench._positive_int, default=100,
                    help="per-world search time, identical for both sides")
     p.add_argument("--parallelism", type=bench._positive_int, default=1)
@@ -109,6 +119,7 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--threads", type=bench._positive_int, default=1)
     p.add_argument("--workers", type=bench._positive_int, default=os.cpu_count() or 4,
                    help="shared MCTS process pool size")
+    p.add_argument("--port", type=int, default=8000, help="local Showdown server port")
     p.add_argument("--connect-timeout", type=bench._positive_seconds, default=30)
     p.add_argument("--game-timeout", type=bench._positive_seconds, default=900)
     return p
@@ -135,11 +146,13 @@ def _quality(args, side: str) -> dict:
     }
 
 
-async def _duel_pair(args, share: int, pool):
+async def _duel_pair(args, share: int, pool, plans=None):
+    """One parallel net-vs-stock pair. Returns (net, stock, results), ``results`` being
+    ``[(team pair, net score)]`` for the games of ``plans`` (empty with --teams random)."""
     options = {
-        "battle_format": args.format,
+        "battle_format": teams_module.battle_format_for(args.teams, args.format),
         "max_concurrent_battles": 1,
-        "server_configuration": LocalhostServerConfiguration,
+        "server_configuration": bench.local_server(args.port),
         "log_level": logging.ERROR,
         "open_timeout": args.connect_timeout,
     }
@@ -186,20 +199,39 @@ async def _duel_pair(args, share: int, pool):
         }),
         executor=pool, **options,
     )
+    results: list[tuple[int, float]] = []
     try:
         await bench._wait_for_player_logins([net, stock], args.connect_timeout)
-        await asyncio.wait_for(
-            net.battle_against(stock, n_battles=share), timeout=args.game_timeout * share
-        )
+        if plans is None:
+            await asyncio.wait_for(
+                net.battle_against(stock, n_battles=share), timeout=args.game_timeout * share
+            )
+        else:
+            for plan in plans:  # one game at a time: both sides take their team per game
+                won, tied, done = net.n_won_battles, net.n_tied_battles, net.n_finished_battles
+                await teams_module.play_plan(plan, net, stock, args.game_timeout,
+                                             mode=args.teams, seed=args.team_seed)
+                if net.n_finished_battles != done + 1:
+                    raise RuntimeError(f"game {plan.index} did not finish")
+                score = 1.0 if net.n_won_battles > won else 0.5 if net.n_tied_battles > tied else 0.0
+                results.append((plan.pair, score))
     finally:
         await asyncio.gather(*(bench._disconnect_player(p) for p in (net, stock)))
-    return net, stock
+    return net, stock, results
 
 
 async def _run(args):
     pool = get_pool(args.workers)
-    shares = bench.split_games(args.games, args.pairs)
-    tasks = [asyncio.ensure_future(_duel_pair(args, s, pool)) for s in shares]
+    if args.teams == "random":
+        shares = bench.split_games(args.games, args.pairs)
+        share_plans = [None] * len(shares)
+    else:
+        shares = teams_module.split_pairs(args.games, args.pairs)
+        plans = teams_module.plan_games(args.teams, args.games, args.team_seed)
+        starts = [sum(shares[:i]) for i in range(len(shares))]
+        share_plans = [teams_module.slice_plans(plans, s, st) for s, st in zip(shares, starts)]
+    tasks = [asyncio.ensure_future(_duel_pair(args, s, pool, sp))
+             for s, sp in zip(shares, share_plans)]
     try:
         return await asyncio.gather(*tasks)
     except BaseException:
@@ -235,6 +267,14 @@ def main(argv=None) -> int:
         print(f"--opponent-leaf-scale must be finite and > 0, got {args.opponent_leaf_scale}",
               file=sys.stderr)
         return 2
+    if args.teams != "random":
+        try:
+            teams_module.battle_format_for(args.teams, args.format)
+            if args.games % 2:
+                raise ValueError(f"--teams {args.teams} plays pairs of games; --games must be even")
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
     start = time.perf_counter()
     try:
         pairs = asyncio.run(_run(args))
@@ -245,8 +285,8 @@ def main(argv=None) -> int:
         print(f"duel error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
     elapsed = time.perf_counter() - start
-    n = sum(net.n_finished_battles for net, _ in pairs)
-    wins = sum(net.n_won_battles for net, _ in pairs)
+    n = sum(net.n_finished_battles for net, _, _ in pairs)
+    wins = sum(net.n_won_battles for net, _, _ in pairs)
     lo, hi = bench.wilson_interval(wins, n)
     print("\n=== duel: search-net vs search ===")
     if args.evaluator:
@@ -269,6 +309,12 @@ def main(argv=None) -> int:
           f"worlds {args.worlds or '2 x parallelism (4x early)'}, threads {args.threads}; "
           f"{len(pairs)} parallel pairs, pool of {args.workers}")
     print(f"search-net wins: {wins}/{n} ({wins / max(n, 1):.1%}); Wilson 95% CI: [{lo:.1%}, {hi:.1%}]")
+    if args.teams != "random":
+        rows = [r for p in pairs for r in p[2]]
+        print(f"teams: {args.teams} (seed {args.team_seed}), format "
+              f"{teams_module.battle_format_for(args.teams, args.format)}")
+        print("search-net " + teams_module.format_paired(
+            teams_module.paired_summary(teams_module.pair_scores(rows))))
     for label, idx in (("search-net", 0), ("search    ", 1)):
         iters = sum(p[idx].stats.iterations for p in pairs)
         ms = sum(p[idx].stats.search_ms for p in pairs)

@@ -27,7 +27,7 @@ import secrets
 import sys
 import time
 from collections.abc import Awaitable, Callable, Iterable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from poke_env import to_id_str
@@ -35,6 +35,7 @@ from poke_env.player import Player
 from poke_env.ps_client import AccountConfiguration, LocalhostServerConfiguration
 
 from showdown_bot import bench
+from showdown_bot import teams as teams_module
 from showdown_bot.bench import FOULPLAY_NAME
 
 logger = logging.getLogger("showdown_bot.league")
@@ -183,6 +184,11 @@ class Game:
     p2_user: str = ""
     format: str = "gen9randombattle"
     specs: dict = field(default_factory=dict)  # label -> spec text
+    # fixed-team designs (showdown_bot.teams): mode, team pair index within the matchup (the two
+    # games of a pair share it) and the generated team ids seated as (p1, p2)
+    team_mode: str | None = None
+    team_pair: int | None = None
+    team_ids: tuple[int, int] | None = None
 
     def score_for(self, bot: str) -> float:
         if self.winner == TIE:
@@ -203,6 +209,9 @@ class Game:
             "seed": self.seed,
             "format": self.format,
             "specs": self.specs,
+            **({"team_mode": self.team_mode, "team_pair": self.team_pair,
+                "team_ids": list(self.team_ids) if self.team_ids else None}
+               if self.team_mode else {}),
         }
 
     @classmethod
@@ -216,7 +225,9 @@ class Game:
             battle_tag=d["battle_tag"], p1=d["p1"], p2=d["p2"], winner=winner,
             turns=int(d["turns"]), seed=d.get("seed"), p1_user=d.get("p1_user", ""),
             p2_user=d.get("p2_user", ""), format=d.get("format", "gen9randombattle"),
-            specs=dict(d.get("specs") or {}),
+            specs=dict(d.get("specs") or {}), team_mode=d.get("team_mode"),
+            team_pair=d.get("team_pair"),
+            team_ids=tuple(d["team_ids"]) if d.get("team_ids") else None,
         )
 
 
@@ -404,6 +415,21 @@ def head_to_head(games: Sequence[Game], bots: Sequence[str]) -> dict:
     return out
 
 
+def paired_head_to_head(games: Sequence[Game], bots: Sequence[str]) -> dict:
+    """{(a, b): paired summary} over the fixed-team games (swap / mirror) of each bot pair.
+
+    The unit is the team pair: the mean of a's scores in the two games sharing a ``team_pair``
+    (pairs missing a game are dropped); see ``teams.paired_summary``.
+    """
+    out = {}
+    for a, b in itertools.permutations(bots, 2):
+        rows = [(g.team_pair, g.score_for(a)) for g in games
+                if g.team_pair is not None and {g.p1, g.p2} == {a, b}]
+        if rows:
+            out[(a, b)] = teams_module.paired_summary(teams_module.pair_scores(rows))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
@@ -417,6 +443,7 @@ def build_results(games: Sequence[Game], bots: Sequence[str], *, n_boot: int, se
     cis = bootstrap_elo(games, bots, n_boot=n_boot, seed=seed, anchor=anchor) if n_boot > 0 else {}
     seq = sequential_elo(games, bots)
     h2h = head_to_head(games, bots)
+    paired = paired_head_to_head(games, bots)
     ratings = []
     for i, b in enumerate(bots):
         lo, hi = cis.get(b, (None, None))
@@ -427,6 +454,7 @@ def build_results(games: Sequence[Game], bots: Sequence[str], *, n_boot: int, se
         })
     ratings.sort(key=lambda r: -r["elo"])
     return {
+        "paired_head_to_head": [{"a": a, "b": b, **d} for (a, b), d in paired.items()],
         "n_games": len(games), "bots": bots, "anchor": anchor, "bootstrap": n_boot,
         "bootstrap_seed": seed, "prior_weight": PRIOR_WEIGHT, "ratings": ratings,
         "head_to_head": [
@@ -470,6 +498,26 @@ def format_markdown(res: dict) -> str:
                          f"{h['wins']}-{h['losses']}-{h['ties']}, {h['score']:.0%} "
                          f"[{h['ci_low']:.0%}, {h['ci_high']:.0%}]")
         lines.append(f"| **{a}** | " + " | ".join(cells) + " |")
+    if res.get("paired_head_to_head"):
+        lines += ["", "## Paired head to head (fixed teams)", "",
+                  "Team pairs (swap / mirror): both games of a pair use the same teams with the "
+                  "bots swapped; the unit is the pair's mean score. Row bot vs column bot: "
+                  "score% [95% t-CI over pairs] (pairs).", ""]
+        plook = {(h["a"], h["b"]): h for h in res["paired_head_to_head"]}
+        lines.append("| | " + " | ".join(bots) + " |")
+        lines.append("|---|" + "---|" * len(bots))
+        for a in bots:
+            cells = []
+            for b in bots:
+                h = plook.get((a, b))
+                if h is None:
+                    cells.append("-")
+                elif h["pairs"] < 2:
+                    cells.append(f"{h['mean']:.0%} ({h['pairs']} pair)")
+                else:
+                    cells.append(f"{h['mean']:.0%} [{h['ci_low']:.0%}, {h['ci_high']:.0%}] "
+                                 f"({h['pairs']} pairs)")
+            lines.append(f"| **{a}** | " + " | ".join(cells) + " |")
     if res.get("leaks"):
         lines += ["", "## Leak report", "", *[f"- {x}" for x in res["leaks"]]]
     return "\n".join(lines) + "\n"
@@ -493,6 +541,8 @@ def write_results(out: Path, games: Sequence[Game], bots: Sequence[str], *, n_bo
 class LeagueConfig:
     out: Path
     battle_format: str = "gen9randombattle"
+    requested_format: str = "gen9randombattle"  # the format asked for; battle_format is the
+    # fixed-team variant when teams != random
     games_per_pair: int = 10
     concurrency: int = 1
     connect_timeout: float = 30.0
@@ -504,6 +554,9 @@ class LeagueConfig:
     seed: int = 0
     search_workers: int | None = None  # shared MCTS pool size; None: per-player default
     parallel_pairs: int = 1
+    teams: str = "random"  # random | swap | mirror (showdown_bot.teams)
+    team_seed: int = 0
+    port: int = 8000
     specs: dict = field(default_factory=dict)  # label -> BotSpec
 
 
@@ -553,7 +606,7 @@ def _make_player(spec: BotSpec, cfg: LeagueConfig, recorder, concurrency: int, s
         max_concurrent_battles=concurrency,
         account_configuration=account
         or AccountConfiguration("lg" + secrets.token_hex(5), None),
-        server_configuration=server or LocalhostServerConfiguration,
+        server_configuration=server or bench.local_server(cfg.port),
         log_level=logging.ERROR,
         open_timeout=cfg.connect_timeout,
         save_replays=str(cfg.out / "replays"),
@@ -605,7 +658,7 @@ def _make_player(spec: BotSpec, cfg: LeagueConfig, recorder, concurrency: int, s
 
 
 def _new_games(bot_name: str, player: Player, opp_name: str, opp_user: str, seen: set,
-               cfg: LeagueConfig, seed: int) -> list[Game]:
+               cfg: LeagueConfig, seed: int, plan: teams_module.GamePlan | None = None) -> list[Game]:
     """Games finished since the last call, from the challenger's battles."""
     out = []
     for tag, battle in player.battles.items():
@@ -622,8 +675,10 @@ def _new_games(bot_name: str, player: Player, opp_name: str, opp_user: str, seen
             winner = TIE
         users = (player.username, opp_user) if role == "p1" else (opp_user, player.username)
         specs = {k: cfg.specs[k].text for k in (bot_name, opp_name) if k in cfg.specs}
+        team = ({"team_mode": cfg.teams, "team_pair": plan.pair,
+                 "team_ids": (plan.p1_team_id, plan.p2_team_id)} if plan else {})
         out.append(Game(tag, mine, theirs, winner, int(battle.turn), seed,
-                        users[0], users[1], cfg.battle_format, specs))
+                        users[0], users[1], cfg.battle_format, specs, **team))
     return out
 
 
@@ -631,7 +686,17 @@ async def play_matchup(a: str, b: str, cfg: LeagueConfig, tracker: Tracker, reco
                        games_path: Path, pair_index: int) -> list[Game]:
     """Play cfg.games_per_pair games between two bots (one may be Foul Play)."""
     if FOULPLAY_NAME in (cfg.specs[a].type, cfg.specs[b].type):
+        if cfg.teams != "random":  # Foul Play brings its own team in a normal random battle
+            cfg = replace(cfg, teams="random", battle_format=cfg.requested_format)
         return await _play_foulplay_matchup(a, b, cfg, tracker, recorder, games_path, pair_index)
+    plans = None
+    if cfg.teams != "random":
+        if cfg.concurrency != 1:
+            logger.warning("--teams %s plays one game at a time; ignoring --concurrency %d",
+                           cfg.teams, cfg.concurrency)
+            cfg = replace(cfg, concurrency=1)
+        plans = teams_module.plan_games(cfg.teams, cfg.games_per_pair,
+                                        cfg.team_seed * 1000 + pair_index)
     players: list[Player] = []
     games: list[Game] = []
     try:
@@ -644,7 +709,19 @@ async def play_matchup(a: str, b: str, cfg: LeagueConfig, tracker: Tracker, reco
         await bench._wait_for_player_logins(players, cfg.connect_timeout)
         by_name = {a: pa, b: pb}
         seen: set = set()  # shared: both players hold every battle of the pair
-        for p1, p2, k in seat_schedule(a, b, cfg.games_per_pair, cfg.concurrency):
+        for plan in plans or ():
+            try:
+                p1_player, _ = await teams_module.play_plan(
+                    plan, pa, pb, cfg.game_timeout, mode=cfg.teams,
+                    seed=cfg.team_seed * 1000 + pair_index)
+            except TimeoutError:
+                raise RuntimeError(f"{a} vs {b}: game {plan.index} timed out") from None
+            p1_name, p2_name = (a, b) if plan.a_is_p1 else (b, a)
+            for g in _new_games(p1_name, p1_player, p2_name, by_name[p2_name].username, seen,
+                                cfg, cfg.seed, plan):
+                append_game(games_path, g)
+                games.append(g)
+        for p1, p2, k in ([] if plans else seat_schedule(a, b, cfg.games_per_pair, cfg.concurrency)):
             waves = -(-k // cfg.concurrency)
             try:
                 await asyncio.wait_for(
@@ -750,6 +827,12 @@ def load_report(pairs: Sequence[tuple[BotSpec, BotSpec]], cfg: LeagueConfig,
 
 
 async def run_league(specs: Sequence[BotSpec], cfg: LeagueConfig) -> tuple[list[Game], list[str]]:
+    if cfg.teams != "random":
+        if cfg.games_per_pair % 2:
+            raise ValueError(f"--teams {cfg.teams} plays pairs of games; --games-per-pair must be even")
+        if cfg.battle_format != teams_module.FIXED_FORMAT:
+            cfg.requested_format = cfg.battle_format
+            cfg.battle_format = teams_module.battle_format_for(cfg.teams, cfg.battle_format)
     cfg.out.mkdir(parents=True, exist_ok=True)
     (cfg.out / "replays").mkdir(exist_ok=True)
     cfg.specs = {s.label: s for s in specs}
@@ -824,6 +907,14 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--rate-only", type=Path, metavar="DIR", help="recompute results from DIR/games.jsonl")
     p.add_argument("--pairing", choices=["roundrobin"], default="roundrobin")
     p.add_argument("--format", default="gen9randombattle")
+    p.add_argument("--teams", choices=teams_module.MODES, default="random",
+                   help="random (default): fresh random teams per game. swap / mirror: variance-"
+                        "reduced pairs of games (see showdown_bot.teams) in the gen9randombattlefixed "
+                        "server format; needs an even --games-per-pair and plays one game at a time "
+                        "per matchup. Foul Play matchups always use random teams")
+    p.add_argument("--team-seed", type=int, default=0, help="seed of the generated teams")
+    p.add_argument("--port", type=int, default=8000, help="local Showdown server port "
+                   "(not used for Foul Play, which stays on 8000)")
     p.add_argument("--concurrency", type=bench._positive_int, default=1,
                    help="games in flight per matchup (also the seat-swap chunk size)")
     p.add_argument("--search-time-ms", type=bench._positive_int, default=100)
@@ -870,7 +961,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         fp_search_time_ms=args.fp_search_time_ms, fp_parallelism=args.fp_parallelism,
         fp_threads=args.fp_threads, seed=args.seed,
         search_workers=args.search_workers, parallel_pairs=args.parallel_pairs,
+        teams=args.teams, team_seed=args.team_seed, port=args.port,
     )
+    if args.teams != "random" and args.games_per_pair % 2:
+        print(f"error: --teams {args.teams} needs an even --games-per-pair", file=sys.stderr)
+        return 2
     try:
         games, leaks = asyncio.run(run_league(specs, cfg))
     except KeyboardInterrupt:

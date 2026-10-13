@@ -101,6 +101,7 @@ class GameRecorder:
         battle_format: str | None = None,
         config: dict[str, Any] | None = None,
         player: str = "search",
+        teams: dict[str, Any] | None = None,
     ) -> None:
         header = {
             "type": "game",
@@ -114,6 +115,8 @@ class GameRecorder:
             "config": config or {},
             "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         }
+        if teams:  # fixed-team duels (showdown_bot.teams): mode, team pair id, team ids
+            header["teams"] = teams
         with self._lock:
             self._games[(battle_tag, username)] = [header]
 
