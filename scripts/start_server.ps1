@@ -1,8 +1,10 @@
+param([int]$Port = 8000)
+
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $cacheRoot = Join-Path $repoRoot '.cache'
-$serverPath = Join-Path $repoRoot 'vendor\pokemon-showdown'
+$serverPath = if ($env:SHOWDOWN_BOT_SERVER_DIR) { $env:SHOWDOWN_BOT_SERVER_DIR } else { Join-Path $repoRoot 'vendor\pokemon-showdown' }
 
 # Current Pokemon Showdown releases require Node 22.18 or later.
 $minimumNodeVersion = [version]'22.18.0'
@@ -93,9 +95,17 @@ if ($lastBindAddress -notmatch '^\s*exports\.bindaddress\s*=\s*[''"]127\.0\.0\.1
     Add-Content -LiteralPath $config -Value "`r`nexports.bindaddress = '127.0.0.1';"
 }
 
+# Custom formats (gen9randombattlefixed: player-supplied teams, randbats rules). Idempotent copy.
+$customSrc = Join-Path $PSScriptRoot 'showdown\custom-formats.ts'
+$customDst = Join-Path $serverPath 'config\custom-formats.ts'
+if (-not (Test-Path -LiteralPath $customDst) -or
+    (Get-FileHash -LiteralPath $customSrc).Hash -ne (Get-FileHash -LiteralPath $customDst).Hash) {
+    Copy-Item -LiteralPath $customSrc -Destination $customDst -Force
+}
+
 Push-Location $serverPath
 try {
-    node pokemon-showdown start 8000 --no-security
+    node pokemon-showdown start $Port --no-security
     if ($LASTEXITCODE -ne 0) {
         throw "Pokemon Showdown exited with code $LASTEXITCODE"
     }

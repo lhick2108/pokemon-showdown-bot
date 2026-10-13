@@ -18,6 +18,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from showdown_bot.teams import data_format
 from showdown_bot import sleep as sleep_module
 from showdown_bot.inference import (
     Constraint,
@@ -314,6 +315,7 @@ class RandbatsData:
         battle for lack of (or stale/unreachable) full data.
         """
         cache_path = Path(cache_dir)
+        format = data_format(format)  # gen9randombattlefixed plays with gen9randombattle data
         sets_path = cache_path / f"{format}.json"
         stats_path = cache_path / "stats" / f"{format}.json"
         full_path = cache_path / "full" / f"{format}.json"

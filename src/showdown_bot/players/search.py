@@ -1031,6 +1031,7 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
                     role=getattr(battle, "player_role", None),
                     battle_format=self.format,
                     config=asdict(self.config),
+                    teams=getattr(self, "team_info", None),
                 )
             worlds = [
                 recorder_module.world_record(

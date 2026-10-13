@@ -21,7 +21,9 @@ from poke_env.player import (
     RandomPlayer,
     SimpleHeuristicsPlayer,
 )
-from poke_env.ps_client import AccountConfiguration, LocalhostServerConfiguration
+from poke_env.ps_client import (
+    AccountConfiguration, LocalhostServerConfiguration, ServerConfiguration,
+)
 
 from showdown_bot.players.search import SearchNetPlayer, SearchPlayer
 
@@ -501,6 +503,15 @@ async def _wait_for_foulplay_ready(
                 f"{timeout:g} seconds. See {log_path} for details."
             )
         await asyncio.sleep(0.2)
+
+
+def local_server(port: int = 8000) -> ServerConfiguration:
+    """Local Showdown server on ``port`` (poke-env's localhost config for 8000)."""
+    if port == 8000:
+        return LocalhostServerConfiguration
+    return ServerConfiguration(
+        f"ws://localhost:{port}/showdown/websocket", LocalhostServerConfiguration.authentication_url
+    )
 
 
 def split_games(n: int, instances: int) -> list[int]:
