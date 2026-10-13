@@ -13,7 +13,9 @@ Data and split
     Positions of one battle are strongly correlated, so train/val is split by
     ``battle_tag`` (both players' recordings of a battle share a tag and stay
     together). ``--states`` picks exact "truth" states, sampled opponent
-    "worlds", or both (default).
+    "worlds", both (default), or ``prefer-truth`` (truth where a decision has
+    one, else its sampled worlds: low memory on self-play, still uses
+    ladder/league records that lack truth).
 
 Weighting (``--weighting``)
     Every position carries its battle's outcome, so long games would otherwise
@@ -80,7 +82,7 @@ from torch import nn
 from showdown_bot import augment, dataset
 
 WEIGHTINGS = ("sqrt", "game", "none")
-STATE_CHOICES = ("both", "truth", "worlds")
+STATE_CHOICES = ("both", "truth", "worlds", "prefer-truth")
 VALUE_TARGETS = ("outcome", "search", "blend", "td", "nstep")
 N_BUCKETS = 10
 
@@ -198,8 +200,9 @@ def load_data(
     load = dataset.LoadStats()
     for path in paths:
         for s in dataset.iter_samples(
-            path, sides=(1,), worlds=states in ("both", "worlds"),
-            truth=states in ("both", "truth"), stats=load, q_source=q_source,
+            path, sides=(1,),
+            worlds="fallback" if states == "prefer-truth" else states in ("both", "worlds"),
+            truth=states in ("both", "truth", "prefer-truth"), stats=load, q_source=q_source,
             q_eval_scale=q_eval_scale, feature_version=feature_version,
         ):
             feats.append(np.asarray(s.features, dtype=np_dtype))  # a list of Python floats costs ~8x the memory

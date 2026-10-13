@@ -66,6 +66,20 @@ def test_loader_targets_are_signed_for_both_sides(tmp_path, state_string):
     assert by["w", 2, "world"].policy is None
 
 
+def test_prefer_truth_uses_truth_else_worlds(tmp_path, state_string):
+    _write(tmp_path, state_string, recorder.RESULT_WIN, "has_truth")
+    rec = recorder.GameRecorder(tmp_path)
+    rec.start_game("no_truth", "u")
+    rec.add_decision("no_truth", "u", {
+        "turn": 1, "worlds": [fake_world(state_string), fake_world(state_string)],
+        "policy": {"a": 1.0}, "chosen": "a",
+    })
+    rec.end_game("no_truth", "u", recorder.RESULT_WIN, turns=2)
+    samples = list(dataset.iter_samples(tmp_path, worlds="fallback", truth=True))
+    kinds = sorted((s.battle_tag, s.kind) for s in samples); print(kinds)
+    assert kinds == [("has_truth", "truth"), ("no_truth", "world"), ("no_truth", "world")]
+
+
 def test_default_triples_are_side_one_and_bad_states_are_counted(tmp_path, state_string):
     _write(tmp_path, state_string, recorder.RESULT_WIN, "w")
     write_fake_game(recorder.GameRecorder(tmp_path), tag="bad")  # "S1": engine cannot parse
