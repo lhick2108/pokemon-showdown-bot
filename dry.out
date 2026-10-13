@@ -1,0 +1,12 @@
+bot> Logged in as ldr67626b99 on LOCAL dry-run server; bot search; move cap 5s; accepting gen9randombattle challenges; Ctrl-C to stop
+--- chle2869c0a challenges ldr67626b99 in gen8randombattle
+bot> challenge from chle2869c0a (gen8randombattle): REJECT - format gen8randombattle (only gen9randombattle)
+--- chle2869c0a challenges ldr67626b99 in gen9randombattle
+bot> challenge from chle2869c0a (gen9randombattle): ACCEPT - ok
+bot> [1/1] battle-gen9randombattle-25778 vs chle2869c0a: win in 36 turns, rating n/a
+bot> ran 24s; challenges accepted 1, rejected 1
+bot> Challenge games: 1  W-L-T 1-0-0
+bot> Win rate 100.0%  Wilson 95% CI [20.7%, 100.0%]
+bot> Rating: not reported by the server
+bot> Challenges accepted 1, rejected 1
+DRY RUN PASSED
