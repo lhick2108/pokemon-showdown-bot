@@ -104,6 +104,7 @@ def main(argv=None):
         l2, h2 = bench.wilson_interval(tw, tn)
         print(f"games where the bias triggered: {tw}/{tn} ({tw / tn:.1%}) CI [{l2:.1%}, {h2:.1%}]")
     print(f"opponent trigger turns={trig} biased turns={biased}; "
+          f"cond-priority turns={sum(u.cond_turns for u, _ in pairs)} used={sum(u.cond_used for u, _ in pairs)}; "
           f"our decisions with evidence={sum(u.tendency_decisions for u, _ in pairs)}; "
           f"fallbacks={sum(u.stats.fallbacks for u, _ in pairs)} wall={time.perf_counter() - start:.0f}s")
     return 0 if n else 1

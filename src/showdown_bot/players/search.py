@@ -652,6 +652,8 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         self._sampler = engine_state.TeamSampler(data)
         self.last_policy: dict[str, float] = {}
         self.last_tendency: dict[str, Any] | None = None  # diagnostics of the last exploit
+        self.cond_turns = 0  # decisions where we held Sucker Punch-like moves
+        self.cond_used = 0  # ...of which we chose one
         self.tendency_decisions = 0  # decisions where evidence moved the strategy
         self.last_choice: str | None = None
         # Recording is off unless a recorder is passed or SHOWDOWN_RECORD_DIR is set.
@@ -699,6 +701,13 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
 
     async def _choose(self, battle: Any) -> BattleOrder | None:
         query = None
+        self._tendency_context = None
+        if not getattr(battle, "force_switch", False):
+            try:  # bookkeeping for validation (how often we hold Sucker Punch-like moves)
+                self._tendency_context = tendency_module.context_from_battle(battle)
+                self.cond_turns += self._tendency_context.cond_priority
+            except Exception:
+                pass
         if self.config.tendency:
             try:
                 query = self._tendency_query(battle)
@@ -772,9 +781,10 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         if not getattr(battle, "force_switch", False):
             tracker.set_context(battle.turn, context)
         self._tendency_context = context
-        return TendencyQuery(
-            tracker.counts_for(context), self.config.tendency_kappa, self.config.tendency_delta
-        )
+        # The all-clear bucket pools every ordinary turn, so its counts only restate the
+        # Nash mix; exploit only contexts that carry a guessing-game feature.
+        counts = tracker.counts_for(context) if context.key != "---" else {}
+        return TendencyQuery(counts, self.config.tendency_kappa, self.config.tendency_delta)
 
     def _note_tendency(self, query: TendencyQuery | None) -> None:
         self.last_tendency = None
@@ -809,6 +819,9 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             legal_policy, mode or self.config.mode, self._rng, self.config.mixed_threshold
         )
         self.last_choice = choice
+        if choice is not None and getattr(self, "_tendency_context", None) is not None:
+            if self._tendency_context.cond_priority and choice.removesuffix("-tera") in tendency_module.PRIORITY_CONDITIONAL:
+                self.cond_used += 1
         return orders[choice] if choice is not None else None
 
     async def _run_worlds(self, state_strings: list[str], time_ms: int) -> list[WorldResult]:
