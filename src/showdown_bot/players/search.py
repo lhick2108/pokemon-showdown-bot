@@ -179,6 +179,8 @@ class SearchConfig:
     nash_floor: float = DEFAULT_NASH_FLOOR  # mode="nash": drop actions below this share
     inference: bool = True  # 589.28 opponent set inference (False: pre-589.28 sampling)
     damage_inference: bool = True  # ...of which: damage-roll inference (needs inference)
+    eval_lowhp_knee: float = 0.0  # 589.32 experiment: >0 discounts alive/item/boost value of low-HP mons
+    eval_boost_scale: float = 1.0  # 589.32 experiment: multiplier on all stat-boost eval terms
 
     @classmethod
     def from_env(cls) -> SearchConfig:
@@ -208,6 +210,8 @@ class SearchConfig:
             not in ("0", "off", "false", "no"),
             damage_inference=os.environ.get("SHOWDOWN_INFERENCE_DAMAGE", "1").strip().lower()
             not in ("0", "off", "false", "no"),
+            eval_lowhp_knee=_env_float("SHOWDOWN_EVAL_LOWHP_KNEE", 0.0, 0.0, 1.0),
+            eval_boost_scale=_env_float("SHOWDOWN_EVAL_BOOST_SCALE", 1.0, 0.0, 10.0),
         )
 
     def plan(self, early: bool) -> tuple[int, int]:
@@ -678,7 +682,8 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
                 executor, _worker.search_world, state, time_ms, self.config.threads,
                 self.config.evaluator, self.config.evaluator_scale,
                 self.config.selection, self.config.selection_gamma,
-                self.config.mode == NASH,
+                self.config.mode == NASH, self.config.eval_lowhp_knee,
+                self.config.eval_boost_scale,
             )
             for state in state_strings
         ]

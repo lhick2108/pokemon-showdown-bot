@@ -41,6 +41,8 @@ def search_world(
     selection: str = "ucb1",
     selection_gamma: float = 0.1,
     joint: bool = False,
+    eval_knee: float = 0.0,
+    eval_boost_scale: float = 1.0,
 ) -> tuple:
     """Run MCTS on one serialised world.
 
@@ -50,13 +52,24 @@ def search_world(
     With ``joint`` (Nash mode) the result is always a 4-tuple: the third element is the
     strategy list or ``None`` (ucb1), the fourth ``(k2, [(i, j, visits, mean), ...])``,
     the root joint-action matrix (``k2`` = the opponent's option count).
+    ``eval_boost_scale`` multiplies every stat-boost term (1.0 = stock).
+    ``eval_knee`` > 0 enables the experimental low-HP evaluation discount (bead 589.32; needs
+    an engine build that has ``set_eval_low_hp_knee``); 0.0 is the stock evaluation. The
+    setting is process-wide in the engine, so it is applied before every search.
     Plain tuples keep the result cheap to pickle. A Rust panic surfaces in
     Python as ``pyo3_runtime.PanicException`` (a ``BaseException``), so it is
     converted to an ordinary ``RuntimeError`` here.
     """
+    import poke_engine
     from poke_engine import State, monte_carlo_tree_search
 
     try:
+        setter = getattr(poke_engine, "set_eval_low_hp_knee", None)
+        if setter is not None:
+            setter(float(eval_knee))
+            poke_engine.set_eval_boost_scale(float(eval_boost_scale))
+        elif eval_knee or eval_boost_scale != 1.0:
+            raise RuntimeError("this poke_engine build has no 589.32 eval switches (wheel needed)")
         state = State.from_string(state_string)
         kwargs: dict = {}
         if evaluator_path is not None:
