@@ -476,7 +476,7 @@ def test_nash_mode_reaches_worker_and_returns_a_joint_matrix(data):
     pool.shutdown()
     assert order.message in _legal(_battle())
     assert p.stats.fallbacks == 0 and p.stats.world_errors == 0
-    assert calls and all(args[-1] is True for args in calls)
+    assert calls and all(args[7] is True for args in calls)
     assert sum(p.last_policy.values()) == pytest.approx(1.0, abs=1e-6)
 
 
