@@ -67,6 +67,12 @@ def _parser() -> argparse.ArgumentParser:
                    help="589.32: multiplier on stat-boost eval terms for the net side (1 = stock)")
     p.add_argument("--stock-eval-boost-scale", type=float, default=1.0,
                    help="589.32: multiplier on stat-boost eval terms for the stock side (1 = stock)")
+    p.add_argument("--net-tendency", choices=("on", "off"), default="off",
+                   help="589.40 opponent tendency model on the net side (default off)")
+    p.add_argument("--stock-tendency", choices=("on", "off"), default="off",
+                   help="589.40 opponent tendency model on the stock side (default off)")
+    p.add_argument("--tendency-kappa", type=float, default=None, help="prior pseudo-observations")
+    p.add_argument("--tendency-delta", type=float, default=None, help="max loss vs Nash")
     p.add_argument("--selection-gamma", type=float, default=0.1,
                    help="exploration rate in (0, 1] for exp3/rm sides")
     p.add_argument("--stock-uses-evaluator", action="store_true",
@@ -84,6 +90,15 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--connect-timeout", type=bench._positive_seconds, default=30)
     p.add_argument("--game-timeout", type=bench._positive_seconds, default=900)
     return p
+
+
+def _tendency_fields(args, flag: str) -> dict:
+    fields = {"tendency": flag == "on"}
+    if args.tendency_kappa is not None:
+        fields["tendency_kappa"] = args.tendency_kappa
+    if args.tendency_delta is not None:
+        fields["tendency_delta"] = args.tendency_delta
+    return fields
 
 
 async def _duel_pair(args, share: int, pool):
@@ -109,7 +124,8 @@ async def _duel_pair(args, share: int, pool):
                           "damage_inference": args.net_damage_inference == "on",
                           "mode": args.net_mode,
                           "eval_lowhp_knee": args.net_eval_lowhp,
-                          "eval_boost_scale": args.net_eval_boost_scale}),
+                          "eval_boost_scale": args.net_eval_boost_scale,
+                          **_tendency_fields(args, args.net_tendency)}),
         executor=pool, **options,
     )
     stock_cls = SearchNetPlayer if (args.stock_uses_evaluator and args.evaluator) else SearchPlayer
@@ -123,6 +139,7 @@ async def _duel_pair(args, share: int, pool):
             "mode": args.stock_mode,
             "eval_lowhp_knee": args.stock_eval_lowhp,
             "eval_boost_scale": args.stock_eval_boost_scale,
+            **_tendency_fields(args, args.stock_tendency),
         }),
         executor=pool, **options,
     )
@@ -161,6 +178,9 @@ def main(argv=None) -> int:
         if args.threads > 1:
             print("exp3/rm selection needs --threads 1", file=sys.stderr)
             return 2
+    if "on" in (args.net_tendency, args.stock_tendency) and args.threads > 1:
+        print("tendency needs --threads 1", file=sys.stderr)
+        return 2
     if "nash" in (args.net_mode, args.stock_mode) and args.threads > 1:
         print("nash mode needs --threads 1", file=sys.stderr)
         return 2
@@ -188,7 +208,8 @@ def main(argv=None) -> int:
         print("evaluator: none (stock search on both sides)")
     print(f"selection: net={args.net_selection} stock={args.stock_selection} "
           f"(gamma {args.selection_gamma:g} for exp3/rm); "
-          f"mode: net={args.net_mode} stock={args.stock_mode}")
+          f"mode: net={args.net_mode} stock={args.stock_mode}; "
+          f"tendency: net={args.net_tendency} stock={args.stock_tendency}")
     print(f"compute (both sides): {args.search_time_ms} ms/world, parallelism {args.parallelism}, "
           f"worlds {args.worlds or '2 x parallelism (4x early)'}, threads {args.threads}; "
           f"{len(pairs)} parallel pairs, pool of {args.workers}")

@@ -43,6 +43,7 @@ def search_world(
     joint: bool = False,
     eval_knee: float = 0.0,
     eval_boost_scale: float = 1.0,
+    opp_names: bool = False,
 ) -> tuple:
     """Run MCTS on one serialised world.
 
@@ -56,6 +57,8 @@ def search_world(
     ``eval_knee`` > 0 enables the experimental low-HP evaluation discount (bead 589.32; needs
     an engine build that has ``set_eval_low_hp_knee``); 0.0 is the stock evaluation. The
     setting is process-wide in the engine, so it is applied before every search.
+    With ``opp_names`` (tendency model, needs ``joint``) a fifth element lists the
+    opponent's option choice strings, aligned with the joint matrix columns.
     Plain tuples keep the result cheap to pickle. A Rust panic surfaces in
     Python as ``pyo3_runtime.PanicException`` (a ``BaseException``), so it is
     converted to an ordinary ``RuntimeError`` here.
@@ -91,7 +94,10 @@ def search_world(
                 if selection != "ucb1"
                 else None
             )
-            return (int(result.total_visits), options, strategies, (len(result.side_two), cells))
+            out = (int(result.total_visits), options, strategies, (len(result.side_two), cells))
+            if opp_names:
+                out += ([str(option.move_choice) for option in result.side_two],)
+            return out
         if selection != "ucb1":
             return (
                 int(result.total_visits),

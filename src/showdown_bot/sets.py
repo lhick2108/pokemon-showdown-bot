@@ -2356,6 +2356,13 @@ class OpponentModelPlayerMixin:
                 sleep_module.observe_events(battle_tag, split_messages[1:])
             except Exception:  # bookkeeping must never break the battle loop
                 logger.debug("Sleep tracking failed in %s", battle_tag, exc_info=True)
+            try:  # the opponent's action class per context (bead 589.40)
+                from showdown_bot import opponent_tendency
+
+                role = getattr(getattr(self, "_battles", {}).get(battle_tag), "player_role", None)
+                opponent_tendency.observe_events(battle_tag, split_messages[1:], role)
+            except Exception:
+                logger.debug("Tendency tracking failed in %s", battle_tag, exc_info=True)
         result = await super()._handle_battle_message(split_messages)
         if battle_tag is not None:
             battle = getattr(self, "_battles", {}).get(battle_tag)

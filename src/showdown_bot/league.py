@@ -52,9 +52,11 @@ PRIOR_WEIGHT = 0.5  # virtual tie games added between every pair of bots
 
 SPEC_KEYS = {
     "search": {"evaluator": str, "scale": float, "time_ms": int, "worlds": int,
-               "selection": str, "gamma": float, "mode": str},
+               "selection": str, "gamma": float, "mode": str,
+               "tendency": str, "tkappa": float, "tdelta": float},
     "search-net": {"evaluator": str, "scale": float, "time_ms": int, "worlds": int,
-                   "selection": str, "gamma": float, "mode": str},
+                   "selection": str, "gamma": float, "mode": str,
+               "tendency": str, "tkappa": float, "tdelta": float},
 }
 
 
@@ -137,7 +139,11 @@ def parse_spec(text: str) -> BotSpec:
                 raise ValueError(f"gamma must be in (0, 1] in bot spec {raw!r}")
             if key == "mode" and parsed.lower() not in ("mixed", "argmax", "nash"):
                 raise ValueError(f"mode must be mixed, argmax or nash in bot spec {raw!r}")
-            params.append((key, parsed.lower() if key in ("selection", "mode") else parsed))
+            if key == "tendency" and parsed.lower() not in ("on", "off"):
+                raise ValueError(f"tendency must be on or off in bot spec {raw!r}")
+            if key in ("tkappa", "tdelta") and not (math.isfinite(parsed) and parsed >= 0):
+                raise ValueError(f"{key} must be >= 0 in bot spec {raw!r}")
+            params.append((key, parsed.lower() if key in ("selection", "mode", "tendency") else parsed))
     if type_name == "search-net" and not any(k == "evaluator" for k, _ in params) \
             and not os.environ.get("SHOWDOWN_SEARCH_EVALUATOR"):
         raise ValueError(f"search-net spec {raw!r} needs evaluator=<path.pev>")
@@ -556,6 +562,14 @@ def _make_player(spec: BotSpec, cfg: LeagueConfig, recorder, concurrency: int, s
             if "mode" not in _init_params(cls):
                 raise ValueError(f"{spec.label}: mode needs SearchPlayer(mode=...)")
             kwargs["mode"] = spec.param("mode")
+        if spec.param("tendency") is not None:
+            if "tendency" not in _init_params(cls):
+                raise ValueError(f"{spec.label}: tendency needs SearchPlayer(tendency=...)")
+            kwargs["tendency"] = spec.param("tendency") == "on"
+            if spec.param("tkappa") is not None:
+                kwargs["tendency_kappa"] = spec.param("tkappa")
+            if spec.param("tdelta") is not None:
+                kwargs["tendency_delta"] = spec.param("tdelta")
         if cfg.search_workers:
             kwargs["executor"] = get_pool(cfg.search_workers)
     return cls(**kwargs)
@@ -775,7 +789,7 @@ def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     p.add_argument("--bots", help="comma-separated label=type[:key=value...] or plain type. Types: "
                    + ", ".join(sorted(bench.PLAYER_REGISTRY)) + ", foulplay. search keys: "
-                   "evaluator, scale, time_ms, worlds, selection (ucb1|exp3|rm), gamma, mode (mixed|argmax|nash). e.g. net=search-net:evaluator=m.pev:scale=4")
+                   "evaluator, scale, time_ms, worlds, selection (ucb1|exp3|rm), gamma, mode (mixed|argmax|nash), tendency (on|off), tkappa, tdelta. e.g. net=search-net:evaluator=m.pev:scale=4")
     p.add_argument("--games-per-pair", type=bench._positive_int, default=20)
     p.add_argument("--out", type=Path, help="output dir, e.g. data/league/<run-id>")
     p.add_argument("--rate-only", type=Path, metavar="DIR", help="recompute results from DIR/games.jsonl")
