@@ -80,10 +80,17 @@ class Run:
         print(f"[{len(self.games)}/{self.args.games}] {game.battle_tag} vs {game.opponent}: "
               f"{game.result} in {game.turns} turns, rating {rating}", flush=True)
 
+    def recorder(self):
+        # per-decision search records (worlds, policy) so ladder blunders can be replayed
+        if getattr(self, "_recorder", None) is None:
+            from showdown_bot.recorder import GameRecorder
+            self._recorder = GameRecorder(self.out / "records", truth=False)
+        return self._recorder
+
     def make_player(self):
         cfg = league.LeagueConfig(out=self.out, connect_timeout=self.args.connect_timeout)
         player = league._make_player(
-            self.spec, cfg, None, self.args.max_concurrent, secrets.randbits(16),
+            self.spec, cfg, self.recorder(), self.args.max_concurrent, secrets.randbits(16),
             account=self.account(), server=self.server,
             wrap=lambda cls: ladder.with_ladder_hooks(
                 cls, move_cap_s=self.args.move_cap, on_finish=self.on_finish,
