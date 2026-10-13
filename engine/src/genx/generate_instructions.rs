@@ -1,4 +1,4 @@
-use super::abilities::{
+﻿use super::abilities::{
     ability_after_damage_hit, ability_before_move, ability_end_of_turn,
     ability_modify_attack_against, ability_modify_attack_being_used, ability_on_switch_in,
     ability_on_switch_out, Abilities,
@@ -8626,6 +8626,157 @@ mod tests {
         );
 
         assert_eq!(expected_instructions, incoming_instructions);
+    }
+
+    fn imposter_setup() -> State {
+        let mut state: State = State::default();
+        {
+            let ditto = &mut state.side_one.pokemon[PokemonIndex::P1];
+            ditto.id = crate::pokemon::PokemonName::DITTO;
+            ditto.ability = Abilities::IMPOSTER;
+            ditto.base_ability = Abilities::IMPOSTER;
+            ditto.attack = 48;
+            ditto.special_attack = 48;
+            ditto.speed = 48;
+            ditto.weight_kg = 4.0;
+            ditto.maxhp = 100;
+            ditto.hp = 100;
+            ditto.moves.m0 = Move {
+                id: Choices::TRANSFORM,
+                disabled: false,
+                pp: 16,
+                choice: MOVES.get(&Choices::TRANSFORM).unwrap().to_owned(),
+            };
+            ditto.moves.m1 = Move::default();
+            ditto.moves.m2 = Move::default();
+            ditto.moves.m3 = Move::default();
+        }
+        {
+            let foe = state.side_two.get_active();
+            foe.types = (PokemonType::DRAGON, PokemonType::FIRE);
+            foe.ability = Abilities::INTIMIDATE;
+            foe.attack = 300;
+            foe.defense = 250;
+            foe.special_attack = 310;
+            foe.special_defense = 200;
+            foe.speed = 280;
+            foe.hp = 150;
+            foe.maxhp = 300;
+            foe.weight_kg = 77.7;
+            foe.moves.m0.id = Choices::NASTYPLOT;
+            foe.moves.m0.choice = MOVES.get(&Choices::NASTYPLOT).unwrap().to_owned();
+            foe.moves.m1.id = Choices::DRACOMETEOR;
+            foe.moves.m1.choice = MOVES.get(&Choices::DRACOMETEOR).unwrap().to_owned();
+            foe.moves.m1.pp = 8;
+            foe.moves.m2 = Move::default();
+            foe.moves.m3 = Move::default();
+        }
+        state.side_two.special_attack_boost = 2;
+        state.side_two.speed_boost = -1;
+        state
+    }
+
+    #[test]
+    fn test_imposter_switch_in_copies_target_and_reverses() {
+        let mut state = imposter_setup();
+        let before = state.serialize();
+        let mut incoming = StateInstructions::default();
+        generate_instructions_from_switch(
+            &mut state,
+            PokemonIndex::P1,
+            SideReference::SideOne,
+            &mut incoming,
+        );
+        let d = state.side_one.get_active_immutable();
+        assert_eq!(d.id, crate::pokemon::PokemonName::DITTO);
+        assert_eq!(d.types, (PokemonType::DRAGON, PokemonType::FIRE));
+        assert_eq!(d.ability, Abilities::INTIMIDATE);
+        assert_eq!((d.attack, d.defense, d.special_attack), (300, 250, 310));
+        assert_eq!((d.special_defense, d.speed), (200, 280));
+        assert_eq!(d.hp, 100, "HP is not copied");
+        assert_eq!(d.maxhp, 100);
+        assert_eq!(d.weight_kg, 77.7);
+        assert_eq!(d.moves.m0.id, Choices::NASTYPLOT);
+        assert_eq!(d.moves.m1.id, Choices::DRACOMETEOR);
+        assert_eq!(d.moves.m0.pp, 5);
+        assert_eq!(d.moves.m1.pp, 5);
+        assert_eq!(d.moves.m2.id, Choices::NONE);
+        assert_eq!(state.side_one.special_attack_boost, 2);
+        assert_eq!(state.side_one.speed_boost, -1);
+        assert!(state
+            .side_one
+            .volatile_statuses
+            .contains(&PokemonVolatileStatus::TRANSFORMED));
+        // transformed mon round-trips through serialization
+        let rt = State::deserialize(&state.serialize());
+        assert_eq!(rt.serialize(), state.serialize());
+        assert_eq!(
+            rt.side_one.get_active_immutable().moves.m1.id,
+            Choices::DRACOMETEOR
+        );
+
+        state.reverse_instructions(&incoming.instruction_list);
+        assert_eq!(state.serialize(), before);
+    }
+
+    #[test]
+    fn test_imposter_fails_against_substitute_and_transformed_target() {
+        let mut state = imposter_setup();
+        state
+            .side_two
+            .volatile_statuses
+            .insert(PokemonVolatileStatus::SUBSTITUTE);
+        let mut incoming = StateInstructions::default();
+        generate_instructions_from_switch(
+            &mut state,
+            PokemonIndex::P1,
+            SideReference::SideOne,
+            &mut incoming,
+        );
+        assert_eq!(incoming.instruction_list.len(), 1); // only the Switch
+        assert_eq!(state.side_one.get_active_immutable().attack, 48);
+
+        let mut state = imposter_setup();
+        state
+            .side_two
+            .volatile_statuses
+            .insert(PokemonVolatileStatus::TRANSFORMED);
+        let mut incoming = StateInstructions::default();
+        generate_instructions_from_switch(
+            &mut state,
+            PokemonIndex::P1,
+            SideReference::SideOne,
+            &mut incoming,
+        );
+        assert_eq!(incoming.instruction_list.len(), 1);
+    }
+
+    #[test]
+    fn test_imposter_clears_transformed_volatile_and_ability_on_switch_out() {
+        let mut state = imposter_setup();
+        let mut incoming = StateInstructions::default();
+        generate_instructions_from_switch(
+            &mut state,
+            PokemonIndex::P1,
+            SideReference::SideOne,
+            &mut incoming,
+        );
+        let mut out = StateInstructions::default();
+        generate_instructions_from_switch(
+            &mut state,
+            PokemonIndex::P0,
+            SideReference::SideOne,
+            &mut out,
+        );
+        assert!(!state
+            .side_one
+            .volatile_statuses
+            .contains(&PokemonVolatileStatus::TRANSFORMED));
+        assert_eq!(state.side_one.speed_boost, 0);
+        assert_eq!(
+            state.side_one.pokemon[PokemonIndex::P1].ability,
+            Abilities::IMPOSTER
+        );
     }
 
     #[test]

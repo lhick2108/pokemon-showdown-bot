@@ -264,6 +264,7 @@ define_enum_with_from_str! {
         UNBURDEN,
         UPROAR,
         YAWN,
+        TRANSFORMED,
     },
     default = NONE
 }
@@ -1396,7 +1397,7 @@ impl State {
             let should_retain = match pkmn_volatile_status {
                 PokemonVolatileStatus::SUBSTITUTE => baton_passing || shed_tailing,
                 PokemonVolatileStatus::LEECHSEED => baton_passing,
-                PokemonVolatileStatus::TYPECHANGE => {
+                PokemonVolatileStatus::TYPECHANGE | PokemonVolatileStatus::TRANSFORMED => {
                     let active = side.get_active();
                     if active.base_types != active.types {
                         instructions.push(Instruction::ChangeType(ChangeType {

@@ -11,12 +11,13 @@ use crate::define_enum_with_from_str;
 use crate::instruction::{
     ApplyVolatileStatusInstruction, BoostInstruction, ChangeAbilityInstruction,
     ChangeItemInstruction, ChangeSideConditionInstruction, ChangeStatusInstruction, ChangeTerrain,
-    ChangeType, ChangeVolatileStatusDurationInstruction, ChangeWeather, DamageInstruction,
-    FormeChangeInstruction, HealInstruction, Instruction, StateInstructions,
+    ChangeMoveInstruction, ChangeStatInstruction, ChangeType,
+    ChangeVolatileStatusDurationInstruction, ChangeWeather, ChangeWeightInstruction,
+    DamageInstruction, DecrementPPInstruction, FormeChangeInstruction, HealInstruction, Instruction, StateInstructions,
 };
 use crate::pokemon::PokemonName;
 use crate::state::{
-    PokemonBoostableStat, PokemonSideCondition, PokemonStatus, PokemonType, Side, SideReference,
+    PokemonBoostableStat, PokemonMoveIndex, PokemonSideCondition, PokemonStatus, PokemonType, Side, SideReference,
     State,
 };
 use std::cmp;
@@ -1359,6 +1360,174 @@ pub fn ability_end_of_turn(
     }
 }
 
+/// Imposter: on switch-in, transform into the opposing active Pokemon
+/// (Pokemon Showdown `Pokemon.transformInto`, gen 9). Copies types, attack/defense/
+/// special attack/special defense/speed (not HP), all stat boosts, moves (5 PP each),
+/// ability and weight. Fails if either side is already transformed, the target has a
+/// substitute or a disguised Illusion, or either mon is fainted. Tera type and
+/// terastallization state are NOT copied (the target's pre-Tera types are copied).
+/// The user keeps its own species id (so stats are not recalculated), and the
+/// copied stats/moves are not restored on switch-out (the TRANSFORMED volatile is
+/// removed and the ability reverts; Imposter re-copies on the next entry).
+pub fn imposter_transform(
+    state: &mut State,
+    side_ref: &SideReference,
+    instructions: &mut StateInstructions,
+) {
+    let (own_side, foe_side) = state.get_both_sides(side_ref);
+    let foe = foe_side.get_active_immutable();
+    let own = own_side.get_active_immutable();
+    if own.hp <= 0
+        || foe.hp <= 0
+        || foe.ability == Abilities::ILLUSION
+        || foe_side
+            .volatile_statuses
+            .contains(&PokemonVolatileStatus::SUBSTITUTE)
+        || foe_side
+            .volatile_statuses
+            .contains(&PokemonVolatileStatus::TRANSFORMED)
+        || own_side
+            .volatile_statuses
+            .contains(&PokemonVolatileStatus::TRANSFORMED)
+    {
+        return;
+    }
+    // PS: `pokemon.getTypes(true, true)` -> excludes added types AND ignores
+    // terastallization, so the pre-Tera typing is copied
+    let foe_types = foe.types;
+    let foe_ability = foe.ability;
+    let foe_stats = (
+        foe.attack,
+        foe.defense,
+        foe.special_attack,
+        foe.special_defense,
+        foe.speed,
+    );
+    let foe_weight_hg = (foe.weight_kg * 10.0).round() as i16;
+    let foe_moves = [
+        foe.moves.m0.id,
+        foe.moves.m1.id,
+        foe.moves.m2.id,
+        foe.moves.m3.id,
+    ];
+    let foe_boosts = [
+        (PokemonBoostableStat::Attack, foe_side.attack_boost),
+        (PokemonBoostableStat::Defense, foe_side.defense_boost),
+        (
+            PokemonBoostableStat::SpecialAttack,
+            foe_side.special_attack_boost,
+        ),
+        (
+            PokemonBoostableStat::SpecialDefense,
+            foe_side.special_defense_boost,
+        ),
+        (PokemonBoostableStat::Speed, foe_side.speed_boost),
+        (PokemonBoostableStat::Accuracy, foe_side.accuracy_boost),
+        (PokemonBoostableStat::Evasion, foe_side.evasion_boost),
+    ];
+
+    let list = &mut instructions.instruction_list;
+    list.push(Instruction::ApplyVolatileStatus(
+        ApplyVolatileStatusInstruction {
+            side_ref: *side_ref,
+            volatile_status: PokemonVolatileStatus::TRANSFORMED,
+        },
+    ));
+    own_side
+        .volatile_statuses
+        .insert(PokemonVolatileStatus::TRANSFORMED);
+
+    // boosts
+    for (stat, target_boost) in foe_boosts.iter() {
+        let cur = match stat {
+            PokemonBoostableStat::Attack => &mut own_side.attack_boost,
+            PokemonBoostableStat::Defense => &mut own_side.defense_boost,
+            PokemonBoostableStat::SpecialAttack => &mut own_side.special_attack_boost,
+            PokemonBoostableStat::SpecialDefense => &mut own_side.special_defense_boost,
+            PokemonBoostableStat::Speed => &mut own_side.speed_boost,
+            PokemonBoostableStat::Accuracy => &mut own_side.accuracy_boost,
+            PokemonBoostableStat::Evasion => &mut own_side.evasion_boost,
+        };
+        if *cur != *target_boost {
+            list.push(Instruction::Boost(BoostInstruction {
+                side_ref: *side_ref,
+                stat: *stat,
+                amount: *target_boost - *cur,
+            }));
+            *cur = *target_boost;
+        }
+    }
+
+    let own = own_side.get_active();
+    if own.types != foe_types {
+        list.push(Instruction::ChangeType(ChangeType {
+            side_ref: *side_ref,
+            new_types: foe_types,
+            old_types: own.types,
+        }));
+        own.types = foe_types;
+    }
+    if own.ability != foe_ability {
+        list.push(Instruction::ChangeAbility(ChangeAbilityInstruction {
+            side_ref: *side_ref,
+            ability_change: foe_ability as i16 - own.ability as i16,
+        }));
+        own.ability = foe_ability;
+    }
+    macro_rules! copy_stat {
+        ($field:ident, $variant:ident, $val:expr) => {
+            if own.$field != $val {
+                list.push(Instruction::$variant(ChangeStatInstruction {
+                    side_ref: *side_ref,
+                    amount: $val - own.$field,
+                }));
+                own.$field = $val;
+            }
+        };
+    }
+    copy_stat!(attack, ChangeAttack, foe_stats.0);
+    copy_stat!(defense, ChangeDefense, foe_stats.1);
+    copy_stat!(special_attack, ChangeSpecialAttack, foe_stats.2);
+    copy_stat!(special_defense, ChangeSpecialDefense, foe_stats.3);
+    copy_stat!(speed, ChangeSpeed, foe_stats.4);
+    let own_weight_hg = (own.weight_kg * 10.0).round() as i16;
+    if own_weight_hg != foe_weight_hg {
+        list.push(Instruction::ChangeWeight(ChangeWeightInstruction {
+            side_ref: *side_ref,
+            amount_hg: foe_weight_hg - own_weight_hg,
+        }));
+        own.weight_kg = foe_weight_hg as f32 / 10.0;
+    }
+    for (mi, new_id) in [
+        PokemonMoveIndex::M0,
+        PokemonMoveIndex::M1,
+        PokemonMoveIndex::M2,
+        PokemonMoveIndex::M3,
+    ]
+    .iter()
+    .zip(foe_moves.iter())
+    {
+        let mv = &mut own.moves[mi];
+        if mv.id != *new_id {
+            list.push(Instruction::ChangeMove(ChangeMoveInstruction {
+                side_ref: *side_ref,
+                move_index: *mi,
+                id_change: *new_id as i16 - mv.id as i16,
+            }));
+            mv.id = *new_id;
+            mv.choice = crate::choices::MOVES.get(new_id).unwrap().to_owned();
+        }
+        if *new_id != Choices::NONE && mv.pp != 5 {
+            list.push(Instruction::DecrementPP(DecrementPPInstruction {
+                side_ref: *side_ref,
+                move_index: *mi,
+                amount: mv.pp - 5,
+            }));
+            mv.pp = 5;
+        }
+    }
+}
+
 pub fn ability_on_switch_in(
     state: &mut State,
     side_ref: &SideReference,
@@ -1554,6 +1723,7 @@ pub fn ability_on_switch_in(
                 state.weather.turns_remaining = WEATHER_ABILITY_TURNS;
             }
         }
+        Abilities::IMPOSTER => imposter_transform(state, side_ref, instructions),
         Abilities::INTIMIDATE => {
             let defender = defending_side.get_active_immutable();
             if !(defender.ability == Abilities::OWNTEMPO

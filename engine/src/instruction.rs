@@ -76,6 +76,8 @@ pub enum Instruction {
     SetSleepTurns(SetSleepTurnsInstruction),
     ChangeSubstituteHealth(ChangeSubsituteHealthInstruction),
     FormeChange(FormeChangeInstruction),
+    ChangeMove(ChangeMoveInstruction),
+    ChangeWeight(ChangeWeightInstruction),
     SetSideOneMoveSecondSwitchOutMove(SetSecondMoveSwitchOutMoveInstruction),
     SetSideTwoMoveSecondSwitchOutMove(SetSecondMoveSwitchOutMoveInstruction),
     ToggleBatonPassing(ToggleBatonPassingInstruction),
@@ -269,6 +271,16 @@ impl fmt::Debug for Instruction {
             }
             Instruction::FormeChange(s) => {
                 write!(f, "FormeChange {:?} {}", s.side_ref, s.name_change)
+            }
+            Instruction::ChangeMove(s) => {
+                write!(
+                    f,
+                    "ChangeMove {:?} {:?} {}",
+                    s.side_ref, s.move_index, s.id_change
+                )
+            }
+            Instruction::ChangeWeight(s) => {
+                write!(f, "ChangeWeight {:?} {}hg", s.side_ref, s.amount_hg)
             }
             Instruction::SetSideOneMoveSecondSwitchOutMove(s) => {
                 write!(
@@ -490,6 +502,24 @@ pub struct FormeChangeInstruction {
     // PokemonName is represented as i16
     // This is the amount the name has changed by
     pub name_change: i16,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct ChangeMoveInstruction {
+    pub side_ref: SideReference,
+    pub move_index: PokemonMoveIndex,
+
+    // Choices is represented as u16
+    // This is the amount the move id has changed by
+    pub id_change: i16,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct ChangeWeightInstruction {
+    pub side_ref: SideReference,
+
+    // change in weight, in hectograms (0.1kg)
+    pub amount_hg: i16,
 }
 
 #[derive(Debug, PartialEq, Clone)]
