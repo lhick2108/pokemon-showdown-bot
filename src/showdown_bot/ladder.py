@@ -340,3 +340,124 @@ def max_decision_estimate_s(search_time_ms: int, worlds: int | None, parallelism
     return waves * search_time_ms / 1000.0
 
 
+# ---------------------------------------------------------------------------
+# Challenge mode (accept challenges from players instead of laddering)
+# ---------------------------------------------------------------------------
+
+def to_id(name: str) -> str:
+    """Showdown userid: lowercase alphanumerics only."""
+    return re.sub(r"[^a-z0-9]", "", str(name).lower())
+
+
+class ChallengePolicy:
+    """Decides which incoming challenges to accept; everything else is rejected.
+
+    Accept only ``battle_format`` challenges, optionally only from ``allow`` users, and
+    only while no battle is running (one at a time). Repeats of the same challenge
+    (the server reports it through both ``updatechallenges`` and a PM) are ignored for
+    ``dedupe_s`` seconds, so a challenge is answered exactly once.
+    """
+
+    ACCEPT_GRACE_S = 30.0  # an accepted challenge counts as "busy" until its battle exists
+
+    def __init__(self, battle_format: str = "gen9randombattle",
+                 allow: Sequence[str] | None = None, *, dedupe_s: float = 10.0, clock=None):
+        import time as _time
+
+        self.battle_format = battle_format
+        self.allow = {to_id(a) for a in allow} if allow else None
+        self.dedupe_s = dedupe_s
+        self._clock = clock or _time.monotonic
+        self._seen: dict[tuple[str, str], float] = {}
+        self._accepted_at: float | None = None
+        self.last_activity = self._clock()
+        self.counts = {"accepted": 0, "rejected": 0}
+
+    def decide(self, user: str, fmt: str, busy: bool) -> tuple[str, str] | None:
+        """``("accept"|"reject", reason)``, or None for a repeat already answered."""
+        now = self._clock()
+        key = (to_id(user), to_id(fmt))
+        self._seen = {k: t for k, t in self._seen.items() if now - t < self.dedupe_s}
+        if key in self._seen:
+            return None
+        self._seen[key] = now
+        self.last_activity = now
+        if to_id(fmt) != to_id(self.battle_format):
+            verdict = ("reject", f"format {fmt or '?'} (only {self.battle_format})")
+        elif self.allow is not None and key[0] not in self.allow:
+            verdict = ("reject", "user not on the allowlist")
+        elif busy or (self._accepted_at is not None
+                      and now - self._accepted_at < self.ACCEPT_GRACE_S):
+            verdict = ("reject", "a battle is already in progress")
+        else:
+            self._accepted_at = now
+            verdict = ("accept", "ok")
+        self.counts["accepted" if verdict[0] == "accept" else "rejected"] += 1
+        return verdict
+
+    def battle_started(self) -> None:
+        self._accepted_at = None
+
+    def touch(self) -> None:
+        self.last_activity = self._clock()
+
+    def idle_seconds(self) -> float:
+        return self._clock() - self.last_activity
+
+
+def with_challenge_policy(
+    cls: type, policy: ChallengePolicy,
+    on_decision: Callable[[str, str, str, str], None] | None = None,
+) -> type:
+    """Subclass of ``cls`` answering every challenge itself (``/accept`` or ``/reject``).
+
+    poke-env's own queue silently drops other formats and never rejects, so both of its
+    challenge entry points are replaced; ``accept_challenges`` is not used.
+    """
+
+    class ChallengePlayer(cls):  # type: ignore[valid-type, misc]
+        async def _answer(self, user: str, fmt: str) -> None:
+            if to_id(user) == to_id(self.username):
+                return
+            busy = any(not b.finished for b in self.battles.values())
+            verdict = policy.decide(user, fmt, busy)
+            if verdict is None:
+                return
+            action, reason = verdict
+            if on_decision is not None:
+                try:
+                    on_decision(user, fmt, action, reason)
+                except Exception:
+                    logger.exception("challenge callback failed")
+            if action == "accept":
+                await self.ps_client.accept_challenge(to_id(user), self.next_team)
+            else:
+                await self.ps_client.send_message(f"/reject {to_id(user)}")
+
+        async def _update_challenges(self, split_message):
+            data = json.loads(split_message[2]) if len(split_message) > 2 else {}
+            for user, fmt in (data.get("challengesFrom") or {}).items():
+                await self._answer(user, fmt)
+
+        async def _handle_challenge_request(self, split_message):
+            # |pm|SENDER|RECEIVER|/challenge FORMAT|...
+            if len(split_message) >= 5 and split_message[4].startswith("/challenge"):
+                fmt = split_message[4][len("/challenge"):].strip().split("|")[0]
+                if len(split_message) >= 6 and split_message[5]:
+                    fmt = split_message[5]
+                if fmt:  # an empty format is a withdrawn challenge
+                    await self._answer(split_message[2].strip(), fmt)
+
+        def _battle_finished_callback(self, battle):
+            super()._battle_finished_callback(battle)
+            policy.touch()
+
+        async def _create_battle(self, split_message):
+            battle = await super()._create_battle(split_message)
+            policy.battle_started()
+            return battle
+
+    ChallengePlayer.__name__ = f"Challenge{cls.__name__}"
+    return ChallengePlayer
+
+

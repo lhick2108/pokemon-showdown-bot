@@ -59,3 +59,33 @@ also applies; a decision never takes longer than `--move-cap`.
     python scripts/replay_log.py data/ladder/<run>/logs/<battle>.log --turn 11 --from-record data/ladder/<run>/records [--research --time-ms 300 --evaluator X.pev]
 
 `--moves` / `--item` only matter for old logs without requests. poke-env tracks our PP from the protocol (as live), not from the request pp.
+
+## Challenge mode (accept challenges instead of laddering)
+
+The bot stays logged in on the public server and plays whoever challenges it, in
+`gen9randombattle` only:
+
+    python scripts/ladder.py --accept-challenges --games 5
+    python scripts/ladder.py --accept-challenges --games 5 --from alice,bob --idle-timeout 30
+
+- `--games N`: stop after N finished battles. `--from a,b`: accept only these users
+  (compared case/punctuation-insensitively). `--idle-timeout MIN`: stop after MIN
+  minutes with no challenge and no battle. Same `--bot`, `--move-cap`, `--game-timeout`,
+  credentials and reconnect handling as the ladder. Without `--idle-timeout` it waits
+  until N games are played or you press Ctrl-C.
+- Output goes to `data/challenges/<run-id>` (override with `--out`): the same
+  `games.jsonl`, `logs/`, `records/`, `summary.txt` as ladder runs, plus
+  `challenges.jsonl` (every challenge seen, accepted or rejected). Friendly games, so
+  no rating is reported.
+- Answers: a gen9randombattle challenge while idle is accepted (`/accept`); any other
+  format, a user outside `--from`, or a challenge arriving while a battle is running is
+  rejected (`/reject USER`). Each challenge is answered once. No chat messages are sent.
+  (poke-env's own `accept_challenges` silently drops other formats and never rejects,
+  so challenge mode answers challenges itself.)
+- Politeness: one battle at a time, the account name says it is a bot, no greeting or
+  chat spam.
+- Stopping: reach `--games`, hit `--idle-timeout`, or Ctrl-C (a running battle is
+  forfeited and logged, the summary is still written).
+- Local check (needs the local server): `python scripts/challenge_dryrun.py` starts the
+  bot with `--dry-run`, challenges it in gen8randombattle (rejected) then
+  gen9randombattle (accepted and played).
