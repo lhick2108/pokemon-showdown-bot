@@ -1099,17 +1099,39 @@ pub fn choice_hazard_clear(
                 state.terrain.terrain_type = Terrain::NONE;
                 state.terrain.turns_remaining = 0;
             }
-            let side_condition_clears = [
+            // sdb (589.39): Showdown's Defog lowers the target's evasion by 1 (which triggers
+            // Defiant/Competitive; a Substitute or Clear Body blocks it, hazard removal still
+            // happens) and removes screens/Safeguard/Mist from the TARGET's side only; hazards
+            // go from both sides.
+            let defender_ref = attacking_side_ref.get_other_side();
+            apply_boost_instruction(
+                state.get_side(&defender_ref),
+                &PokemonBoostableStat::Evasion,
+                &-1,
+                attacking_side_ref,
+                &defender_ref,
+                instructions,
+            );
+            let hazards = [
                 PokemonSideCondition::Stealthrock,
                 PokemonSideCondition::Spikes,
                 PokemonSideCondition::ToxicSpikes,
                 PokemonSideCondition::StickyWeb,
+            ];
+            let target_only = [
                 PokemonSideCondition::Reflect,
                 PokemonSideCondition::LightScreen,
                 PokemonSideCondition::AuroraVeil,
+                PokemonSideCondition::Safeguard,
+                PokemonSideCondition::Mist,
             ];
 
             for side in [SideReference::SideOne, SideReference::SideTwo] {
+                let side_condition_clears: Vec<PokemonSideCondition> = if side == defender_ref {
+                    hazards.iter().chain(target_only.iter()).copied().collect()
+                } else {
+                    hazards.to_vec()
+                };
                 for side_condition in side_condition_clears {
                     let side_condition_num = state
                         .get_side_immutable(&side)

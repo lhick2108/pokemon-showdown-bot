@@ -3002,7 +3002,7 @@ pub fn ability_modify_attack_against(
             }
         }
         Abilities::OVERCOAT => {
-            if attacker_choice.flags.powder {
+            if attacker_choice.flags.powder && attacker_choice.move_id != Choices::LEECHSEED {
                 attacker_choice.remove_all_effects();
                 attacker_choice.accuracy = 0.0
             }

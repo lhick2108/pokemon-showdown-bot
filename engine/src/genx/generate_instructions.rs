@@ -484,11 +484,13 @@ fn generate_instructions_from_switch(
         if side.side_conditions.sticky_web == 1 && switched_in_pkmn.is_grounded() {
             // a pkmn switching in doesn't have any other speed drops,
             // so no need to check for going below -6
+            // sdb (589.39): Showdown credits the foe as the source of the Sticky Web drop, so
+            // Defiant / Competitive trigger and Clear Body / White Smoke / Clear Amulet block it.
             apply_boost_instruction(
                 side,
                 &PokemonBoostableStat::Speed,
                 &-1,
-                &switching_side_ref,
+                &switching_side_ref.get_other_side(),
                 &switching_side_ref,
                 incoming_instructions,
             );
@@ -3024,6 +3026,7 @@ fn add_end_of_turn_instructions(
             if active_pkmn.hp == 0
                 || active_pkmn.ability == Abilities::MAGICGUARD
                 || active_pkmn.ability == Abilities::OVERCOAT
+                || active_pkmn.item == Items::SAFETYGOGGLES
                 || active_pkmn.ability == Abilities::ICEBODY
                 || active_pkmn.has_type(&PokemonType::ICE)
             {
@@ -3046,6 +3049,7 @@ fn add_end_of_turn_instructions(
             if active_pkmn.hp == 0
                 || active_pkmn.ability == Abilities::MAGICGUARD
                 || active_pkmn.ability == Abilities::OVERCOAT
+                || active_pkmn.item == Items::SAFETYGOGGLES
                 || active_pkmn.has_type(&PokemonType::GROUND)
                 || active_pkmn.has_type(&PokemonType::STEEL)
                 || active_pkmn.has_type(&PokemonType::ROCK)
@@ -6401,7 +6405,11 @@ mod tests {
 
         let expected_instructions = vec![StateInstructions {
             percentage: 100.0,
-            instruction_list: vec![],
+            instruction_list: vec![Instruction::Boost(BoostInstruction {
+                side_ref: SideReference::SideTwo,
+                stat: PokemonBoostableStat::Evasion,
+                amount: -1,
+            })],
         }];
 
         assert_eq!(instructions, expected_instructions)
@@ -6428,12 +6436,19 @@ mod tests {
 
         let expected_instructions = vec![StateInstructions {
             percentage: 100.0,
-            instruction_list: vec![Instruction::ChangeTerrain(ChangeTerrain {
-                new_terrain: Terrain::NONE,
-                new_terrain_turns_remaining: 0,
-                previous_terrain: Terrain::ELECTRICTERRAIN,
-                previous_terrain_turns_remaining: 1,
-            })],
+            instruction_list: vec![
+                Instruction::ChangeTerrain(ChangeTerrain {
+                    new_terrain: Terrain::NONE,
+                    new_terrain_turns_remaining: 0,
+                    previous_terrain: Terrain::ELECTRICTERRAIN,
+                    previous_terrain_turns_remaining: 1,
+                }),
+                Instruction::Boost(BoostInstruction {
+                    side_ref: SideReference::SideTwo,
+                    stat: PokemonBoostableStat::Evasion,
+                    amount: -1,
+                }),
+            ],
         }];
 
         assert_eq!(instructions, expected_instructions)
@@ -6469,11 +6484,12 @@ mod tests {
                     previous_terrain: Terrain::ELECTRICTERRAIN,
                     previous_terrain_turns_remaining: 1,
                 }),
-                Instruction::ChangeSideCondition(ChangeSideConditionInstruction {
-                    side_ref: SideReference::SideOne,
-                    side_condition: PokemonSideCondition::Reflect,
+                Instruction::Boost(BoostInstruction {
+                    side_ref: SideReference::SideTwo,
+                    stat: PokemonBoostableStat::Evasion,
                     amount: -1,
                 }),
+                // only the target's screens are removed; the user's own Reflect stays
                 Instruction::ChangeSideCondition(ChangeSideConditionInstruction {
                     side_ref: SideReference::SideTwo,
                     side_condition: PokemonSideCondition::Reflect,
@@ -11820,4 +11836,5 @@ mod tests {
             assert!(!changes_status(&outcomes), "{status:?}");
         }
     }
+    include!("fail_move_tests.inc.rs");
 }

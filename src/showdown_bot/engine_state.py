@@ -1032,6 +1032,10 @@ def _engine_supports_transform() -> bool:
 _ENGINE_TRANSFORMS = _engine_supports_transform()
 #: ``0.0.48+sdb.4``: Encore honours ``failencore`` last moves, Sleep Talk is exact (589.35).
 _ENGINE_SLEEP_FIXES = _engine_sdb_level() >= 4
+#: ``0.0.48+sdb.5``: Defog lowers evasion (Defiant/Competitive) and keeps the user's screens,
+#: Safety Goggles block powder, Sticky Web counts as a foe drop (589.39). Pending Wish is
+#: passed through ``Side.wish`` (any build).
+_ENGINE_FAIL_FIXES = _engine_sdb_level() >= 5
 
 
 def _rebuild_pokemon(pokemon: pe.Pokemon, **changes: Any) -> pe.Pokemon:
@@ -1122,6 +1126,36 @@ def _apply_transform(
     entries[0] = (_rebuild_pokemon(pokemon, **changes), moves, mon)
 
 
+def _pending_wish(
+    battle: Any,
+    ordered: Sequence[tuple[pe.Pokemon, list[pe.Move], Any | None]],
+    is_ours: bool,
+) -> tuple[int, int] | None:
+    """The engine's ``wish=(turns, heal)`` for a Wish used last turn, else ``None``.
+
+    poke-env has no Wish bookkeeping, so :class:`sleep.SleepTracker` reads the protocol:
+    a Wish used during turn N-1 heals at the end of turn N and a second Wish before then
+    fails (589.39; the engine refuses to re-arm a pending Wish).
+    """
+    role = str(getattr(battle, "player_role", "") or "")
+    if role not in ("p1", "p2"):
+        return None
+    tracker = sleep_module.for_battle(getattr(battle, "battle_tag", "") or "")
+    if tracker is None:
+        return None
+    side = role if is_ours else ("p2" if role == "p1" else "p1")
+    wisher = tracker.wish_pending(side, int(battle.turn))
+    if wisher is None or not ordered:
+        return None
+    name = to_id(wisher.split(": ", 1)[-1])
+    maxhp = ordered[0][0].maxhp
+    for entry in ordered:
+        if to_id(entry[0].id) == name or (entry[2] is not None and to_id(entry[2].species) == name):
+            maxhp = entry[0].maxhp
+            break
+    return 1, max(1, maxhp // 2)
+
+
 def _make_side(
     ordered: Sequence[tuple[pe.Pokemon, list[pe.Move], Any | None]],
     active_mon: Any | None,
@@ -1167,6 +1201,9 @@ def _make_side(
         )
         kwargs["force_trapped"] = bool(battle.trapped)
     side_conditions = _side_conditions(conditions, battle.turn, toxic_count, protect_counter)
+    wish = _pending_wish(battle, ordered, is_ours)
+    if wish is not None:
+        kwargs["wish"] = wish
     return pe.Side(
         pokemon=pokemon,
         side_conditions=side_conditions,
