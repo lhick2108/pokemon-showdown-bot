@@ -1066,6 +1066,26 @@ fn stock_evaluate(py_state: PyState) -> f32 {
     poke_engine::engine::evaluate::evaluate(&state)
 }
 
+/// Experimental (589.32): scale the stock evaluation's alive/item bonuses of a Pokemon by
+/// `min(1, hp_fraction / knee)`. `0.0` (the default) restores the stock evaluation.
+/// Process-wide; affects `evaluate`, residual learned evaluators and the MCTS leaf.
+#[pyfunction]
+fn set_eval_low_hp_knee(knee: f32) {
+    poke_engine::engine::evaluate::set_low_hp_knee(knee);
+}
+
+/// Experimental (589.32): multiply every stat-boost term of the stock evaluation by `scale`.
+#[pyfunction]
+fn set_eval_boost_scale(scale: f32) {
+    poke_engine::engine::evaluate::set_boost_scale(scale);
+}
+
+/// The current low-HP knee (see `set_eval_low_hp_knee`).
+#[pyfunction]
+fn eval_low_hp_knee() -> f32 {
+    poke_engine::engine::evaluate::low_hp_knee()
+}
+
 /// The fixed-length feature vector of `state` from `side`'s perspective (1 or 2).
 #[pyfunction]
 #[pyo3(signature = (py_state, side=1))]
@@ -1332,6 +1352,9 @@ fn py_poke_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(id, m)?)?;
     m.add_function(wrap_pyfunction!(mcts, m)?)?;
     m.add_function(wrap_pyfunction!(stock_evaluate, m)?)?;
+    m.add_function(wrap_pyfunction!(set_eval_low_hp_knee, m)?)?;
+    m.add_function(wrap_pyfunction!(eval_low_hp_knee, m)?)?;
+    m.add_function(wrap_pyfunction!(set_eval_boost_scale, m)?)?;
     m.add_function(wrap_pyfunction!(state_features, m)?)?;
     m.add_function(wrap_pyfunction!(state_feature_names, m)?)?;
     m.add("FEATURE_VERSION", FEATURE_VERSION)?;

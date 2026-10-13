@@ -59,6 +59,14 @@ def _parser() -> argparse.ArgumentParser:
                    help="damage-roll part of the net side's inference (default on)")
     p.add_argument("--stock-damage-inference", choices=("on", "off"), default="on",
                    help="damage-roll part of the stock side's inference (default on)")
+    p.add_argument("--net-eval-lowhp", type=float, default=0.0,
+                   help="589.32: low-HP evaluation knee for the net side (0 = stock; needs the 589.32 engine wheel)")
+    p.add_argument("--stock-eval-lowhp", type=float, default=0.0,
+                   help="589.32: low-HP evaluation knee for the stock side (0 = stock)")
+    p.add_argument("--net-eval-boost-scale", type=float, default=1.0,
+                   help="589.32: multiplier on stat-boost eval terms for the net side (1 = stock)")
+    p.add_argument("--stock-eval-boost-scale", type=float, default=1.0,
+                   help="589.32: multiplier on stat-boost eval terms for the stock side (1 = stock)")
     p.add_argument("--selection-gamma", type=float, default=0.1,
                    help="exploration rate in (0, 1] for exp3/rm sides")
     p.add_argument("--stock-uses-evaluator", action="store_true",
@@ -99,7 +107,9 @@ async def _duel_pair(args, share: int, pool):
                           "selection": args.net_selection,
                           "inference": args.net_inference == "on",
                           "damage_inference": args.net_damage_inference == "on",
-                          "mode": args.net_mode}),
+                          "mode": args.net_mode,
+                          "eval_lowhp_knee": args.net_eval_lowhp,
+                          "eval_boost_scale": args.net_eval_boost_scale}),
         executor=pool, **options,
     )
     stock_cls = SearchNetPlayer if (args.stock_uses_evaluator and args.evaluator) else SearchPlayer
@@ -111,6 +121,8 @@ async def _duel_pair(args, share: int, pool):
             "inference": args.stock_inference == "on",
             "damage_inference": args.stock_damage_inference == "on",
             "mode": args.stock_mode,
+            "eval_lowhp_knee": args.stock_eval_lowhp,
+            "eval_boost_scale": args.stock_eval_boost_scale,
         }),
         executor=pool, **options,
     )

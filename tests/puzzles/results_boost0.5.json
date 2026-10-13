@@ -1,0 +1,3067 @@
+[
+ {
+  "id": "S01",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "encore": 0.9510752760137731,
+   "hydropump": 0.048924723986226895
+  }
+ },
+ {
+  "id": "S02",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "thunderwave": 1.0
+  }
+ },
+ {
+  "id": "S03",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 0.7913988028334717,
+  "dist": {
+   "moonblast": 0.4612136755888925,
+   "synthesis": 0.33018512724457905,
+   "gardevoir": 0.2086011971665285
+  }
+ },
+ {
+  "id": "S04",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "aquajet": 1.0
+  }
+ },
+ {
+  "id": "S05",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "recover": 1.0
+  }
+ },
+ {
+  "id": "S06",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 0.25295250804532154,
+  "dist": {
+   "kleavor": 0.7470474919546783,
+   "noretreat": 0.21968206349700126,
+   "knockoff": 0.033270444548320316
+  }
+ },
+ {
+  "id": "S07",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "psychicnoise": 1.0
+  }
+ },
+ {
+  "id": "S08",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "earthquake": 1.0
+  }
+ },
+ {
+  "id": "S09",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 0.0,
+  "dist": {
+   "grafaiai": 1.0
+  }
+ },
+ {
+  "id": "S10",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "stoneedge": 0.47337026583024805,
+   "doubleedge": 0.23726089845991752,
+   "earthquake": 0.231453676396043,
+   "rockpolish": 0.05791515931379141
+  }
+ },
+ {
+  "id": "S11",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 0.0,
+  "dist": {
+   "staraptor": 1.0
+  }
+ },
+ {
+  "id": "S12",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 0.40628088451347055,
+  "dist": {
+   "chesnaught": 0.21595637318675223,
+   "sleeppowder": 0.20597194783288603,
+   "gigadrain": 0.20030893668058433,
+   "calmmind": 0.18925324395402388,
+   "psychic": 0.1885094983457535
+  }
+ },
+ {
+  "id": "S13",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 0.505455771436684,
+  "dist": {
+   "icehammer": 0.505455771436684,
+   "eelektross": 0.4945442285633161
+  }
+ },
+ {
+  "id": "S14",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 0.0,
+  "dist": {
+   "enamorustherian": 1.0
+  }
+ },
+ {
+  "id": "K01",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 0.0,
+  "dist": {
+   "slackoff": 0.506654566581254,
+   "vespiquen": 0.49334543341874615
+  }
+ },
+ {
+  "id": "K02",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "arcaninehisui": 1.0
+  }
+ },
+ {
+  "id": "K03",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 0.43584794418638717,
+  "dist": {
+   "megahorn": 0.43893513242216226,
+   "copperajah": 0.43584794418638717,
+   "knockoff": 0.12521692339145057
+  }
+ },
+ {
+  "id": "K04",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "goodrahisui": 1.0
+  }
+ },
+ {
+  "id": "K05",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "rillaboom": 1.0
+  }
+ },
+ {
+  "id": "K06",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "meloetta": 1.0
+  }
+ },
+ {
+  "id": "K07",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "mesprit": 1.0
+  }
+ },
+ {
+  "id": "K08",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 0.0,
+  "dist": {
+   "shellsmash": 1.0
+  }
+ },
+ {
+  "id": "K09",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "chimecho": 1.0
+  }
+ },
+ {
+  "id": "K10",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "golemalola": 1.0
+  }
+ },
+ {
+  "id": "K11",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 0.0,
+  "dist": {
+   "suckerpunch": 1.0
+  }
+ },
+ {
+  "id": "U01",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 0.7877082265987787,
+  "dist": {
+   "closecombat": 0.2774614708273502,
+   "bravebird": 0.2774610176836875,
+   "stoneedge": 0.2327857380877411,
+   "swordsdance": 0.21229177340122113
+  }
+ },
+ {
+  "id": "U02",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "behemothblade": 0.5000011600162849,
+   "closecombat": 0.499998839983715
+  }
+ },
+ {
+  "id": "U03",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 0.0,
+  "dist": {
+   "shellsmash": 1.0
+  }
+ },
+ {
+  "id": "U04",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 0.7046972336551249,
+  "dist": {
+   "earthquake": 0.35234913637462306,
+   "glaiverush": 0.35234809728050176,
+   "iciclecrash": 0.295302766344875
+  }
+ },
+ {
+  "id": "U05",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "darkpulse": 1.0
+  }
+ },
+ {
+  "id": "U06",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "darkpulse": 1.0
+  }
+ },
+ {
+  "id": "U07",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "alluringvoice": 0.5000021183090065,
+   "thunderbolt": 0.49999788169099346
+  }
+ },
+ {
+  "id": "U08",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "bodypress": 1.0
+  }
+ },
+ {
+  "id": "U09",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "closecombat": 0.5000028260925978,
+   "earthquake": 0.4999971739074021
+  }
+ },
+ {
+  "id": "U10",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "hornleech": 1.0
+  }
+ },
+ {
+  "id": "U11",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "knockoff": 0.5000022305710757,
+   "earthquake": 0.49999776942892427
+  }
+ },
+ {
+  "id": "U12",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "closecombat": 0.5000023228318162,
+   "flareblitz": 0.49999767716818366
+  }
+ },
+ {
+  "id": "U13",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 0.3333314727959337,
+  "dist": {
+   "stoneedge": 0.3333348826446686,
+   "playrough": 0.3333336445593976,
+   "closecombat": 0.3333314727959337
+  }
+ },
+ {
+  "id": "U14",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "thunderbolt": 1.0
+  }
+ },
+ {
+  "id": "U15",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "moonblast": 0.5008076547260755,
+   "psyshock": 0.4991923452739246
+  }
+ },
+ {
+  "id": "U16",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "acrobatics": 1.0
+  }
+ },
+ {
+  "id": "T01",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "morningsun": 1.0
+  }
+ },
+ {
+  "id": "T02",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "roost": 1.0
+  }
+ },
+ {
+  "id": "T03",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "recover": 1.0
+  }
+ },
+ {
+  "id": "T04",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 0.25847619123765575,
+  "dist": {
+   "roost": 0.25847619123765575,
+   "headbutt": 0.2518857289003886,
+   "earthquake": 0.24821000075047608,
+   "terrakion": 0.24142807911147968
+  }
+ },
+ {
+  "id": "T05",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "morningsun": 1.0
+  }
+ },
+ {
+  "id": "T06",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "recover": 1.0
+  }
+ },
+ {
+  "id": "T07",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "roost": 1.0
+  }
+ },
+ {
+  "id": "T08",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "recover": 1.0
+  }
+ },
+ {
+  "id": "T09",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 0.0,
+  "dist": {
+   "alluringvoice": 1.0
+  }
+ },
+ {
+  "id": "T10",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "morningsun": 1.0
+  }
+ },
+ {
+  "id": "T11",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 0.0,
+  "dist": {
+   "discharge": 1.0
+  }
+ },
+ {
+  "id": "T12",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "recover": 1.0
+  }
+ },
+ {
+  "id": "T13",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "recover": 1.0
+  }
+ },
+ {
+  "id": "T14",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 0.0,
+  "dist": {
+   "ficklebeam": 1.0
+  }
+ },
+ {
+  "id": "C01",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "bugbuzz": 1.0
+  }
+ },
+ {
+  "id": "C02",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "terrakion": 1.0
+  }
+ },
+ {
+  "id": "C03",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 0.0,
+  "dist": {
+   "morningsun": 1.0
+  }
+ },
+ {
+  "id": "C04",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "aeroblast": 1.0
+  }
+ },
+ {
+  "id": "C05",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "dazzlinggleam": 1.0
+  }
+ },
+ {
+  "id": "C06",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "scald": 0.5153555595946182,
+   "icebeam": 0.4846444404053817
+  }
+ },
+ {
+  "id": "C07",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "terrakion": 1.0
+  }
+ },
+ {
+  "id": "C08",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "hurricane": 1.0
+  }
+ },
+ {
+  "id": "C09",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 0.0,
+  "dist": {
+   "roost": 1.0
+  }
+ },
+ {
+  "id": "C10",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 0.3325120624744644,
+  "dist": {
+   "icebeam": 0.33471502954379234,
+   "recover": 0.3327729079817432,
+   "discharge": 0.3325120624744644
+  }
+ },
+ {
+  "id": "C11",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 100,
+  "pass": 0.0,
+  "dist": {
+   "slackoff": 1.0
+  }
+ },
+ {
+  "id": "S01",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "encore": 1.0
+  }
+ },
+ {
+  "id": "S02",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "thunderwave": 1.0
+  }
+ },
+ {
+  "id": "S03",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 0.5921546405271817,
+  "dist": {
+   "gardevoir": 0.4078453594728182,
+   "moonblast": 0.3709978385050465,
+   "synthesis": 0.22115680202213528
+  }
+ },
+ {
+  "id": "S04",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "aquajet": 1.0
+  }
+ },
+ {
+  "id": "S05",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "recover": 1.0
+  }
+ },
+ {
+  "id": "S06",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "noretreat": 0.5794027817843136,
+   "knockoff": 0.42059721821568635
+  }
+ },
+ {
+  "id": "S07",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "psychicnoise": 1.0
+  }
+ },
+ {
+  "id": "S08",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "earthquake": 1.0
+  }
+ },
+ {
+  "id": "S09",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 0.0,
+  "dist": {
+   "grafaiai": 1.0
+  }
+ },
+ {
+  "id": "S10",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "doubleedge": 0.6398445700082279,
+   "stoneedge": 0.36015542999177214
+  }
+ },
+ {
+  "id": "S11",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 0.7358358878366331,
+  "dist": {
+   "moonblast": 0.48684728000922567,
+   "staraptor": 0.2641641121633669,
+   "knockoff": 0.24898860782740748
+  }
+ },
+ {
+  "id": "S12",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 0.39133026776540414,
+  "dist": {
+   "chesnaught": 0.2342576344413247,
+   "sleeppowder": 0.19704810530292594,
+   "gigadrain": 0.19428216246247812,
+   "calmmind": 0.18780067485484075,
+   "psychic": 0.1866114229384304
+  }
+ },
+ {
+  "id": "S13",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 0.2925487291331799,
+  "dist": {
+   "eelektross": 0.7074512708668199,
+   "icehammer": 0.2925487291331799
+  }
+ },
+ {
+  "id": "S14",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 0.28388393638333187,
+  "dist": {
+   "enamorustherian": 0.716116063616668,
+   "stoneedge": 0.28388393638333187
+  }
+ },
+ {
+  "id": "K01",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "baxcalibur": 1.0
+  }
+ },
+ {
+  "id": "K02",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 0.9422466572151467,
+  "dist": {
+   "arcaninehisui": 0.9422466572151467,
+   "poltergeist": 0.057753342784853244
+  }
+ },
+ {
+  "id": "K03",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 0.0,
+  "dist": {
+   "megahorn": 1.0
+  }
+ },
+ {
+  "id": "K04",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "goodrahisui": 1.0
+  }
+ },
+ {
+  "id": "K05",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "rillaboom": 1.0
+  }
+ },
+ {
+  "id": "K06",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "meloetta": 1.0
+  }
+ },
+ {
+  "id": "K07",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "mesprit": 1.0
+  }
+ },
+ {
+  "id": "K08",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 0.0,
+  "dist": {
+   "shellsmash": 1.0
+  }
+ },
+ {
+  "id": "K09",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 0.0,
+  "dist": {
+   "stoneedge": 0.6139138105385794,
+   "highhorsepower": 0.35234192368486017,
+   "crabhammer": 0.033744265776560305
+  }
+ },
+ {
+  "id": "K10",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "golemalola": 1.0
+  }
+ },
+ {
+  "id": "K11",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 0.0,
+  "dist": {
+   "suckerpunch": 1.0
+  }
+ },
+ {
+  "id": "U01",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 0.7864635761723426,
+  "dist": {
+   "closecombat": 0.2762563417169737,
+   "bravebird": 0.27625602106398595,
+   "stoneedge": 0.2339512133913829,
+   "swordsdance": 0.21353642382765742
+  }
+ },
+ {
+  "id": "U02",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "behemothblade": 0.5000027285830524,
+   "closecombat": 0.49999727141694755
+  }
+ },
+ {
+  "id": "U03",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 0.0,
+  "dist": {
+   "shellsmash": 1.0
+  }
+ },
+ {
+  "id": "U04",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 0.7066545489007361,
+  "dist": {
+   "earthquake": 0.35332971060369517,
+   "glaiverush": 0.3533248382970407,
+   "iciclecrash": 0.293345451099264
+  }
+ },
+ {
+  "id": "U05",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "darkpulse": 1.0
+  }
+ },
+ {
+  "id": "U06",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "darkpulse": 1.0
+  }
+ },
+ {
+  "id": "U07",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "alluringvoice": 0.5000026159347692,
+   "thunderbolt": 0.49999738406523075
+  }
+ },
+ {
+  "id": "U08",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "bodypress": 1.0
+  }
+ },
+ {
+  "id": "U09",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "closecombat": 0.5000041126303814,
+   "earthquake": 0.49999588736961853
+  }
+ },
+ {
+  "id": "U10",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "hornleech": 1.0
+  }
+ },
+ {
+  "id": "U11",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "knockoff": 0.5000035320455418,
+   "earthquake": 0.4999964679544582
+  }
+ },
+ {
+  "id": "U12",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "closecombat": 0.5000047609929954,
+   "flareblitz": 0.49999523900700454
+  }
+ },
+ {
+  "id": "U13",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 0.33332943021285844,
+  "dist": {
+   "stoneedge": 0.3333366309034251,
+   "playrough": 0.3333339388837166,
+   "closecombat": 0.33332943021285844
+  }
+ },
+ {
+  "id": "U14",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "thunderbolt": 1.0
+  }
+ },
+ {
+  "id": "U15",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "moonblast": 0.5005446854519258,
+   "psyshock": 0.4994553145480743
+  }
+ },
+ {
+  "id": "U16",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "acrobatics": 1.0
+  }
+ },
+ {
+  "id": "T01",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "morningsun": 1.0
+  }
+ },
+ {
+  "id": "T02",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "roost": 1.0
+  }
+ },
+ {
+  "id": "T03",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "recover": 1.0
+  }
+ },
+ {
+  "id": "T04",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 0.2603669623991791,
+  "dist": {
+   "roost": 0.2603669623991791,
+   "headbutt": 0.252318525706496,
+   "earthquake": 0.24988430771277864,
+   "terrakion": 0.23743020418154612
+  }
+ },
+ {
+  "id": "T05",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "morningsun": 1.0
+  }
+ },
+ {
+  "id": "T06",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "recover": 1.0
+  }
+ },
+ {
+  "id": "T07",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "roost": 1.0
+  }
+ },
+ {
+  "id": "T08",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "recover": 1.0
+  }
+ },
+ {
+  "id": "T09",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 0.0,
+  "dist": {
+   "alluringvoice": 1.0
+  }
+ },
+ {
+  "id": "T10",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "morningsun": 1.0
+  }
+ },
+ {
+  "id": "T11",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 0.0,
+  "dist": {
+   "discharge": 1.0
+  }
+ },
+ {
+  "id": "T12",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "recover": 1.0
+  }
+ },
+ {
+  "id": "T13",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "recover": 1.0
+  }
+ },
+ {
+  "id": "T14",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 0.0,
+  "dist": {
+   "ficklebeam": 1.0
+  }
+ },
+ {
+  "id": "C01",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "bugbuzz": 1.0
+  }
+ },
+ {
+  "id": "C02",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "terrakion": 1.0
+  }
+ },
+ {
+  "id": "C03",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 0.0,
+  "dist": {
+   "morningsun": 1.0
+  }
+ },
+ {
+  "id": "C04",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "aeroblast": 1.0
+  }
+ },
+ {
+  "id": "C05",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "dazzlinggleam": 1.0
+  }
+ },
+ {
+  "id": "C06",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "scald": 0.5285165176623055,
+   "icebeam": 0.47148348233769444
+  }
+ },
+ {
+  "id": "C07",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "terrakion": 1.0
+  }
+ },
+ {
+  "id": "C08",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "hurricane": 1.0
+  }
+ },
+ {
+  "id": "C09",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 0.0,
+  "dist": {
+   "roost": 1.0
+  }
+ },
+ {
+  "id": "C10",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 0.32940951621937903,
+  "dist": {
+   "recover": 0.33886615029089967,
+   "icebeam": 0.33172433348972113,
+   "discharge": 0.32940951621937903
+  }
+ },
+ {
+  "id": "C11",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "stock",
+  "ms": 300,
+  "pass": 0.0,
+  "dist": {
+   "slackoff": 1.0
+  }
+ },
+ {
+  "id": "S01",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "encore": 0.4805864268915177,
+   "hydropump": 0.47562559534748267,
+   "icebeam": 0.043787977760999706
+  }
+ },
+ {
+  "id": "S02",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "thunderwave": 1.0
+  }
+ },
+ {
+  "id": "S03",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "moonblast": 0.5320270983759363,
+   "synthesis": 0.44896044005746055,
+   "terablast": 0.019012461566603193
+  }
+ },
+ {
+  "id": "S04",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "aquajet": 1.0
+  }
+ },
+ {
+  "id": "S05",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 0.7961342167336781,
+  "dist": {
+   "sludgebomb": 0.2544963192711283,
+   "lumineon": 0.2038657832663219,
+   "earthquake": 0.19556454601654913,
+   "recover": 0.1900939594953705,
+   "surf": 0.15597939195063004
+  }
+ },
+ {
+  "id": "S06",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "noretreat": 0.28826561039090265,
+   "knockoff": 0.2839685385119822,
+   "closecombat": 0.22199928750864498,
+   "ironhead": 0.2057665635884701
+  }
+ },
+ {
+  "id": "S07",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "psychicnoise": 1.0
+  }
+ },
+ {
+  "id": "S08",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "earthquake": 1.0
+  }
+ },
+ {
+  "id": "S09",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 0.0,
+  "dist": {
+   "grafaiai": 1.0
+  }
+ },
+ {
+  "id": "S10",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 0.8081076494305208,
+  "dist": {
+   "earthquake": 0.3224470886109943,
+   "stoneedge": 0.2680980792542886,
+   "ironcrown": 0.19189235056947923,
+   "doubleedge": 0.1843437204420586,
+   "rockpolish": 0.033218761123179216
+  }
+ },
+ {
+  "id": "S11",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 0.0,
+  "dist": {
+   "staraptor": 1.0
+  }
+ },
+ {
+  "id": "S12",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 0.423812346230778,
+  "dist": {
+   "sleeppowder": 0.21253475141842837,
+   "gigadrain": 0.21127759481234956,
+   "psychic": 0.20591506968726644,
+   "calmmind": 0.2057306347610368,
+   "chesnaught": 0.1645419493209188
+  }
+ },
+ {
+  "id": "S13",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 0.5521398251069817,
+  "dist": {
+   "icehammer": 0.5521398251069817,
+   "eelektross": 0.44786017489301844
+  }
+ },
+ {
+  "id": "S14",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 0.0,
+  "dist": {
+   "enamorustherian": 1.0
+  }
+ },
+ {
+  "id": "K01",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "net",
+  "ms": 100,
+  "pass": 0.0,
+  "dist": {
+   "slackoff": 0.5026271998658782,
+   "vespiquen": 0.4973728001341218
+  }
+ },
+ {
+  "id": "K02",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "net",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "dugtrioalola": 0.5461449190384854,
+   "arcaninehisui": 0.4538550809615146
+  }
+ },
+ {
+  "id": "K03",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "net",
+  "ms": 100,
+  "pass": 0.20628402393751857,
+  "dist": {
+   "megahorn": 0.2395079484738321,
+   "knockoff": 0.2230536300281812,
+   "stickyweb": 0.2078092703452897,
+   "copperajah": 0.20628402393751857,
+   "poisonjab": 0.12334512721517839
+  }
+ },
+ {
+  "id": "K04",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "net",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "goodrahisui": 1.0
+  }
+ },
+ {
+  "id": "K05",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "net",
+  "ms": 100,
+  "pass": 0.9904426234976262,
+  "dist": {
+   "rillaboom": 0.9904426234976262,
+   "throatchop": 0.009557376502373779
+  }
+ },
+ {
+  "id": "K06",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "net",
+  "ms": 100,
+  "pass": 0.5047520110061229,
+  "dist": {
+   "meloetta": 0.5047520110061229,
+   "aquajet": 0.495247988993877
+  }
+ },
+ {
+  "id": "K07",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "net",
+  "ms": 100,
+  "pass": 0.6573806618013204,
+  "dist": {
+   "mesprit": 0.6573806618013204,
+   "morningsun": 0.3426193381986795
+  }
+ },
+ {
+  "id": "K08",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "net",
+  "ms": 100,
+  "pass": 0.0,
+  "dist": {
+   "shellsmash": 0.7624695655828971,
+   "bulletseed": 0.23753043441710292
+  }
+ },
+ {
+  "id": "K09",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "net",
+  "ms": 100,
+  "pass": 0.5997564723788241,
+  "dist": {
+   "chimecho": 0.5997564723788241,
+   "crabhammer": 0.4002435276211759
+  }
+ },
+ {
+  "id": "K10",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "net",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "golemalola": 1.0
+  }
+ },
+ {
+  "id": "K11",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "net",
+  "ms": 100,
+  "pass": 0.21706932278206542,
+  "dist": {
+   "suckerpunch": 0.7829306772179344,
+   "moltresgalar": 0.21706932278206542
+  }
+ },
+ {
+  "id": "U01",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 0.787892287314452,
+  "dist": {
+   "closecombat": 0.27745918017497073,
+   "bravebird": 0.2774585069861025,
+   "stoneedge": 0.2329746001533787,
+   "swordsdance": 0.21210771268554815
+  }
+ },
+ {
+  "id": "U02",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "behemothblade": 0.5000031844318442,
+   "closecombat": 0.4999968155681557
+  }
+ },
+ {
+  "id": "U03",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 0.0,
+  "dist": {
+   "shellsmash": 1.0
+  }
+ },
+ {
+  "id": "U04",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 0.7054878635948281,
+  "dist": {
+   "earthquake": 0.3527454371448773,
+   "glaiverush": 0.3527424264499509,
+   "iciclecrash": 0.29451213640517176
+  }
+ },
+ {
+  "id": "U05",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "darkpulse": 1.0
+  }
+ },
+ {
+  "id": "U06",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "darkpulse": 1.0
+  }
+ },
+ {
+  "id": "U07",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "alluringvoice": 0.500001959805295,
+   "thunderbolt": 0.49999804019470495
+  }
+ },
+ {
+  "id": "U08",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "bodypress": 1.0
+  }
+ },
+ {
+  "id": "U09",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "closecombat": 0.5000012501269157,
+   "earthquake": 0.4999987498730843
+  }
+ },
+ {
+  "id": "U10",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "hornleech": 1.0
+  }
+ },
+ {
+  "id": "U11",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "knockoff": 0.5000028531087021,
+   "earthquake": 0.49999714689129793
+  }
+ },
+ {
+  "id": "U12",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "closecombat": 0.5000018852684396,
+   "flareblitz": 0.4999981147315605
+  }
+ },
+ {
+  "id": "U13",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 0.3333311641495753,
+  "dist": {
+   "stoneedge": 0.33333535228548883,
+   "playrough": 0.333333483564936,
+   "closecombat": 0.3333311641495753
+  }
+ },
+ {
+  "id": "U14",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "thunderbolt": 1.0
+  }
+ },
+ {
+  "id": "U15",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "moonblast": 0.5001175146212458,
+   "psyshock": 0.49988248537875435
+  }
+ },
+ {
+  "id": "U16",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "acrobatics": 1.0
+  }
+ },
+ {
+  "id": "T01",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "morningsun": 1.0
+  }
+ },
+ {
+  "id": "T02",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "roost": 1.0
+  }
+ },
+ {
+  "id": "T03",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "recover": 1.0
+  }
+ },
+ {
+  "id": "T04",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 0.25085939644065736,
+  "dist": {
+   "earthquake": 0.26308723582112165,
+   "roost": 0.25085939644065736,
+   "headbutt": 0.24852207753010147,
+   "terrakion": 0.23753129020811964
+  }
+ },
+ {
+  "id": "T05",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "morningsun": 1.0
+  }
+ },
+ {
+  "id": "T06",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "recover": 1.0
+  }
+ },
+ {
+  "id": "T07",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "roost": 1.0
+  }
+ },
+ {
+  "id": "T08",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "recover": 1.0
+  }
+ },
+ {
+  "id": "T09",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 0.0,
+  "dist": {
+   "alluringvoice": 1.0
+  }
+ },
+ {
+  "id": "T10",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "morningsun": 1.0
+  }
+ },
+ {
+  "id": "T11",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 0.10604191254306154,
+  "dist": {
+   "discharge": 0.8939580874569385,
+   "recover": 0.10604191254306154
+  }
+ },
+ {
+  "id": "T12",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "recover": 1.0
+  }
+ },
+ {
+  "id": "T13",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "recover": 1.0
+  }
+ },
+ {
+  "id": "T14",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 100,
+  "pass": 0.0,
+  "dist": {
+   "ficklebeam": 1.0
+  }
+ },
+ {
+  "id": "C01",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "net",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "bugbuzz": 1.0
+  }
+ },
+ {
+  "id": "C02",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "net",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "terrakion": 1.0
+  }
+ },
+ {
+  "id": "C03",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "net",
+  "ms": 100,
+  "pass": 0.0,
+  "dist": {
+   "morningsun": 1.0
+  }
+ },
+ {
+  "id": "C04",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "net",
+  "ms": 100,
+  "pass": 0.0,
+  "dist": {
+   "recover": 1.0
+  }
+ },
+ {
+  "id": "C05",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "net",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "dazzlinggleam": 1.0
+  }
+ },
+ {
+  "id": "C06",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "net",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "scald": 0.5188473963475797,
+   "icebeam": 0.48115260365242024
+  }
+ },
+ {
+  "id": "C07",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "net",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "terrakion": 1.0
+  }
+ },
+ {
+  "id": "C08",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "net",
+  "ms": 100,
+  "pass": 1.0,
+  "dist": {
+   "hurricane": 1.0
+  }
+ },
+ {
+  "id": "C09",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "net",
+  "ms": 100,
+  "pass": 0.0,
+  "dist": {
+   "roost": 1.0
+  }
+ },
+ {
+  "id": "C10",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "net",
+  "ms": 100,
+  "pass": 0.32963696586599417,
+  "dist": {
+   "recover": 0.3370537234448357,
+   "icebeam": 0.33330931068917,
+   "discharge": 0.32963696586599417
+  }
+ },
+ {
+  "id": "C11",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "net",
+  "ms": 100,
+  "pass": 0.0,
+  "dist": {
+   "slackoff": 1.0
+  }
+ },
+ {
+  "id": "S01",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "encore": 0.9268156082796568,
+   "hydropump": 0.07318439172034304
+  }
+ },
+ {
+  "id": "S02",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "thunderwave": 1.0
+  }
+ },
+ {
+  "id": "S03",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "moonblast": 0.5469143439932793,
+   "synthesis": 0.44661429083829346,
+   "terablast": 0.006471365168427271
+  }
+ },
+ {
+  "id": "S04",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "aquajet": 1.0
+  }
+ },
+ {
+  "id": "S05",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 0.6942740383142176,
+  "dist": {
+   "recover": 0.6942740383142176,
+   "lumineon": 0.30572596168578253
+  }
+ },
+ {
+  "id": "S06",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "noretreat": 1.0
+  }
+ },
+ {
+  "id": "S07",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "psychicnoise": 1.0
+  }
+ },
+ {
+  "id": "S08",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "earthquake": 1.0
+  }
+ },
+ {
+  "id": "S09",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 0.0,
+  "dist": {
+   "grafaiai": 1.0
+  }
+ },
+ {
+  "id": "S10",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "stoneedge": 0.6677078381477091,
+   "earthquake": 0.32563509841861976,
+   "doubleedge": 0.006657063433671205
+  }
+ },
+ {
+  "id": "S11",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 0.8842900759627151,
+  "dist": {
+   "moonblast": 0.5214096310018378,
+   "knockoff": 0.36288044496087746,
+   "staraptor": 0.11570992403728494
+  }
+ },
+ {
+  "id": "S12",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 0.40701142146711794,
+  "dist": {
+   "gigadrain": 0.20394435384592854,
+   "sleeppowder": 0.20306706762118942,
+   "calmmind": 0.19923235180273685,
+   "psychic": 0.19765007258973988,
+   "chesnaught": 0.1961061541404054
+  }
+ },
+ {
+  "id": "S13",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "icehammer": 1.0
+  }
+ },
+ {
+  "id": "S14",
+  "theme": "sacrifice",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 0.0,
+  "dist": {
+   "enamorustherian": 1.0
+  }
+ },
+ {
+  "id": "K01",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "baxcalibur": 1.0
+  }
+ },
+ {
+  "id": "K02",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "dugtrioalola": 0.545957847480023,
+   "arcaninehisui": 0.454042152519977
+  }
+ },
+ {
+  "id": "K03",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "net",
+  "ms": 300,
+  "pass": 0.0,
+  "dist": {
+   "megahorn": 0.9786016162234474,
+   "knockoff": 0.021398383776552576
+  }
+ },
+ {
+  "id": "K04",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "goodrahisui": 1.0
+  }
+ },
+ {
+  "id": "K05",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "rillaboom": 1.0
+  }
+ },
+ {
+  "id": "K06",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "net",
+  "ms": 300,
+  "pass": 0.4048856924492936,
+  "dist": {
+   "aquajet": 0.5951143075507063,
+   "meloetta": 0.4048856924492936
+  }
+ },
+ {
+  "id": "K07",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "net",
+  "ms": 300,
+  "pass": 0.7939689407022914,
+  "dist": {
+   "mesprit": 0.7939689407022914,
+   "morningsun": 0.16577720630492512,
+   "sunsteelstrike": 0.0402538529927835
+  }
+ },
+ {
+  "id": "K08",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "net",
+  "ms": 300,
+  "pass": 0.0,
+  "dist": {
+   "shellsmash": 0.5954847320160368,
+   "bulletseed": 0.33856970654584057,
+   "headlongrush": 0.06594556143812251
+  }
+ },
+ {
+  "id": "K09",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "net",
+  "ms": 300,
+  "pass": 0.0,
+  "dist": {
+   "crabhammer": 0.5333718905065615,
+   "stoneedge": 0.4666281094934384
+  }
+ },
+ {
+  "id": "K10",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "golemalola": 1.0
+  }
+ },
+ {
+  "id": "K11",
+  "theme": "sacrifice",
+  "kind": "control",
+  "eval": "net",
+  "ms": 300,
+  "pass": 0.48644401301419216,
+  "dist": {
+   "suckerpunch": 0.5135559869858078,
+   "moltresgalar": 0.48644401301419216
+  }
+ },
+ {
+  "id": "U01",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 0.7858230137558357,
+  "dist": {
+   "closecombat": 0.2762616877406997,
+   "bravebird": 0.27626038017590715,
+   "stoneedge": 0.23330094583922908,
+   "swordsdance": 0.21417698624416406
+  }
+ },
+ {
+  "id": "U02",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "behemothblade": 0.5000046576868118,
+   "closecombat": 0.49999534231318826
+  }
+ },
+ {
+  "id": "U03",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 0.0,
+  "dist": {
+   "shellsmash": 1.0
+  }
+ },
+ {
+  "id": "U04",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 0.7073600250212213,
+  "dist": {
+   "earthquake": 0.3536821057981457,
+   "glaiverush": 0.35367791922307573,
+   "iciclecrash": 0.29263997497877864
+  }
+ },
+ {
+  "id": "U05",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "darkpulse": 1.0
+  }
+ },
+ {
+  "id": "U06",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "darkpulse": 1.0
+  }
+ },
+ {
+  "id": "U07",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "alluringvoice": 0.5000032882899756,
+   "thunderbolt": 0.49999671171002436
+  }
+ },
+ {
+  "id": "U08",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "bodypress": 1.0
+  }
+ },
+ {
+  "id": "U09",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "closecombat": 0.5000046335111329,
+   "earthquake": 0.4999953664888671
+  }
+ },
+ {
+  "id": "U10",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "hornleech": 1.0
+  }
+ },
+ {
+  "id": "U11",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "knockoff": 0.500002973202614,
+   "earthquake": 0.49999702679738617
+  }
+ },
+ {
+  "id": "U12",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "closecombat": 0.5000024537049738,
+   "flareblitz": 0.4999975462950263
+  }
+ },
+ {
+  "id": "U13",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 0.3333301915485137,
+  "dist": {
+   "stoneedge": 0.3333370151155934,
+   "playrough": 0.333332793335893,
+   "closecombat": 0.3333301915485137
+  }
+ },
+ {
+  "id": "U14",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "thunderbolt": 1.0
+  }
+ },
+ {
+  "id": "U15",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "moonblast": 0.5000766428913503,
+   "psyshock": 0.4999233571086498
+  }
+ },
+ {
+  "id": "U16",
+  "theme": "setup",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "acrobatics": 1.0
+  }
+ },
+ {
+  "id": "T01",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "morningsun": 1.0
+  }
+ },
+ {
+  "id": "T02",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "roost": 1.0
+  }
+ },
+ {
+  "id": "T03",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "recover": 1.0
+  }
+ },
+ {
+  "id": "T04",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 0.25848528429590834,
+  "dist": {
+   "earthquake": 0.25875919732525343,
+   "roost": 0.25848528429590834,
+   "headbutt": 0.2551764818673931,
+   "terrakion": 0.22757903651144507
+  }
+ },
+ {
+  "id": "T05",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "morningsun": 1.0
+  }
+ },
+ {
+  "id": "T06",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "recover": 1.0
+  }
+ },
+ {
+  "id": "T07",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "roost": 1.0
+  }
+ },
+ {
+  "id": "T08",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "recover": 1.0
+  }
+ },
+ {
+  "id": "T09",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 0.0,
+  "dist": {
+   "alluringvoice": 1.0
+  }
+ },
+ {
+  "id": "T10",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "morningsun": 1.0
+  }
+ },
+ {
+  "id": "T11",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 0.0,
+  "dist": {
+   "discharge": 1.0
+  }
+ },
+ {
+  "id": "T12",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "recover": 1.0
+  }
+ },
+ {
+  "id": "T13",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "recover": 1.0
+  }
+ },
+ {
+  "id": "T14",
+  "theme": "stall",
+  "kind": "positive",
+  "eval": "net",
+  "ms": 300,
+  "pass": 0.0,
+  "dist": {
+   "ficklebeam": 1.0
+  }
+ },
+ {
+  "id": "C01",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "bugbuzz": 1.0
+  }
+ },
+ {
+  "id": "C02",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "terrakion": 1.0
+  }
+ },
+ {
+  "id": "C03",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "net",
+  "ms": 300,
+  "pass": 0.0,
+  "dist": {
+   "morningsun": 1.0
+  }
+ },
+ {
+  "id": "C04",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "net",
+  "ms": 300,
+  "pass": 0.0,
+  "dist": {
+   "recover": 1.0
+  }
+ },
+ {
+  "id": "C05",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "dazzlinggleam": 1.0
+  }
+ },
+ {
+  "id": "C06",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "scald": 0.5276939743249012,
+   "icebeam": 0.4723060256750987
+  }
+ },
+ {
+  "id": "C07",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "terrakion": 1.0
+  }
+ },
+ {
+  "id": "C08",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "net",
+  "ms": 300,
+  "pass": 1.0,
+  "dist": {
+   "hurricane": 1.0
+  }
+ },
+ {
+  "id": "C09",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "net",
+  "ms": 300,
+  "pass": 0.0,
+  "dist": {
+   "roost": 1.0
+  }
+ },
+ {
+  "id": "C10",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "net",
+  "ms": 300,
+  "pass": 0.3368000591672285,
+  "dist": {
+   "discharge": 0.3368000591672285,
+   "recover": 0.33297272721356913,
+   "icebeam": 0.33022721361920243
+  }
+ },
+ {
+  "id": "C11",
+  "theme": "stall",
+  "kind": "control",
+  "eval": "net",
+  "ms": 300,
+  "pass": 0.0,
+  "dist": {
+   "slackoff": 1.0
+  }
+ }
+]
