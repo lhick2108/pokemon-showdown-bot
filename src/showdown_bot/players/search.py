@@ -448,6 +448,62 @@ def select_choice(
 # ---------------------------------------------------------------------------
 
 
+def _opp_facts(battle: Any, trackers: Any) -> list[dict[str, Any]]:
+    """What the set tracker knows about each revealed opponent Pokemon (recording only).
+
+    Active Pokemon first, then the others (the order worlds use). ``n_sets`` is
+    the number of full randbats sets still consistent with the evidence and
+    ``entropy`` the Shannon entropy (bits) of their occurrence-count weights.
+    """
+    import math
+
+    out: list[dict[str, Any]] = []
+    try:
+        active = battle.opponent_active_pokemon
+        mons = sorted(battle.opponent_team.items(), key=lambda kv: 0 if kv[1] is active else 1)
+        for identifier, mon in mons:
+            tracker = trackers.get(str(identifier))
+            row: dict[str, Any] = {"species": str(getattr(mon, "species", "")).lower()}
+            if tracker is not None:
+                matches = tracker._matching_full_sets()
+                counts = [max(0.0, float(fs.count)) for _, fs in matches]
+                total = sum(counts)
+                entropy = -sum(c / total * math.log2(c / total) for c in counts if c > 0) if total else 0.0
+                # same, ignoring the tera type (unknowable before it is used)
+                groups: dict[tuple, float] = {}
+                for sid, fs in matches:
+                    key = (sid, str(fs.item), str(fs.ability), tuple(sorted(str(m) for m in fs.moves)))
+                    groups[key] = groups.get(key, 0.0) + max(0.0, float(fs.count))
+                gt = sum(groups.values())
+                entropy_nt = -sum(c / gt * math.log2(c / gt) for c in groups.values() if c > 0) if gt else 0.0
+                row.update(
+                    moves=[str(m) for m in tracker.revealed_moves],
+                    item=tracker._revealed_item,
+                    ability=tracker._revealed_ability,
+                    tera=tracker._revealed_tera,
+                    n_constraints=len(tracker.constraints),
+                    n_sets=len(matches),
+                    entropy=round(entropy, 3),
+                    n_sets_nt=len(groups),
+                    vary={
+                        "item": len({str(fs.item) for _, fs in matches}),
+                        "ability": len({str(fs.ability) for _, fs in matches}),
+                        "tera": len({str(fs.tera_type) for _, fs in matches}),
+                        "moves": len({tuple(sorted(str(m) for m in fs.moves)) for _, fs in matches}),
+                    },
+                    entropy_nt=round(entropy_nt, 3),
+                    groups=[
+                        [k[1], k[2], "/".join(k[3]), round(w / gt, 4)]
+                        for k, w in sorted(groups.items(), key=lambda kv: -kv[1])[:40]
+                    ],
+                    inconsistent=bool(tracker.inconsistent),
+                )
+            out.append(row)
+    except Exception:
+        logger.debug("opp_facts failed", exc_info=True)
+    return out
+
+
 class SearchPlayer(OpponentModelPlayerMixin, Player):
     """MCTS over sampled opponent worlds; see the module docstring."""
 
@@ -587,6 +643,7 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         if recording:
             started = time.perf_counter()
             truth_state, truth_status = self._truth_state(battle)
+            opp_facts = _opp_facts(battle, trackers)
         built = None
         state_strings: list[str] = []
         try:
@@ -630,6 +687,7 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             self._record_decision(
                 battle, order, policy, n_worlds, time_ms, started, truth_state, truth_status,
                 nash_records if self.config.mode == NASH else None,
+                opp_facts,
             )
         return order
 
@@ -744,6 +802,7 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         truth_state: str | None,
         truth_status: str,
         nash_records: list[dict[str, Any] | None] | None = None,
+        opp_facts: list[dict[str, Any]] | None = None,
     ) -> None:
         try:
             recorder = self._recorder
@@ -784,6 +843,7 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
                     },
                     "truth": {"state": truth_state} if truth_state else None,
                     "truth_status": truth_status,
+                    "opp_facts": opp_facts,
                 },
             )
         except Exception:

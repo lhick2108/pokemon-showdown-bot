@@ -62,12 +62,18 @@ class Constraint:
       ``no_heal``     data = item ids whose end-of-turn heal was absent.
       ``no_orb``      data = ("flameorb"|"toxicorb",): no activation at end of turn.
       ``no_hazard``   data = hazards that stayed silent on a switch-in.
+      ``ability_not`` data = ability ids that would have been announced on switch-in
+                      (Intimidate, Pressure, ...) but were not.
       ``speed``       data = (our_speed, opp_first, trick_room, stage, par, tailwind)
     """
 
     kind: str
     data: tuple = ()
 
+
+# Abilities whose switch-in activation always prints an ``-ability`` line. Seeing a
+# Pokemon enter without it rules the ability out (absent Neutralizing Gas, a fainted foe).
+SWITCH_ANNOUNCED = ("intimidate", "pressure", "moldbreaker", "teravolt", "turboblaze")
 
 CHOICE_ITEMS = ("choiceband", "choicespecs", "choicescarf")
 
@@ -201,6 +207,8 @@ def constraint_allows(constraint: Constraint, species_id: str, full_set: Any) ->
             return True
         types = species_types(species_id)
         return all(_hazard_blocked(h, types, ability, item) for h in constraint.data)
+    if kind == "ability_not":
+        return ability not in constraint.data
     if kind == "speed":
         return _speed_allows(constraint.data, species_id, full_set, item, ability)
     if kind == "reject":
@@ -342,6 +350,15 @@ class _Pending:
     skip: bool = False
 
 
+@dataclass
+class _Intro:
+    """A switch-in awaiting its (possible) ``-ability`` announcement."""
+
+    identity: Identity
+    announced: set = field(default_factory=set)
+    skip: bool = False
+
+
 Emission = tuple  # (identity, Constraint | SpeedObs)
 
 
@@ -404,6 +421,8 @@ class InferenceTracker:
         self.safeguard: dict[str, bool] = {"p1": False, "p2": False}
         self.weather = ""
         self.pending: list[_Pending] = []
+        self.intros: list[_Intro] = []
+        self.ngas = False  # Neutralizing Gas seen: no ability evidence from here on
         self.actions: list[tuple[str, str, Identity | None]] = []  # (kind, move id, identity)
         self.action_status: list[bool] = []
         self.turn_snapshot: tuple | None = None
@@ -445,6 +464,20 @@ class InferenceTracker:
                 )
                 if silent and not self.gravity:
                     out.append((item.identity, Constraint("no_hazard", tuple(sorted(silent)))))
+
+    def _close_intros(self, out: list[Emission], side: str | None = None) -> None:
+        keep = []
+        for intro in self.intros:
+            if side is not None and intro.identity[0] != side:
+                keep.append(intro)
+                continue
+            foe = self.active.get(("p2" if intro.identity[0] == "p1" else "p1", "a"))
+            if intro.skip or self.ngas or foe is None:
+                continue
+            silent = tuple(a for a in SWITCH_ANNOUNCED if a not in intro.announced)
+            if silent:
+                out.append((intro.identity, Constraint("ability_not", silent)))
+        self.intros = keep
 
     # -- main entry ------------------------------------------------------
 
@@ -540,6 +573,7 @@ class InferenceTracker:
 
     def _on_blank(self, event, out) -> None:
         self._close_pending(out)
+        self._close_intros(out)
         for identity in self.active.values():
             mon = self._mon(identity)
             mon.in_residual = True
@@ -550,6 +584,7 @@ class InferenceTracker:
 
     def _on_turn(self, event, out) -> None:
         self._close_pending(out)
+        self._close_intros(out)
         self.actions = []
         self.action_status = []
         self.turn_snapshot = self._speed_signature()
@@ -559,6 +594,7 @@ class InferenceTracker:
 
     def _on_cant(self, event, out) -> None:
         self._close_pending(out)
+        self._close_intros(out)
         identity = _ident(event[2]) if len(event) > 2 else None
         self._record_action("cant", "", identity, False, out)
 
@@ -570,6 +606,7 @@ class InferenceTracker:
 
     def _on_win(self, event, out) -> None:
         self._close_pending(out)
+        self._close_intros(out)
 
     def _on_switch(self, event, out) -> None:
         self._close_pending(out)
@@ -578,6 +615,11 @@ class InferenceTracker:
         identity, slot = _ident(event[2]), _slot(event[2])
         if identity is None or slot is None:
             return
+        self._close_intros(out, side=identity[0])
+        foe = self.active.get(("p2" if identity[0] == "p1" else "p1", "a"))
+        foe_mon = self.mons.get(foe) if foe else None
+        foe_gone = foe_mon is not None and (foe_mon.hp is not None and foe_mon.hp <= 0)
+        self.intros.append(_Intro(identity, skip=foe_gone or "tera:" in str(event[3]).lower()))
         self.active[slot] = identity
         mon = _Mon(hp=_parse_hp(event[4]), status=_status_of(event[4]))
         mon.terastallized = "tera:" in str(event[3]).lower()
@@ -595,6 +637,7 @@ class InferenceTracker:
         # Illusion ends: the HP/state seen under the disguise name is the
         # Zoroark's, but we cannot reattribute pending checks; drop them.
         self.pending = []
+        self.intros = []
         self.actions = []
         slot = _slot(event[2]) if len(event) > 2 else None
         identity = _ident(event[2]) if len(event) > 2 else None
@@ -649,6 +692,7 @@ class InferenceTracker:
 
     def _on_move(self, event, out) -> None:
         self._close_pending(out)
+        self._close_intros(out)
         if len(event) < 4:
             return
         identity = _ident(event[2])
@@ -718,6 +762,17 @@ class InferenceTracker:
         for item in self.pending:
             if item.identity == identity:
                 item.skip = True
+
+    def _on_ability(self, event, out) -> None:
+        identity = _ident(event[2]) if len(event) > 2 else None
+        name = to_id(event[3]) if len(event) > 3 else ""
+        if name == "neutralizinggas":
+            self.ngas = True
+        if identity is None:
+            return
+        for intro in self.intros:
+            if intro.identity == identity:
+                intro.announced.add(name)
 
     def _on_activate(self, event, out) -> None:
         if len(event) < 4:
@@ -942,6 +997,7 @@ class InferenceTracker:
 
     def _on_upkeep(self, event, out) -> None:
         self._close_pending(out)
+        self._close_intros(out)
         for slot, identity in self.active.items():
             mon = self.mons.get(identity)
             if mon is None or not mon.in_residual or mon.terastallized:
