@@ -43,10 +43,27 @@ DEFAULT_MOVES = ["Tackle", "Protect", "Rest", "Substitute"]
 SKIP = {"inactive", "inactiveoff", "request", "title", "j", "l", "c", "raw", ""}
 
 
-def our_species(lines: list[str]) -> list[tuple[str, int]]:
+def our_role(lines: list[str], username: str = "porygonzplaya") -> str:
+    """Our side ("p1"/"p2") from the ``|player|`` lines; p1 if the log doesn't say."""
+    for line in lines:
+        parts = line.split("|")
+        if len(parts) > 3 and parts[1] == "player" and parts[3].strip().lower() == username:
+            return parts[2]
+    return "p1"
+
+
+def side_request(team, active: int, role: str) -> dict:
+    request = request_for(team, active=active)
+    request["side"]["id"] = role
+    for mon in request["side"]["pokemon"]:
+        mon["ident"] = role + mon["ident"][2:]
+    return request
+
+
+def our_species(lines: list[str], role: str = "p1") -> list[tuple[str, int]]:
     seen: dict[str, int] = {}
     for line in lines:
-        match = re.match(r"\|switch\|p1a: [^|]+\|([^,|]+), L(\d+)", line)
+        match = re.match(rf"\|switch\|{role}a: [^|]+\|([^,|]+), L(\d+)", line)
         if match:
             seen.setdefault(match.group(1), int(match.group(2)))
     return list(seen.items())
@@ -70,12 +87,13 @@ def replay(lines: list[str], turn: int, team=None, model: OpponentModel | None =
     """Feed the log up to the start of ``turn``; ``model.update`` runs at every turn start
     (the bot updates its opponent model at each decision, and the trackers are incremental)."""
     battle = Battle("battle-gen9randombattle-replay", username="porygonzplaya", logger=None, gen=9)
-    battle.player_role = "p1"
+    role = our_role(lines)
+    battle.player_role = role
     sleep_module._TRACKERS.pop(battle.battle_tag, None)
     real = has_requests(lines)
     if not real:
         names = [t[0] for t in team]
-        battle.parse_request(request_for(team, active=0))
+        battle.parse_request(side_request(team, 0, role))
     at_turn = False  # reached |turn|N: the server's request for N follows it in the log
     for line in lines:
         if not line.startswith("|"):
@@ -91,8 +109,8 @@ def replay(lines: list[str], turn: int, team=None, model: OpponentModel | None =
             break
         if parts[1] in SKIP:
             continue
-        if not real and parts[1] == "switch" and parts[2].startswith("p1a"):
-            battle.parse_request(request_for(team, active=names.index(parts[3].split(",")[0])))
+        if not real and parts[1] == "switch" and parts[2].startswith(role + "a"):
+            battle.parse_request(side_request(team, names.index(parts[3].split(",")[0]), role))
         if model is not None:
             model.observe_events(battle.battle_tag, [parts], battle)
         sleep_module.observe_events(battle.battle_tag, [parts])  # as OpponentModelPlayerMixin does
@@ -194,7 +212,7 @@ def main() -> None:
     lines = Path(args.log).read_text(encoding="utf-8").splitlines()
     moves = {k: v.split(",") for k, v in (m.split("=", 1) for m in args.moves)}
     items = dict(i.split("=", 1) for i in args.item)
-    team = None if has_requests(lines) else build_team(our_species(lines), moves, items)
+    team = None if has_requests(lines) else build_team(our_species(lines, our_role(lines)), moves, items)
     print("our side:", "real |request| sets" if team is None else "synthesised (no requests in log)")
     data = default_randbats_data()
     model = OpponentModel(data)
