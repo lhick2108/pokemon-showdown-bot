@@ -1192,7 +1192,7 @@ impl Side {
 
         let mut vs_bitset = VolatileStatusBitset::default();
         if split[8] != "" {
-            for item in split[8].split(":") {
+            for item in split[8].split(":").filter(|i| !i.is_empty()) {
                 vs_bitset.insert(PokemonVolatileStatus::from_str(item).unwrap());
             }
         }
@@ -1978,6 +1978,18 @@ impl State {
                 let active = self.get_side(&instruction.side_ref).get_active();
                 active.id = PokemonName::from(active.id as i16 + instruction.name_change);
             }
+            Instruction::ChangeMove(instruction) => {
+                let mv = &mut self.get_side(&instruction.side_ref).get_active().moves
+                    [&instruction.move_index];
+                mv.id = Choices::from((mv.id as i16 + instruction.id_change) as u16);
+                mv.choice = MOVES.get(&mv.id).unwrap().to_owned();
+            }
+            Instruction::ChangeWeight(instruction) => {
+                let active = self.get_side(&instruction.side_ref).get_active();
+                active.weight_kg =
+                    ((active.weight_kg * 10.0).round() as i32 + instruction.amount_hg as i32) as f32
+                        / 10.0;
+            }
             Instruction::TeamPreviewFaintIndex(side_ref, pkmn_index) => {
                 self.get_side(&side_ref).pokemon[*pkmn_index].hp = 0;
             }
@@ -2179,6 +2191,18 @@ impl State {
             Instruction::FormeChange(instruction) => {
                 let active = self.get_side(&instruction.side_ref).get_active();
                 active.id = PokemonName::from(active.id as i16 - instruction.name_change);
+            }
+            Instruction::ChangeMove(instruction) => {
+                let mv = &mut self.get_side(&instruction.side_ref).get_active().moves
+                    [&instruction.move_index];
+                mv.id = Choices::from((mv.id as i16 - instruction.id_change) as u16);
+                mv.choice = MOVES.get(&mv.id).unwrap().to_owned();
+            }
+            Instruction::ChangeWeight(instruction) => {
+                let active = self.get_side(&instruction.side_ref).get_active();
+                active.weight_kg =
+                    ((active.weight_kg * 10.0).round() as i32 - instruction.amount_hg as i32) as f32
+                        / 10.0;
             }
             Instruction::TeamPreviewFaintIndex(side_ref, pkmn_index) => {
                 let pkmn = &mut self.get_side(side_ref).pokemon[*pkmn_index];

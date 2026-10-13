@@ -977,6 +977,116 @@ def _opponent_pokemon(slot: OpponentSlot, battle: Any) -> tuple[pe.Pokemon, list
     return pokemon, moves, mon
 
 
+def _engine_supports_transform() -> bool:
+    """Whether the installed engine knows the ``transformed`` volatile / Imposter.
+
+    Added in ``0.0.48+sdb.3``; older builds panic on an unknown volatile name.
+    """
+    try:
+        from importlib.metadata import version
+
+        text = version("poke_engine")
+    except Exception:
+        return False
+    if "+sdb." not in text:
+        return False
+    try:
+        return int(text.rsplit("+sdb.", 1)[1].split(".")[0]) >= 3
+    except ValueError:
+        return False
+
+
+_ENGINE_TRANSFORMS = _engine_supports_transform()
+
+
+def _rebuild_pokemon(pokemon: pe.Pokemon, **changes: Any) -> pe.Pokemon:
+    """Copy of an engine Pokemon (attributes are read-only) with ``changes`` applied."""
+    kwargs: dict[str, Any] = dict(
+        id=pokemon.id, level=pokemon.level, types=pokemon.types,
+        base_types=pokemon.base_types, hp=pokemon.hp, maxhp=pokemon.maxhp,
+        ability=pokemon.ability, base_ability=pokemon.base_ability, item=pokemon.item,
+        nature=pokemon.nature, evs=pokemon.evs, attack=pokemon.attack,
+        defense=pokemon.defense, special_attack=pokemon.special_attack,
+        special_defense=pokemon.special_defense, speed=pokemon.speed,
+        status=pokemon.status, rest_turns=pokemon.rest_turns,
+        sleep_turns=pokemon.sleep_turns, weight_kg=pokemon.weight_kg,
+        mega_evolved=pokemon.mega_evolved, terastallized=pokemon.terastallized,
+        tera_type=pokemon.tera_type, moves=list(pokemon.moves),
+    )
+    kwargs.update(changes)
+    return pe.Pokemon(**kwargs)
+
+
+def _transform_target_stats(
+    mon: Any, foe_entries: Sequence[tuple[pe.Pokemon, list[pe.Move], Any | None]]
+) -> tuple[int, int, int, int, int] | None:
+    """atk/def/spa/spd/spe a Transformed Pokemon copied, as the engine sees the target.
+
+    Showdown copies the target's actual stats (``transformInto``), not stats rebuilt
+    from the target species at the user's own level. poke-env keeps only the target's
+    species base stats, so find the foe whose species matches (the active one first);
+    fall back to the formula at the user's level.
+    """
+    base_stats = getattr(mon, "_temporary_base_stats", None)
+    if not base_stats:
+        return None
+    for pokemon, _moves, _mon in foe_entries:
+        entry = dex_entry(to_id(pokemon.id))
+        if entry is not None and dict(entry["baseStats"]) == dict(base_stats):
+            return (
+                pokemon.attack, pokemon.defense, pokemon.special_attack,
+                pokemon.special_defense, pokemon.speed,
+            )
+    stats = compute_stats(base_stats, int(mon.level or 100))
+    return (stats["atk"], stats["def"], stats["spa"], stats["spd"], stats["spe"])
+
+
+def _apply_transform(
+    entries: list[tuple[pe.Pokemon, list[pe.Move], Any | None]],
+    foe_entries: Sequence[tuple[pe.Pokemon, list[pe.Move], Any | None]],
+    *,
+    is_ours: bool,
+) -> None:
+    """Make an already-Transformed active Pokemon carry its copied kit (in place).
+
+    A Ditto that has used Transform / Imposter (protocol ``-transform``) keeps its
+    own species id, but its stats (except HP), moves (5 PP each), ability, weight and
+    types are the target's. Our side's request already lists the copied moves and the
+    right ability, but its ``stats`` are the base species' (Ditto's), and the opponent
+    side is otherwise built from the sampled randbats set (Ditto's lone Transform).
+    Boosts are copied by poke-env itself.
+    """
+    if not entries:
+        return
+    pokemon, moves, mon = entries[0]
+    if mon is None or mon.fainted or not getattr(mon, "transformed", False):
+        return
+    changes: dict[str, Any] = {}
+    stats = _transform_target_stats(mon, foe_entries)
+    if stats is not None:
+        changes.update(
+            attack=stats[0], defense=stats[1], special_attack=stats[2],
+            special_defense=stats[3], speed=stats[4],
+        )
+    weight = getattr(mon, "weight", None)
+    if weight:
+        changes["weight_kg"] = float(weight)
+    changes["types"] = changes["base_types"] = _types_pair(mon.base_types)
+    if not is_ours:
+        ability = to_id(mon.ability)
+        if ability:
+            changes["ability"] = ability
+            changes["base_ability"] = pokemon.base_ability
+        copied = [
+            _engine_move(move_id, min(5, move.current_pp))
+            for move_id, move in list(mon.moves.items())[:4]
+        ]
+        if copied:
+            changes["moves"] = copied
+            moves = copied
+    entries[0] = (_rebuild_pokemon(pokemon, **changes), moves, mon)
+
+
 def _make_side(
     ordered: Sequence[tuple[pe.Pokemon, list[pe.Move], Any | None]],
     active_mon: Any | None,
@@ -992,6 +1102,10 @@ def _make_side(
     protect_counter = 0
     if active_mon is not None and not active_mon.fainted:
         volatiles, durations = _volatiles_for(active_mon)
+        if _ENGINE_TRANSFORMS and getattr(active_mon, "transformed", False):
+            # Imposter / Transform already happened: it must not re-copy, and
+            # nothing may copy-from a transformed Pokemon (Showdown's rules).
+            volatiles.add("transformed")
         kwargs["volatile_statuses"] = volatiles
         kwargs["volatile_status_durations"] = pe.VolatileStatusDurations(**durations)
         if "substitute" in volatiles:
@@ -1040,13 +1154,19 @@ def build_state(
     for mon in ours_sorted[:TEAM_SIZE]:
         pokemon, moves = _own_pokemon(battle, mon, mon is our_active)
         our_entries.append((pokemon, moves, mon))
-    side_one = _make_side(
-        our_entries, our_active, battle, battle.side_conditions, is_ours=True
-    )
 
     # --- opponent (sampled) ---
     opp_active = battle.opponent_active_pokemon
     opp_entries = [_opponent_pokemon(slot, battle) for slot in opponent_team[:TEAM_SIZE]]
+
+    # A Ditto that already transformed copies stats it does not have in the request /
+    # sampled set; resolve each side against the other's (pre-transform) entries.
+    opp_before = list(opp_entries)
+    _apply_transform(opp_entries, our_entries, is_ours=False)
+    _apply_transform(our_entries, opp_before, is_ours=True)
+    side_one = _make_side(
+        our_entries, our_active, battle, battle.side_conditions, is_ours=True
+    )
     opp_active_mon = None
     if opp_entries:
         opp_active_mon = opp_entries[0][2] if opp_entries[0][2] is opp_active else None
