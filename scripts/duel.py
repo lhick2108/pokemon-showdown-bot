@@ -73,6 +73,23 @@ def _parser() -> argparse.ArgumentParser:
                    help="589.40 opponent tendency model on the stock side (default off)")
     p.add_argument("--tendency-kappa", type=float, default=None, help="prior pseudo-observations")
     p.add_argument("--tendency-delta", type=float, default=None, help="max loss vs Nash")
+    for side in ("net", "stock"):
+        p.add_argument(f"--{side}-escalate", action="store_true",
+                       help=f"589.47: {side} side re-searches longer when the top two options are flat")
+        p.add_argument(f"--{side}-escalate-gap", type=float, default=0.02,
+                       help="flat when the top two mean scores differ by less than this")
+        p.add_argument(f"--{side}-escalate-factor", type=float, default=4.0,
+                       help="escalated per-world budget as a multiple of --search-time-ms")
+        p.add_argument(f"--{side}-escalate-steps", type=int, default=1)
+        p.add_argument(f"--{side}-escalate-cap-ms", type=int, default=3000,
+                       help="hard wall-clock cap of one decision's search")
+        p.add_argument(f"--{side}-prune-noop", action="store_true",
+                       help=f"589.47: {side} side drops moves the engine proves have no effect")
+        p.add_argument(f"--{side}-prune-noop-loose", action="store_true",
+                       help="with --prune-noop: ignore opponent switches when proving a no-op "
+                            "(also prunes status into an already-statused target)")
+        p.add_argument(f"--{side}-tera-margin", type=float, default=0.0,
+                       help="589.47: X-tera needs a mean this much above X, else it folds into X (0 = off)")
     p.add_argument("--selection-gamma", type=float, default=0.1,
                    help="exploration rate in (0, 1] for exp3/rm sides")
     p.add_argument("--stock-uses-evaluator", action="store_true",
@@ -106,6 +123,18 @@ def _tendency_fields(args, flag: str) -> dict:
     return fields
 
 
+def _quality(args, side: str) -> dict:
+    """SearchConfig fields of the 589.47 decision-quality options for one side."""
+    get = lambda name: getattr(args, f"{side}_{name}")  # noqa: E731
+    return {
+        "escalate": get("escalate"), "escalate_gap": get("escalate_gap"),
+        "escalate_factor": get("escalate_factor"), "escalate_steps": get("escalate_steps"),
+        "escalate_cap_ms": get("escalate_cap_ms"), "prune_noop": get("prune_noop"),
+        "noop_vs_switches": not get("prune_noop_loose"),
+        "tera_margin": get("tera_margin"),
+    }
+
+
 async def _duel_pair(args, share: int, pool):
     options = {
         "battle_format": args.format,
@@ -130,7 +159,8 @@ async def _duel_pair(args, share: int, pool):
                           "mode": args.net_mode,
                           "eval_lowhp_knee": args.net_eval_lowhp,
                           "eval_boost_scale": args.net_eval_boost_scale,
-                          **_tendency_fields(args, args.net_tendency)}),
+                          **_tendency_fields(args, args.net_tendency),
+                          **_quality(args, "net")}),
         executor=pool, **options,
     )
     if args.opponent_evaluator:
@@ -152,6 +182,7 @@ async def _duel_pair(args, share: int, pool):
             "eval_lowhp_knee": args.stock_eval_lowhp,
             "eval_boost_scale": args.stock_eval_boost_scale,
             **_tendency_fields(args, args.stock_tendency),
+            **_quality(args, "stock"),
         }),
         executor=pool, **options,
     )
@@ -230,6 +261,10 @@ def main(argv=None) -> int:
           f"(gamma {args.selection_gamma:g} for exp3/rm); "
           f"mode: net={args.net_mode} stock={args.stock_mode}; "
           f"tendency: net={args.net_tendency} stock={args.stock_tendency}")
+    for side in ("net", "stock"):
+        q = _quality(args, side)
+        if q["escalate"] or q["prune_noop"] or q["tera_margin"]:
+            print(f"589.47 {side}: {q}")
     print(f"compute (both sides): {args.search_time_ms} ms/world, parallelism {args.parallelism}, "
           f"worlds {args.worlds or '2 x parallelism (4x early)'}, threads {args.threads}; "
           f"{len(pairs)} parallel pairs, pool of {args.workers}")
@@ -238,6 +273,9 @@ def main(argv=None) -> int:
         iters = sum(p[idx].stats.iterations for p in pairs)
         ms = sum(p[idx].stats.search_ms for p in pairs)
         fb = sum(p[idx].stats.fallbacks for p in pairs)
+        st = [p[idx].stats for p in pairs]
+        print(f"{label}: decisions={sum(x.searched for x in st)} escalations={sum(x.escalations for x in st)} "
+              f"noop_pruned={sum(x.noop_pruned for x in st)} tera_folded={sum(x.tera_folded for x in st)}")
         werr = sum(p[idx].stats.world_errors for p in pairs)
         print(f"{label}: {iters / (ms / 1000) if ms else 0:,.0f} iterations per second of "
               f"per-world budget ({iters:,} iterations over {ms / 1000:.0f} s); "
