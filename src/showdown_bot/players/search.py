@@ -33,6 +33,13 @@ only poke-env options), these environment variables:
     SHOWDOWN_SEARCH_NASH_PSEUDOCOUNT
                                  shrinkage pseudo-count c >= 0 for the joint matrix (default 5)
     SHOWDOWN_SEARCH_NASH_FLOOR   drop Nash actions below this share, in [0, 1) (default 0.03)
+    SHOWDOWN_SEARCH_TENDENCY     "on" turns the opponent-tendency model on (default off, 589.40):
+                                 solves the root matrix game like mode "nash" and exploits the
+                                 opponent's observed action classes within a safety margin
+    SHOWDOWN_SEARCH_TENDENCY_KAPPA
+                                 prior pseudo-observations of the Nash class mix (default 4)
+    SHOWDOWN_SEARCH_TENDENCY_DELTA
+                                 max worst-case win-probability loss vs Nash (default 0.05)
     SHOWDOWN_SEARCH_SELECTION    engine tree-policy: "ucb1" (default), "exp3" or "rm";
                                  exp3/rm need threads == 1 (see docs/selection.md)
     SHOWDOWN_SEARCH_SELECTION_GAMMA
@@ -57,6 +64,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import dataclasses
+import functools
 import logging
 import math
 import os
@@ -76,6 +84,7 @@ from poke_env.ps_client import AccountConfiguration
 from poke_env.player.battle_order import BattleOrder, DefaultBattleOrder
 
 from showdown_bot import engine_state, nash as nash_module, recorder as recorder_module
+from showdown_bot import opponent_tendency as tendency_module
 from showdown_bot.players import _worker
 from showdown_bot.recorder import GameRecorder
 from showdown_bot.sets import OpponentModel, OpponentModelPlayerMixin, RandbatsData
@@ -177,6 +186,9 @@ class SearchConfig:
     selection_gamma: float = 0.1  # exploration rate for exp3 / rm
     nash_pseudocount: float = nash_module.DEFAULT_PSEUDOCOUNT  # mode="nash": cell shrinkage c
     nash_floor: float = DEFAULT_NASH_FLOOR  # mode="nash": drop actions below this share
+    tendency: bool = False  # 589.40 opponent tendency model (implies nash-style root solve)
+    tendency_kappa: float = tendency_module.DEFAULT_KAPPA  # prior pseudo-observations
+    tendency_delta: float = tendency_module.DEFAULT_DELTA  # safe-exploitation loss bound
     inference: bool = True  # 589.28 opponent set inference (False: pre-589.28 sampling)
     damage_inference: bool = True  # ...of which: damage-roll inference (needs inference)
     eval_lowhp_knee: float = 0.0  # 589.32 experiment: >0 discounts alive/item/boost value of low-HP mons
@@ -206,6 +218,14 @@ class SearchConfig:
                 NASH_PSEUDOCOUNT_ENV, nash_module.DEFAULT_PSEUDOCOUNT, 0.0, math.inf
             ),
             nash_floor=_env_float(NASH_FLOOR_ENV, DEFAULT_NASH_FLOOR, 0.0, 1.0),
+            tendency=os.environ.get("SHOWDOWN_SEARCH_TENDENCY", "off").strip().lower()
+            in ("1", "on", "true", "yes"),
+            tendency_kappa=_env_float(
+                "SHOWDOWN_SEARCH_TENDENCY_KAPPA", tendency_module.DEFAULT_KAPPA, 0.0, math.inf
+            ),
+            tendency_delta=_env_float(
+                "SHOWDOWN_SEARCH_TENDENCY_DELTA", tendency_module.DEFAULT_DELTA, 0.0, 1.0
+            ),
             inference=os.environ.get("SHOWDOWN_INFERENCE", "1").strip().lower()
             not in ("0", "off", "false", "no"),
             damage_inference=os.environ.get("SHOWDOWN_INFERENCE_DAMAGE", "1").strip().lower()
@@ -374,8 +394,18 @@ def aggregate_policy(results: list[WorldResult]) -> dict[str, float]:
     return policy
 
 
+@dataclass
+class TendencyQuery:
+    """The current context's observed counts plus blending settings (mode ``tendency``)."""
+
+    counts: dict[str, float]
+    kappa: float = tendency_module.DEFAULT_KAPPA
+    delta: float = tendency_module.DEFAULT_DELTA
+    diag: list = field(default_factory=list)  # one dict per world that was exploited
+
+
 def nash_world(
-    result: WorldResult, pseudocount: float
+    result: WorldResult, pseudocount: float, tendency: TendencyQuery | None = None
 ) -> tuple[dict[str, float], float, float] | None:
     """Solve one world's root matrix game: ``(our strategy by choice, value, exploitability)``.
 
@@ -389,14 +419,25 @@ def nash_world(
     options = result[1]
     matrix = nash_module.shrunk_matrix(len(options), int(k2), cells, pseudocount)
     solution = nash_module.solve_matrix_game(matrix)
+    row = solution.row
+    if tendency is not None and len(result) > 4 and result[4]:
+        classes = [tendency_module.classify_choice(c) for c in result[4]]
+        if len(classes) == matrix.shape[1]:
+            row, info = tendency_module.exploit_world(
+                matrix, solution.row, solution.col, solution.value, classes,
+                tendency.counts, tendency.kappa, tendency.delta,
+            )
+            info["br_choice"] = options[info["br"]][0]
+            tendency.diag.append(info)
     strategy: dict[str, float] = {}
-    for (choice, _visits, _score), p in zip(options, solution.row):
+    for (choice, _visits, _score), p in zip(options, row):
         strategy[choice] = strategy.get(choice, 0.0) + float(p)
     return strategy, solution.value, solution.exploitability
 
 
 def aggregate_nash(
-    results: list[WorldResult], pseudocount: float, floor: float = 0.0
+    results: list[WorldResult], pseudocount: float, floor: float = 0.0,
+    tendency: TendencyQuery | None = None,
 ) -> tuple[dict[str, float], list[dict[str, Any] | None]]:
     """Nash policy over worlds, plus a per-world record (aligned with ``results``).
 
@@ -407,7 +448,7 @@ def aggregate_nash(
     weighted: list[tuple[float, dict[str, float]]] = []
     records: list[dict[str, Any] | None] = []
     for result in results:
-        solved = nash_world(result, pseudocount) if result[0] > 0 else None
+        solved = nash_world(result, pseudocount, tendency) if result[0] > 0 else None
         if solved is None:
             records.append(None)
             continue
@@ -508,6 +549,11 @@ def _opp_facts(battle: Any, trackers: Any) -> list[dict[str, Any]]:
     return out
 
 
+def mode_for_record(config: SearchConfig) -> str:
+    """``nash`` whenever the root joint matrix is needed (nash mode or tendency)."""
+    return NASH if config.tendency else config.mode
+
+
 class SearchPlayer(OpponentModelPlayerMixin, Player):
     """MCTS over sampled opponent worlds; see the module docstring."""
 
@@ -527,6 +573,9 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         mode: str | None = None,
         nash_pseudocount: float | None = None,
         nash_floor: float | None = None,
+        tendency: bool | None = None,
+        tendency_kappa: float | None = None,
+        tendency_delta: float | None = None,
         **kwargs: Any,
     ):
         data = data or (opponent_model.data if opponent_model else default_randbats_data())
@@ -555,12 +604,24 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             self.config = dataclasses.replace(self.config, nash_pseudocount=float(nash_pseudocount))
         if nash_floor is not None:
             self.config = dataclasses.replace(self.config, nash_floor=float(nash_floor))
+        if tendency is not None:
+            self.config = dataclasses.replace(self.config, tendency=bool(tendency))
+        if tendency_kappa is not None:
+            self.config = dataclasses.replace(self.config, tendency_kappa=float(tendency_kappa))
+        if tendency_delta is not None:
+            self.config = dataclasses.replace(self.config, tendency_delta=float(tendency_delta))
         if not self.config.inference:
             self.opponent_model.inference_enabled = False
         if not self.config.damage_inference:
             self.opponent_model.damage_enabled = False
         if self.config.mode not in MODES:
             raise ValueError(f"mode must be one of {MODES}, got {self.config.mode!r}")
+        if not (math.isfinite(self.config.tendency_kappa) and self.config.tendency_kappa >= 0):
+            raise ValueError(f"tendency_kappa must be finite and >= 0, got {self.config.tendency_kappa}")
+        if not (math.isfinite(self.config.tendency_delta) and 0 <= self.config.tendency_delta < 1):
+            raise ValueError(f"tendency_delta must be in [0, 1), got {self.config.tendency_delta}")
+        if self.config.tendency and self.config.threads > 1:
+            raise ValueError("tendency needs threads == 1 (it solves the root joint matrix)")
         if self.config.mode == NASH and self.config.threads > 1:
             raise ValueError("mode nash needs threads == 1 (the shared-tree search has no joint matrix)")
         if not (math.isfinite(self.config.nash_pseudocount) and self.config.nash_pseudocount >= 0):
@@ -590,6 +651,10 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         self._illusion_rng = random.Random(None if seed is None else f"illusion-{seed}")
         self._sampler = engine_state.TeamSampler(data)
         self.last_policy: dict[str, float] = {}
+        self.last_tendency: dict[str, Any] | None = None  # diagnostics of the last exploit
+        self.cond_turns = 0  # decisions where we held Sucker Punch-like moves
+        self.cond_used = 0  # ...of which we chose one
+        self.tendency_decisions = 0  # decisions where evidence moved the strategy
         self.last_choice: str | None = None
         # Recording is off unless a recorder is passed or SHOWDOWN_RECORD_DIR is set.
         self._recorder = recorder if recorder is not None else recorder_module.from_env()
@@ -635,6 +700,19 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         )
 
     async def _choose(self, battle: Any) -> BattleOrder | None:
+        query = None
+        self._tendency_context = None
+        if not getattr(battle, "force_switch", False):
+            try:  # bookkeeping for validation (how often we hold Sucker Punch-like moves)
+                self._tendency_context = tendency_module.context_from_battle(battle)
+                self.cond_turns += self._tendency_context.cond_priority
+            except Exception:
+                pass
+        if self.config.tendency:
+            try:
+                query = self._tendency_query(battle)
+            except Exception:  # the model must never cost a decision
+                logger.exception("Tendency query failed in %s", battle.battle_tag)
         legal = battle.valid_orders
         if len(legal) == 1:
             self.stats.forced += 1
@@ -672,13 +750,14 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         self.stats.searched += 1
         if not results:
             raise RuntimeError("every world failed")
-        mode = self.config.mode
+        mode = NASH if self.config.tendency else self.config.mode
         nash_records: list[dict[str, Any] | None] = []
         policy: dict[str, float] = {}
         if mode == NASH:
             policy, nash_records = aggregate_nash(
-                results, self.config.nash_pseudocount, self.config.nash_floor
+                results, self.config.nash_pseudocount, self.config.nash_floor, query
             )
+            self._note_tendency(query)
             if not policy:  # no world carried a joint matrix: use the visit-share rule
                 logger.warning("No Nash policy in %s; using the mixed rule", battle.battle_tag)
                 mode = MIXED
@@ -690,10 +769,37 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         if recording:
             self._record_decision(
                 battle, order, policy, n_worlds, time_ms, started, truth_state, truth_status,
-                nash_records if self.config.mode == NASH else None,
+                nash_records if mode_for_record(self.config) == NASH else None,
                 opp_facts,
             )
         return order
+
+    def _tendency_query(self, battle: Any) -> TendencyQuery:
+        """Observed counts for the current context; also registers it for the tracker."""
+        tracker = tendency_module.for_battle(battle.battle_tag, create=True)
+        context = tendency_module.context_from_battle(battle, tracker.last_class)
+        if not getattr(battle, "force_switch", False):
+            tracker.set_context(battle.turn, context)
+        self._tendency_context = context
+        # The all-clear bucket pools every ordinary turn, so its counts only restate the
+        # Nash mix; exploit only contexts that carry a guessing-game feature.
+        counts = tracker.counts_for(context) if context.key != "---" else {}
+        return TendencyQuery(counts, self.config.tendency_kappa, self.config.tendency_delta)
+
+    def _note_tendency(self, query: TendencyQuery | None) -> None:
+        self.last_tendency = None
+        if query is None or not query.diag:
+            return
+        n = query.diag[0]["n"]
+        self.last_tendency = {
+            "context": self._tendency_context.key,
+            "n": n,
+            "lambda": sum(d["lambda"] for d in query.diag) / len(query.diag),
+            "post": query.diag[0]["post"],
+            "br": [d["br_choice"] for d in query.diag],
+        }
+        if n > 0:
+            self.tendency_decisions += 1
 
     def _order_from_policy(
         self,
@@ -713,6 +819,9 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             legal_policy, mode or self.config.mode, self._rng, self.config.mixed_threshold
         )
         self.last_choice = choice
+        if choice is not None and getattr(self, "_tendency_context", None) is not None:
+            if self._tendency_context.cond_priority and choice.removesuffix("-tera") in tendency_module.PRIORITY_CONDITIONAL:
+                self.cond_used += 1
         return orders[choice] if choice is not None else None
 
     async def _run_worlds(self, state_strings: list[str], time_ms: int) -> list[WorldResult]:
@@ -735,12 +844,16 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
     ) -> list[WorldResult]:
         loop = asyncio.get_running_loop()
         self._paired = []
+        search_fn = (
+            functools.partial(_worker.search_world, opp_names=True)
+            if self.config.tendency else _worker.search_world
+        )
         futures = [
             loop.run_in_executor(
-                executor, _worker.search_world, state, time_ms, self.config.threads,
+                executor, search_fn, state, time_ms, self.config.threads,
                 self.config.evaluator, self.config.evaluator_scale,
                 self.config.selection, self.config.selection_gamma,
-                self.config.mode == NASH, self.config.eval_lowhp_knee,
+                mode_for_record(self.config) == NASH, self.config.eval_lowhp_knee,
                 self.config.eval_boost_scale,
             )
             for state in state_strings
