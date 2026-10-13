@@ -75,6 +75,7 @@ from poke_env.player import Player
 from poke_env.ps_client import AccountConfiguration
 from poke_env.player.battle_order import BattleOrder, DefaultBattleOrder
 
+from showdown_bot import decision_quality as dq
 from showdown_bot import engine_state, nash as nash_module, recorder as recorder_module
 from showdown_bot.players import _worker
 from showdown_bot.recorder import GameRecorder
@@ -181,6 +182,15 @@ class SearchConfig:
     damage_inference: bool = True  # ...of which: damage-roll inference (needs inference)
     eval_lowhp_knee: float = 0.0  # 589.32 experiment: >0 discounts alive/item/boost value of low-HP mons
     eval_boost_scale: float = 1.0  # 589.32 experiment: multiplier on all stat-boost eval terms
+    # 589.47 decision quality (all default off)
+    escalate: bool = False  # flat-root escalation: re-search longer when the top two are close
+    escalate_gap: float = 0.02  # ...flat when the top two options' mean scores differ by less
+    escalate_factor: float = 4.0  # ...final per-world budget as a multiple of the normal one
+    escalate_steps: int = 1  # ...budget grows in this many equal steps (each re-searches)
+    escalate_cap_ms: int = 3000  # ...hard wall-clock cap on the whole decision's search
+    prune_noop: bool = False  # drop moves the engine proves have no effect (unless all do)
+    noop_vs_switches: bool = True  # ...no-op must also hold against every opponent switch (strict)
+    tera_margin: float = 0.0  # >0: X-tera needs a mean this much above X, else folds into X
 
     @classmethod
     def from_env(cls) -> SearchConfig:
@@ -235,6 +245,9 @@ class SearchStats:
     search_ms: int = 0  # sum over searched worlds of the per-world time budget
     unknown_ids: int = 0
     illusion_worlds: int = 0  # worlds whose active opponent was sampled as Zoroark
+    escalations: int = 0  # 589.47: decisions whose search was extended
+    noop_pruned: int = 0  # 589.47: decisions where >= 1 no-op option was dropped
+    tera_folded: int = 0  # 589.47: decisions where >= 1 tera option was folded away
     fallback_reasons: Counter = field(default_factory=Counter)
 
     def summary(self) -> str:
@@ -246,6 +259,12 @@ class SearchStats:
             + f" worlds={self.worlds_run} world_errors={self.world_errors} "
             f"iterations={self.iterations} engine_unknown_ids={self.unknown_ids} "
             f"illusion_worlds={self.illusion_worlds}"
+            + (
+                f" escalations={self.escalations} noop_pruned={self.noop_pruned} "
+                f"tera_folded={self.tera_folded}"
+                if self.escalations or self.noop_pruned or self.tera_folded
+                else ""
+            )
         )
 
 
@@ -259,6 +278,7 @@ def total_stats() -> SearchStats:
         for name in (
             "decisions", "searched", "forced", "fallbacks", "worlds_run",
             "world_errors", "iterations", "search_ms", "unknown_ids", "illusion_worlds",
+            "escalations", "noop_pruned", "tera_folded",
         ):
             setattr(total, name, getattr(total, name) + getattr(stats, name))
         total.fallback_reasons.update(stats.fallback_reasons)
@@ -582,6 +602,15 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             self.config = dataclasses.replace(
                 self.config, evaluator=str(Path(self.config.evaluator).resolve())
             )
+        cfg = self.config
+        if not (math.isfinite(cfg.escalate_gap) and cfg.escalate_gap >= 0):
+            raise ValueError(f"escalate_gap must be finite and >= 0, got {cfg.escalate_gap}")
+        if not (math.isfinite(cfg.escalate_factor) and cfg.escalate_factor >= 1):
+            raise ValueError(f"escalate_factor must be >= 1, got {cfg.escalate_factor}")
+        if cfg.escalate_steps < 1 or cfg.escalate_cap_ms < 1:
+            raise ValueError("escalate_steps and escalate_cap_ms must be >= 1")
+        if not (math.isfinite(cfg.tera_margin) and cfg.tera_margin >= 0):
+            raise ValueError(f"tera_margin must be finite and >= 0, got {cfg.tera_margin}")
         self.stats = SearchStats()
         _ALL_STATS.append(self.stats)
         self._executor = executor
@@ -591,6 +620,7 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         self._sampler = engine_state.TeamSampler(data)
         self.last_policy: dict[str, float] = {}
         self.last_choice: str | None = None
+        self.last_changes: dict[str, Any] = {}
         # Recording is off unless a recorder is passed or SHOWDOWN_RECORD_DIR is set.
         self._recorder = recorder if recorder is not None else recorder_module.from_env()
         self._paired: list[tuple[str, WorldResult]] = []
@@ -668,10 +698,65 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             built = built or world
             self.stats.unknown_ids += len(world.unknown_ids)
             state_strings.append(world.to_string())
+        decision_started = time.perf_counter()
         results = await self._run_worlds(state_strings, time_ms)
+        run_wall = time.perf_counter() - decision_started
         self.stats.searched += 1
         if not results:
             raise RuntimeError("every world failed")
+        cfg = self.config
+        noop: set[str] = set()
+        if cfg.prune_noop:
+            choices = sorted({c for r in results for c, _v, _s in r[1]})
+            noop = dq.noop_choices(state_strings, choices, cfg.noop_vs_switches)
+        final_ms = time_ms
+        escalated = 0
+        policy, nash_records, mode = self._policy_of(results, battle)
+        adjusted, changes = dq.adjust_policy(
+            policy, results, noop=noop, tera_margin=cfg.tera_margin
+        )
+        if cfg.escalate and cfg.escalate_steps > 0:
+            for step in range(1, cfg.escalate_steps + 1):
+                if not dq.flat_root(adjusted, results, cfg.escalate_gap):
+                    break
+                target = time_ms * (1.0 + (cfg.escalate_factor - 1.0) * step / cfg.escalate_steps)
+                # wall time scales ~linearly with the per-world budget
+                elapsed = time.perf_counter() - decision_started
+                affordable = final_ms * (cfg.escalate_cap_ms / 1000.0 - elapsed) / max(run_wall, 1e-3)
+                new_ms = int(min(target, affordable))
+                if new_ms < final_ms * 1.25:
+                    break
+                started_run = time.perf_counter()
+                more = await self._run_worlds(state_strings, new_ms)
+                if not more:
+                    break
+                run_wall = time.perf_counter() - started_run
+                results, final_ms = more, new_ms
+                escalated += 1
+                policy, nash_records, mode = self._policy_of(results, battle)
+                adjusted, changes = dq.adjust_policy(
+                    policy, results, noop=noop, tera_margin=cfg.tera_margin
+                )
+        self.stats.escalations += bool(escalated)
+        self.stats.noop_pruned += bool(changes["noop_pruned"])
+        self.stats.tera_folded += bool(changes["tera_folded"])
+        policy = adjusted
+        self.last_policy = policy
+        self.last_changes = {**changes, "escalated": escalated, "search_time_ms": final_ms}
+        assert built is not None
+        order = self._order_from_policy(policy, built, battle, mode)
+        if recording:
+            self._record_decision(
+                battle, order, policy, n_worlds, final_ms, started, truth_state, truth_status,
+                nash_records if self.config.mode == NASH else None,
+                opp_facts,
+            )
+        return order
+
+    def _policy_of(
+        self, results: list[WorldResult], battle: Any
+    ) -> tuple[dict[str, float], list[dict[str, Any] | None], str]:
+        """Aggregate the world results into a root policy; returns ``(policy, nash records, mode)``."""
         mode = self.config.mode
         nash_records: list[dict[str, Any] | None] = []
         policy: dict[str, float] = {}
@@ -684,16 +769,7 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
                 mode = MIXED
         if not policy:
             policy = aggregate_policy(results)
-        self.last_policy = policy
-        assert built is not None
-        order = self._order_from_policy(policy, built, battle, mode)
-        if recording:
-            self._record_decision(
-                battle, order, policy, n_worlds, time_ms, started, truth_state, truth_status,
-                nash_records if self.config.mode == NASH else None,
-                opp_facts,
-            )
-        return order
+        return policy, nash_records, mode
 
     def _order_from_policy(
         self,
@@ -846,6 +922,7 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
                         "iterations": sum(w["total_visits"] for w in worlds),
                         "wall_ms": round((time.perf_counter() - started) * 1000, 1),
                     },
+                    "quality": self.last_changes or None,
                     "truth": {"state": truth_state} if truth_state else None,
                     "truth_status": truth_status,
                     "opp_facts": opp_facts,

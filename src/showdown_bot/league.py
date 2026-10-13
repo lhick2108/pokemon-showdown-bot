@@ -52,9 +52,15 @@ PRIOR_WEIGHT = 0.5  # virtual tie games added between every pair of bots
 
 SPEC_KEYS = {
     "search": {"evaluator": str, "scale": float, "time_ms": int, "worlds": int,
-               "selection": str, "gamma": float, "mode": str},
+               "selection": str, "gamma": float, "mode": str,
+               "escalate": int, "escalate_gap": float, "escalate_factor": float,
+               "escalate_steps": int, "escalate_cap_ms": int, "prune_noop": int, "noop_switches": int,
+               "tera_margin": float},
     "search-net": {"evaluator": str, "scale": float, "time_ms": int, "worlds": int,
-                   "selection": str, "gamma": float, "mode": str},
+                   "selection": str, "gamma": float, "mode": str,
+               "escalate": int, "escalate_gap": float, "escalate_factor": float,
+               "escalate_steps": int, "escalate_cap_ms": int, "prune_noop": int, "noop_switches": int,
+               "tera_margin": float},
 }
 
 
@@ -127,6 +133,14 @@ def parse_spec(text: str) -> BotSpec:
                 parsed = allowed[key](value)
             except ValueError:
                 raise ValueError(f"bad value {value!r} for {key!r} in bot spec {raw!r}") from None
+            if key in ("escalate", "prune_noop", "noop_switches") and parsed not in (0, 1):
+                raise ValueError(f"{key} must be 0 or 1 in bot spec {raw!r}")
+            if key in ("escalate_gap", "tera_margin") and not (math.isfinite(parsed) and parsed >= 0):
+                raise ValueError(f"{key} must be >= 0 in bot spec {raw!r}")
+            if key == "escalate_factor" and not (math.isfinite(parsed) and parsed >= 1):
+                raise ValueError(f"escalate_factor must be >= 1 in bot spec {raw!r}")
+            if key in ("escalate_steps", "escalate_cap_ms") and parsed < 1:
+                raise ValueError(f"{key} must be >= 1 in bot spec {raw!r}")
             if key in ("time_ms", "worlds") and parsed <= 0:
                 raise ValueError(f"{key} must be positive in bot spec {raw!r}")
             if key == "scale" and not (math.isfinite(parsed) and parsed > 0):
@@ -506,6 +520,20 @@ class Tracker:
         return bad
 
 
+def _quality_kwargs(spec: BotSpec) -> dict:
+    """SearchConfig fields from the 589.47 decision-quality spec keys (only those given)."""
+    out: dict = {}
+    for key in ("escalate", "prune_noop"):
+        if spec.param(key) is not None:
+            out[key] = bool(spec.param(key))
+    if spec.param("noop_switches") is not None:
+        out["noop_vs_switches"] = bool(spec.param("noop_switches"))
+    for key in ("escalate_gap", "escalate_factor", "escalate_steps", "escalate_cap_ms", "tera_margin"):
+        if spec.param(key) is not None:
+            out[key] = spec.param(key)
+    return out
+
+
 def _make_player(spec: BotSpec, cfg: LeagueConfig, recorder, concurrency: int, salt: int,
                  *, account=None, server=None, wrap=None, extra: dict | None = None) -> Player:
     """Build a spec's player. The keyword-only hooks serve scripts/ladder.py: a given
@@ -532,6 +560,7 @@ def _make_player(spec: BotSpec, cfg: LeagueConfig, recorder, concurrency: int, s
         kwargs["config"] = SearchConfig(
             search_time_ms=spec.param("time_ms", cfg.search_time_ms),
             worlds=spec.param("worlds"),
+            **_quality_kwargs(spec),
         )
         kwargs["recorder"] = recorder
         kwargs["seed"] = cfg.seed * 1000 + salt
