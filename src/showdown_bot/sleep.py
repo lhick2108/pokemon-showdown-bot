@@ -31,6 +31,10 @@ REST_SLEEP_TURNS = 3  # Rest sets time = 3: two turns lost, wakes on the third a
 _SLOT = re.compile(r"^(p[1-4])[a-d]?: ")
 
 
+def _move_id(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(name).lower())
+
+
 def ident_key(ident: str) -> str:
     """``"p2a: Lapras"`` / ``"p2: Lapras"`` -> ``"p2: Lapras"``."""
     return _SLOT.sub(r"\1: ", str(ident).strip())
@@ -53,6 +57,9 @@ class SleepTracker:
 
     def __init__(self) -> None:
         self._records: dict[str, SleepRecord] = {}
+        self.turn = 0
+        # side ("p1"/"p2") -> (turn Wish was used, wisher ident key); see wish_pending
+        self._wishes: dict[str, tuple[int, str]] = {}
 
     def record(self, ident: str) -> SleepRecord | None:
         return self._records.get(ident_key(ident))
@@ -62,7 +69,21 @@ class SleepTracker:
         if len(event) < 3:
             return
         kind = str(event[1])
-        if kind == "-status" and len(event) >= 4:
+        if kind == "turn":
+            try:
+                self.turn = int(event[2])
+            except ValueError:
+                pass
+        elif kind == "move" and len(event) >= 4:
+            key = ident_key(event[2])
+            move_id = _move_id(event[3])
+            if move_id == "wish" and "[still]" not in event[4:]:
+                pending = self._wishes.get(key[:2])
+                # A Wish used while one is pending fails (Showdown's addSlotCondition
+                # refuses a duplicate), so it must not re-arm the slot.
+                if pending is None or pending[0] != self.turn - 1:
+                    self._wishes[key[:2]] = (self.turn, key)
+        elif kind == "-status" and len(event) >= 4:
             key = ident_key(event[2])
             if event[3] == "slp":
                 rest = any(str(tag).replace(" ", "").lower() == "[from]move:rest" for tag in event[4:])
@@ -83,6 +104,18 @@ class SleepTracker:
     def observe_events(self, events: Sequence[Sequence[str]]) -> None:
         for event in events:
             self.observe(event)
+
+    def wish_pending(self, side: str, turn: int) -> str | None:
+        """Ident key of the Pokemon whose Wish is pending for ``side`` at the start of ``turn``.
+
+        A Wish used during turn N-1 heals at the end of turn N (the slot condition lives two
+        end-of-turns), so it is pending exactly while the current turn is N; a second Wish
+        used meanwhile fails (Showdown's ``addSlotCondition`` refuses a duplicate).
+        """
+        record = self._wishes.get(side)
+        if record is not None and record[0] == turn - 1:
+            return record[1]
+        return None
 
 
 _MAX_BATTLES = 64

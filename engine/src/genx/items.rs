@@ -188,6 +188,7 @@ define_enum_with_from_str! {
         LIGHTCLAY,
         LEPPABERRY,
         SCOPELENS,
+        SAFETYGOGGLES,
 
         // mega stones
         VENUSAURITE,
@@ -1086,6 +1087,16 @@ pub fn item_modify_attack_against(
         Items::ASSAULTVEST => {
             if attacking_choice.targets_special_defense() {
                 attacking_choice.base_power /= 1.5;
+            }
+        }
+        // sdb (589.39): Safety Goggles make the holder immune to powder moves (like Overcoat).
+        Items::SAFETYGOGGLES => {
+            if attacking_choice.flags.powder
+                && attacking_choice.move_id != Choices::LEECHSEED
+                && attacking_choice.target == MoveTarget::Opponent
+            {
+                attacking_choice.remove_all_effects();
+                attacking_choice.accuracy = 0.0
             }
         }
         Items::METALPOWDER if attacking_side.get_active_immutable().id == PokemonName::DITTO => {
