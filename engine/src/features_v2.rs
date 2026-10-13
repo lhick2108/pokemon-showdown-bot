@@ -613,6 +613,7 @@ fn put_side_block<S: Sink>(
     own_to_opp: &Assessment,
     opp_to_own: &Assessment,
     trick_room: bool,
+    speeds: (f32, f32, f32),
 ) {
     let sc = &own.side_conditions;
     for (i, (turns, scale)) in [
@@ -631,7 +632,7 @@ fn put_side_block<S: Sink>(
     let a = base + SIDE_SCALAR_NAMES.len();
     let me = own.get_active_immutable();
     let them = opp.get_active_immutable();
-    let (s_me, s_them) = (effective_speed(me, own), effective_speed(them, opp));
+    let (s_me, s_them, lr) = speeds;
     let first = if s_me == s_them {
         0.5
     } else if (s_me > s_them) != trick_room {
@@ -642,7 +643,6 @@ fn put_side_block<S: Sink>(
     if first > 0.0 {
         sink.val(a, first);
     }
-    let lr = (s_me / s_them).log2().clamp(-2.0, 2.0) / 2.0;
     if lr != 0.0 {
         sink.val(a + 1, lr);
     }
@@ -698,8 +698,11 @@ pub fn dynamic_blocks<S: Sink>(sink: &mut S, state: &State, own_ref: SideReferen
     let own_to_opp = assess(a_me, own, a_opp, opp);
     let opp_to_own = assess(a_opp, opp, a_me, own);
     let tr = state.trick_room.active;
-    put_side_block(sink, SIDE2_BASE, own, opp, &own_to_opp, &opp_to_own, tr);
-    put_side_block(sink, SIDE2_BASE + PS2, opp, own, &opp_to_own, &own_to_opp, tr);
+    let (s_me, s_them) = (effective_speed(a_me, own), effective_speed(a_opp, opp));
+    // the speed ratio is antisymmetric: one log serves both sides
+    let lr = (s_me / s_them).log2().clamp(-2.0, 2.0) / 2.0;
+    put_side_block(sink, SIDE2_BASE, own, opp, &own_to_opp, &opp_to_own, tr, (s_me, s_them, lr));
+    put_side_block(sink, SIDE2_BASE + PS2, opp, own, &opp_to_own, &own_to_opp, tr, (s_them, s_me, -lr));
 
     if state.get_weather() != Weather::NONE && state.weather.turns_remaining != 0 {
         // permanent weather (negative turns) counts as full

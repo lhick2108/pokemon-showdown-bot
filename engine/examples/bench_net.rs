@@ -82,6 +82,33 @@ fn main() {
     });
     micro("ev.logit_ref", &mut |s| ev.logit_reference(black_box(s), &mut scratch));
     micro("ev.logit", &mut |s| ev.logit(black_box(s), &mut scratch));
+    {
+        use poke_engine::features_v2::{dynamic_blocks, static_key, Sink};
+        struct Null(f32);
+        impl Sink for Null {
+            fn one(&mut self, i: usize) {
+                self.0 += i as f32;
+            }
+            fn val(&mut self, i: usize, v: f32) {
+                self.0 += i as f32 * v;
+            }
+        }
+        micro("v2 dynamic", &mut |s| {
+            let mut n = Null(0.0);
+            dynamic_blocks(&mut n, black_box(s), SideReference::SideOne);
+            n.0
+        });
+        micro("v2 keys x12", &mut |s| {
+            let mut a = 0u64;
+            for side in [&s.side_one, &s.side_two] {
+                for p in side.pokemon.pkmn.iter() {
+                    let k = static_key(black_box(p));
+                    a = a.wrapping_add(k[0] ^ k[1]);
+                }
+            }
+            a as f32
+        });
+    }
 
     // MCTS it/s: per state, interleave stock / net `reps` times and keep the fastest of each
     let mut tot = [0f64; 2];
