@@ -11,6 +11,12 @@ SearchPlayers with unique usernames playing its share of the games one at a
 time; both sides record, plus an exact "truth" state per decision. With
 ``--vs foulplay`` the existing bench machinery launches Foul Play subprocesses
 and only our side records (no truth: Foul Play is not in this process).
+
+``--pool a=x.pev:scale=1.5,stock`` draws side B's evaluator per game from a pool (the
+opponent's label lands in the header config as ``opponent`` for side A, ``label`` for B).
+``--full-frac P --fast-time-ms T`` is playout cap randomization: a decision gets the full
+search and is recorded with prob P, else a T ms search that is not recorded (search vs
+search only; the Foul Play path ignores it).
 All search work shares one process pool of ``--workers`` processes.
 """
 
@@ -19,7 +25,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import dataclasses
+import hashlib
 import os
+import random
 import secrets
 import sys
 import time
@@ -31,6 +40,61 @@ from showdown_bot import bench, dataset, recorder
 from showdown_bot.players.search import SearchConfig, SearchPlayer, get_pool, inference_summary, total_stats
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+@dataclasses.dataclass(frozen=True)
+class PoolEntry:
+    label: str
+    evaluator: str | None = None
+    scale: float = 1.0
+
+
+def parse_pool(text: str) -> list[PoolEntry]:
+    """Parse ``--pool``: comma-separated ``stock`` or ``label=evaluator_path[:scale=K]``.
+
+    A Windows drive colon in the path is fine: only a trailing ``:scale=<float>`` is split off.
+    """
+    entries: list[PoolEntry] = []
+    for raw in (part.strip() for part in text.split(",")):
+        if not raw:
+            continue
+        if raw == "stock":
+            entries.append(PoolEntry("stock"))
+            continue
+        if "=" not in raw:
+            raise ValueError(f"bad pool spec {raw!r}: want 'stock' or 'label=path[:scale=K]'")
+        label, rest = raw.split("=", 1)
+        scale = 1.0
+        head, sep, tail = rest.rpartition(":scale=")
+        if sep:
+            try:
+                scale = float(tail)
+            except ValueError:
+                raise ValueError(f"bad scale in pool spec {raw!r}") from None
+            rest = head
+        if not label or not rest:
+            raise ValueError(f"bad pool spec {raw!r}: empty label or path")
+        if not scale > 0 or scale == float("inf"):
+            raise ValueError(f"bad scale in pool spec {raw!r}")
+        entries.append(PoolEntry(label.strip(), rest, scale))
+    if not entries:
+        raise ValueError("empty pool")
+    if len({e.label for e in entries}) != len(entries):
+        raise ValueError("duplicate pool labels")
+    return entries
+
+
+def parse_weights(text: str | None, n: int) -> list[float]:
+    if text is None:
+        return [1.0] * n
+    weights = [float(w) for w in text.split(",") if w.strip()]
+    if len(weights) != n or any(w < 0 for w in weights) or sum(weights) <= 0:
+        raise ValueError(f"--pool-weights needs {n} non-negative weights with a positive sum")
+    return weights
+
+
+def sample_pool(entries: list[PoolEntry], weights: list[float], rng: random.Random) -> PoolEntry:
+    return rng.choices(entries, weights=weights, k=1)[0]
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -49,6 +113,15 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--evaluator", default=None,
                    help="learned .pev leaf evaluator for both players (default: stock evaluate())")
     p.add_argument("--leaf-scale", type=float, default=1.0, help="leaf scale for --evaluator")
+    p.add_argument("--pool", default=None,
+                   help="opponent pool for side B (search vs search): comma-separated 'stock' or "
+                        "label=evaluator_path[:scale=K]; side A stays the --evaluator config")
+    p.add_argument("--pool-weights", default=None, help="comma-separated sampling weights (default uniform)")
+    p.add_argument("--full-frac", type=float, default=1.0,
+                   help="playout cap randomization: P(full recorded search) per decision (1.0 = off)")
+    p.add_argument("--fast-time-ms", type=bench._positive_int, default=50,
+                   help="search time of the unrecorded fast decisions (with --full-frac < 1)")
+    p.add_argument("--seed", type=int, default=None, help="seed pool draws and full/fast draws")
     p.add_argument("--workers", type=bench._positive_int, default=os.cpu_count() or 4,
                    help="shared MCTS process pool size (search vs search)")
     p.add_argument("--inference", choices=("on", "off"), default="on",
@@ -61,7 +134,13 @@ def _parser() -> argparse.ArgumentParser:
     return p
 
 
-async def _selfplay_pair(args, run_dir: Path, rec: recorder.GameRecorder, share: int, pool) -> list:
+def hash_seed(seed: str, key: str) -> int:
+    return int.from_bytes(hashlib.sha256(f"{seed}/{key}".encode()).digest()[:8], "big")
+
+
+async def _selfplay_pair(
+    args, run_dir: Path, rec: recorder.GameRecorder, share: int, pool, index: int = 0
+) -> list:
     options = {
         "battle_format": args.format,
         "max_concurrent_battles": 1,
@@ -78,23 +157,42 @@ async def _selfplay_pair(args, run_dir: Path, rec: recorder.GameRecorder, share:
         evaluator_scale=args.leaf_scale,
         inference=args.inference == "on",
         damage_inference=args.damage_inference == "on",
+        full_frac=args.full_frac,
+        fast_time_ms=args.fast_time_ms,
+        label="main",
     )
-    players = [
-        SearchPlayer(
+    entries = parse_pool(args.pool) if args.pool else [PoolEntry("main", args.evaluator, args.leaf_scale)]
+    weights = parse_weights(args.pool_weights, len(entries))
+    seed = None if args.seed is None else f"{args.seed}-{index}"
+    pick_rng = random.Random(seed)
+
+    def make(cfg, k):
+        return SearchPlayer(
             account_configuration=AccountConfiguration("sp" + secrets.token_hex(5), None),
-            config=config,
+            config=cfg,
             executor=pool,
             recorder=rec,
+            seed=None if seed is None else hash_seed(seed, k),
             **options,
         )
-        for _ in range(2)
+
+    player_a = make(config, "a")
+    # one side-B player per pool entry (a pool of one entry == plain self-play)
+    side_b = [
+        make(dataclasses.replace(config, evaluator=e.evaluator, evaluator_scale=e.scale,
+                                 label=e.label, opponent="main"), e.label)
+        for e in entries
     ]
+    players = [player_a, *side_b]
     try:
         await bench._wait_for_player_logins(players, args.connect_timeout)
-        await asyncio.wait_for(
-            players[0].battle_against(players[1], n_battles=share),
-            timeout=args.game_timeout * share,
-        )
+        for _ in range(share):
+            entry = sample_pool(entries, weights, pick_rng)
+            player_a.config = dataclasses.replace(player_a.config, opponent=entry.label)
+            await asyncio.wait_for(
+                player_a.battle_against(side_b[entries.index(entry)], n_battles=1),
+                timeout=args.game_timeout,
+            )
     finally:
         await asyncio.gather(*(bench._disconnect_player(p) for p in players))
     return players
@@ -103,7 +201,7 @@ async def _selfplay_pair(args, run_dir: Path, rec: recorder.GameRecorder, share:
 async def _run_selfplay(args, run_dir: Path, rec: recorder.GameRecorder) -> None:
     pool = get_pool(args.workers)
     shares = bench.split_games(args.games, args.pairs)
-    tasks = [asyncio.ensure_future(_selfplay_pair(args, run_dir, rec, s, pool)) for s in shares]
+    tasks = [asyncio.ensure_future(_selfplay_pair(args, run_dir, rec, s, pool, i)) for i, s in enumerate(shares)]
     try:
         await asyncio.gather(*tasks)
     except BaseException:
@@ -130,6 +228,15 @@ async def _run_foulplay(args, run_dir: Path) -> None:
 
 def main(argv=None) -> int:
     args = _parser().parse_args(argv)
+    if not 0.0 <= args.full_frac <= 1.0:
+        print("--full-frac must be in [0, 1]", file=sys.stderr)
+        return 2
+    if args.pool:
+        try:
+            parse_weights(args.pool_weights, len(parse_pool(args.pool)))
+        except ValueError as exc:
+            print(f"selfplay error: {exc}", file=sys.stderr)
+            return 2
     run_dir = args.out / args.run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     rec = recorder.GameRecorder(run_dir, truth=not args.no_truth and args.vs == "search")

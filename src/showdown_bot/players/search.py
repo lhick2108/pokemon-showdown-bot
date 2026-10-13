@@ -203,6 +203,13 @@ class SearchConfig:
     prune_noop: bool = False  # drop moves the engine proves have no effect (unless all do)
     noop_vs_switches: bool = True  # ...no-op must also hold against every opponent switch (strict)
     tera_margin: float = 0.0  # >0: X-tera needs a mean this much above X, else folds into X
+    # Playout cap randomization (KataGo): with prob full_frac a decision gets the full search and
+    # is recorded; otherwise a cheap fast_time_ms search that is NOT recorded. 1.0 = off.
+    full_frac: float = 1.0
+    fast_time_ms: int = 50
+    # Self-play bookkeeping only (written to the record header; no effect on play).
+    label: str = ""
+    opponent: str = ""
 
     @classmethod
     def from_env(cls) -> SearchConfig:
@@ -630,6 +637,10 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             self.config = dataclasses.replace(self.config, tendency_kappa=float(tendency_kappa))
         if tendency_delta is not None:
             self.config = dataclasses.replace(self.config, tendency_delta=float(tendency_delta))
+        if not (0.0 <= self.config.full_frac <= 1.0):
+            raise ValueError(f"full_frac must be in [0, 1], got {self.config.full_frac}")
+        if self.config.fast_time_ms < 1:
+            raise ValueError(f"fast_time_ms must be >= 1, got {self.config.fast_time_ms}")
         if not self.config.inference:
             self.opponent_model.inference_enabled = False
         if not self.config.damage_inference:
@@ -678,6 +689,7 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         self._rng = random.Random(seed)
         # Separate stream for the Illusion roll so worlds are unchanged at P = 0.
         self._illusion_rng = random.Random(None if seed is None else f"illusion-{seed}")
+        self._cap_rng = random.Random(None if seed is None else f"cap-{seed}")
         self._sampler = engine_state.TeamSampler(data)
         self.last_policy: dict[str, float] = {}
         self.last_tendency: dict[str, Any] | None = None  # diagnostics of the last exploit
@@ -729,6 +741,13 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             and len(active.moves) == 0
         )
 
+    def _draw_full(self) -> bool:
+        """Playout cap randomization: True = full (recorded) search for this decision."""
+        frac = self.config.full_frac
+        if frac >= 1.0:
+            return True  # off: no rng draw, so seeded play is unchanged
+        return self._cap_rng.random() < frac
+
     async def _choose(self, battle: Any) -> BattleOrder | None:
         query = None
         self._tendency_context = None
@@ -750,8 +769,12 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         if not legal:
             return None
         trackers = self.opponent_model.update(battle)
-        n_worlds, time_ms = self.config.plan(self._is_early(battle))
-        recording = self._recorder is not None
+        full = self._draw_full()
+        plan_cfg = self.config if full else dataclasses.replace(
+            self.config, search_time_ms=self.config.fast_time_ms
+        )
+        n_worlds, time_ms = plan_cfg.plan(self._is_early(battle))
+        recording = self._recorder is not None and full
         if recording:
             started = time.perf_counter()
             truth_state, truth_status = self._truth_state(battle)
@@ -793,7 +816,7 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         adjusted, changes = dq.adjust_policy(
             policy, results, noop=noop, tera_margin=cfg.tera_margin
         )
-        if cfg.escalate and cfg.escalate_steps > 0:
+        if full and cfg.escalate and cfg.escalate_steps > 0:
             for step in range(1, cfg.escalate_steps + 1):
                 if not dq.flat_root(adjusted, results, cfg.escalate_gap):
                     break
