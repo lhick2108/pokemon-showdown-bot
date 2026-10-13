@@ -115,7 +115,7 @@ def iter_samples(
     root: str | Path,
     *,
     sides: Sequence[int] = (1,),
-    worlds: bool = True,
+    worlds: bool | str = True,
     truth: bool = True,
     stats: LoadStats | None = None,
     q_source: str = "decision",
@@ -124,6 +124,9 @@ def iter_samples(
     feature_version: int | None = None,
 ) -> Iterator[Sample]:
     """Yield one ``Sample`` per stored state (every searched world, plus truth).
+
+    ``worlds="fallback"`` includes a decision's worlds only when it has no truth
+    state (with ``truth=True`` this means "prefer truth").
 
     ``Sample.search_value`` is the search's value estimate q: the decision's mean
     world ``avg_score`` (``q_source="decision"``, also used for truth states), or
@@ -177,7 +180,7 @@ def iter_samples(
             valid_abs = [v for v in world_abs if v is not None]
             abs_mean = sum(valid_abs) / len(valid_abs) if valid_abs else None
             states: list[tuple[str, str, float | None, float | None]] = []
-            if worlds:
+            if worlds and (worlds != "fallback" or not decision.get("truth")):
                 for w, wa in zip(decision.get("worlds", ()), world_abs):
                     own = q_source == "world"
                     states.append((
