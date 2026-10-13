@@ -36,6 +36,7 @@ use crate::choices::{Choice, MoveCategory};
 use crate::instruction::{
     ChangeStatusInstruction, DamageInstruction, Instruction, StateInstructions, SwitchInstruction,
 };
+use crate::state::encore_fails_against_last_move;
 use crate::state::{
     LastUsedMove, Pokemon, PokemonBoostableStat, PokemonIndex, PokemonMoveIndex, PokemonSideCondition,
     PokemonStatus, PokemonType, Side, SideMovesFirst, SideReference, State,
@@ -1633,12 +1634,22 @@ fn move_has_no_effect(state: &State, choice: &Choice, attacking_side_ref: &SideR
     {
         return true;
     } else if choice.move_id == Choices::ENCORE {
-        return match state
-            .get_side_immutable(&attacking_side_ref.get_other_side())
-            .last_used_move
+        // sdb: Showdown's Encore fails if the target is already encored, has no last move,
+        // or its last move carries `failencore` (Sleep Talk, Encore, Transform, Mimic,
+        // Struggle, ...) or has no PP left. A move Sleep Talk called does not count: the
+        // last move is Sleep Talk itself (see `sleep_talk_move` below).
+        if defending_side
+            .volatile_statuses
+            .contains(&PokemonVolatileStatus::ENCORE)
         {
+            return true;
+        }
+        return match defending_side.last_used_move {
             LastUsedMove::None => true,
-            LastUsedMove::Move(_) => false,
+            LastUsedMove::Move(index) => {
+                let last_move = &defender.moves[&index];
+                encore_fails_against_last_move(last_move.id) || last_move.pp <= 0
+            }
             LastUsedMove::Switch(_) => true,
         };
     } else if state.terrain_is_active(&Terrain::PSYCHICTERRAIN)
@@ -2295,7 +2306,9 @@ pub fn generate_instructions_from_move(
         return;
     }
 
-    if state.use_last_used_move {
+    // sdb: a move called by Sleep Talk is not the user's "last move" (Sleep Talk is, which
+    // is what Encore / choice locks look at), so only the outer Sleep Talk sets it.
+    if state.use_last_used_move && !choice.sleep_talk_move {
         set_last_used_move_as_move(
             state.get_side(&attacking_side),
             choice.move_index,
@@ -2315,7 +2328,8 @@ pub fn generate_instructions_from_move(
     // to matter
     let (attacker_side, defender_side) = state.get_both_sides(&attacking_side);
     let active = attacker_side.get_active();
-    if active.moves[&choice.move_index].pp < 10 {
+    // sdb: Sleep Talk spends its own PP (taken by the outer call), not the called move's
+    if !choice.sleep_talk_move && active.moves[&choice.move_index].pp < 10 {
         let pp_decrement_amount = if choice.target == MoveTarget::Opponent
             && defender_side.get_active_immutable().ability == Abilities::PRESSURE
         {
@@ -2348,6 +2362,11 @@ pub fn generate_instructions_from_move(
     if choice.move_id == Choices::SLEEPTALK && attacker.status == PokemonStatus::SLEEP {
         let new_choices = attacker.get_sleep_talk_choices();
         state.reverse_instructions(&incoming_instructions.instruction_list);
+        if new_choices.is_empty() {
+            // nothing callable: Sleep Talk fails (and must not lose the branch's probability)
+            final_instructions.push(incoming_instructions);
+            return;
+        }
         let num_choices = new_choices.len() as f32;
         for mut new_choice in new_choices {
             new_choice.sleep_talk_move = true;
@@ -11438,5 +11457,367 @@ mod tests {
         assert_eq!(Items::LIGHTCLAY, Items::from_str("lightclay").unwrap());
         assert_eq!(Items::LEPPABERRY, Items::from_str("leppaberry").unwrap());
         assert_eq!(Items::SCOPELENS, Items::from_str("scopelens").unwrap());
+    }
+
+    // --- Sleep / Rest / Sleep Talk / Encore fidelity (589.35) -------------------------
+
+    fn set_move(side: &mut Side, slot: PokemonMoveIndex, id: Choices, pp: i8) {
+        side.get_active().moves[&slot] = Move {
+            id,
+            disabled: false,
+            pp,
+            choice: MOVES.get(&id).unwrap().clone(),
+        };
+    }
+
+    fn use_move(
+        state: &mut State,
+        side: SideReference,
+        id: Choices,
+        slot: PokemonMoveIndex,
+        other: Choices,
+    ) -> Vec<StateInstructions> {
+        let mut choice = MOVES.get(&id).unwrap().to_owned();
+        choice.move_index = slot;
+        let mut outcomes = vec![];
+        generate_instructions_from_move(
+            state,
+            &mut choice,
+            MOVES.get(&other).unwrap(),
+            side,
+            StateInstructions::default(),
+            &mut outcomes,
+            false,
+        );
+        outcomes
+    }
+
+    fn applies_status(outcomes: &[StateInstructions], status: PokemonVolatileStatus) -> bool {
+        outcomes.iter().any(|o| {
+            o.instruction_list.iter().any(|i| {
+                matches!(i, Instruction::ApplyVolatileStatus(a) if a.volatile_status == status)
+            })
+        })
+    }
+
+    fn changes_status(outcomes: &[StateInstructions]) -> bool {
+        outcomes.iter().any(|o| {
+            o.instruction_list
+                .iter()
+                .any(|i| matches!(i, Instruction::ChangeStatus(_)))
+        })
+    }
+
+    fn total_percentage(outcomes: &[StateInstructions]) -> f32 {
+        outcomes.iter().map(|o| o.percentage).sum()
+    }
+
+    /// Side one (Encore user) vs side two whose last used move is `last` in slot M0.
+    fn encore_outcomes(last: Choices, pp: i8, already_encored: bool) -> Vec<StateInstructions> {
+        let mut state = State::default();
+        state.use_last_used_move = true;
+        set_move(&mut state.side_one, PokemonMoveIndex::M0, Choices::ENCORE, 8);
+        set_move(&mut state.side_two, PokemonMoveIndex::M0, last, pp);
+        state.side_two.last_used_move = LastUsedMove::Move(PokemonMoveIndex::M0);
+        if already_encored {
+            state
+                .side_two
+                .volatile_statuses
+                .insert(PokemonVolatileStatus::ENCORE);
+        }
+        use_move(
+            &mut state,
+            SideReference::SideOne,
+            Choices::ENCORE,
+            PokemonMoveIndex::M0,
+            Choices::TACKLE,
+        )
+    }
+
+    #[test]
+    fn test_encore_fails_against_failencore_last_moves() {
+        assert!(applies_status(
+            &encore_outcomes(Choices::TACKLE, 32, false),
+            PokemonVolatileStatus::ENCORE
+        ));
+        for last in [
+            Choices::SLEEPTALK,
+            Choices::ENCORE,
+            Choices::TRANSFORM,
+            Choices::MIMIC,
+            Choices::STRUGGLE,
+            Choices::METRONOME,
+            Choices::COPYCAT,
+            Choices::SKETCH,
+        ] {
+            let outcomes = encore_outcomes(last, 16, false);
+            assert!(
+                !applies_status(&outcomes, PokemonVolatileStatus::ENCORE),
+                "Encore must fail against last move {:?}",
+                last
+            );
+            assert!((total_percentage(&outcomes) - 100.0).abs() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn test_encore_fails_when_target_move_has_no_pp_or_is_already_encored() {
+        assert!(!applies_status(
+            &encore_outcomes(Choices::TACKLE, 0, false),
+            PokemonVolatileStatus::ENCORE
+        ));
+        assert!(!applies_status(
+            &encore_outcomes(Choices::TACKLE, 32, true),
+            PokemonVolatileStatus::ENCORE
+        ));
+    }
+
+    #[test]
+    fn test_sleep_talk_choices_exclude_uncallable_moves() {
+        let mut state = State::default();
+        let active = state.side_one.get_active();
+        active.moves.m0 = Move {
+            id: Choices::SLEEPTALK,
+            disabled: false,
+            pp: 16,
+            choice: MOVES.get(&Choices::SLEEPTALK).unwrap().clone(),
+        };
+        active.moves.m1 = Move {
+            id: Choices::FLY,
+            disabled: false,
+            pp: 16,
+            choice: MOVES.get(&Choices::FLY).unwrap().clone(),
+        };
+        active.moves.m2 = Move {
+            id: Choices::REST,
+            disabled: false,
+            pp: 16,
+            choice: MOVES.get(&Choices::REST).unwrap().clone(),
+        };
+        active.moves.m3 = Move {
+            id: Choices::UPROAR,
+            disabled: false,
+            pp: 16,
+            choice: MOVES.get(&Choices::UPROAR).unwrap().clone(),
+        };
+        let ids: Vec<Choices> = active
+            .get_sleep_talk_choices()
+            .iter()
+            .map(|c| c.move_id)
+            .collect();
+        assert_eq!(ids, vec![Choices::REST]);
+    }
+
+    fn sleeping_state(rest_turns: i8) -> State {
+        let mut state = State::default();
+        state.use_last_used_move = true;
+        let active = state.side_one.get_active();
+        active.status = PokemonStatus::SLEEP;
+        active.rest_turns = rest_turns;
+        active.hp = active.maxhp / 2;
+        set_move(&mut state.side_one, PokemonMoveIndex::M0, Choices::SLEEPTALK, 5);
+        set_move(&mut state.side_one, PokemonMoveIndex::M1, Choices::TACKLE, 9);
+        set_move(&mut state.side_one, PokemonMoveIndex::M2, Choices::SPLASH, 40);
+        state
+    }
+
+    #[test]
+    fn test_sleep_talk_calls_uniformly_and_keeps_sleep_talk_as_last_move() {
+        let mut state = sleeping_state(3);
+        let outcomes = use_move(
+            &mut state,
+            SideReference::SideOne,
+            Choices::SLEEPTALK,
+            PokemonMoveIndex::M0,
+            Choices::TACKLE,
+        );
+        assert!((total_percentage(&outcomes) - 100.0).abs() < 1e-3);
+        // two callable moves (Tackle, Splash), 50% each; Tackle's outcomes damage the foe
+        let damaging: f32 = outcomes
+            .iter()
+            .filter(|o| {
+                o.instruction_list
+                    .iter()
+                    .any(|i| matches!(i, Instruction::Damage(d) if d.side_ref == SideReference::SideTwo))
+            })
+            .map(|o| o.percentage)
+            .sum();
+        assert!(damaging > 40.0 && damaging <= 50.0 + 1e-3, "damaging={damaging}");
+        for outcome in &outcomes {
+            for instruction in &outcome.instruction_list {
+                match instruction {
+                    // the last move stays Sleep Talk (slot M0): never the called move's slot
+                    Instruction::SetLastUsedMove(s) => {
+                        assert_eq!(s.last_used_move, LastUsedMove::Move(PokemonMoveIndex::M0))
+                    }
+                    // only Sleep Talk's own PP is spent (slot M0), not the called move's
+                    Instruction::DecrementPP(d) => assert_eq!(d.move_index, PokemonMoveIndex::M0),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_sleep_talk_with_nothing_callable_fails_without_losing_probability() {
+        let mut state = sleeping_state(3);
+        set_move(&mut state.side_one, PokemonMoveIndex::M1, Choices::NONE, 0);
+        set_move(&mut state.side_one, PokemonMoveIndex::M2, Choices::FLY, 16);
+        let outcomes = use_move(
+            &mut state,
+            SideReference::SideOne,
+            Choices::SLEEPTALK,
+            PokemonMoveIndex::M0,
+            Choices::TACKLE,
+        );
+        assert!((total_percentage(&outcomes) - 100.0).abs() < 1e-3, "{outcomes:?}");
+    }
+
+    #[test]
+    fn test_sleep_talk_only_works_while_asleep() {
+        let mut state = sleeping_state(0);
+        state.side_one.get_active().status = PokemonStatus::NONE;
+        let outcomes = use_move(
+            &mut state,
+            SideReference::SideOne,
+            Choices::SLEEPTALK,
+            PokemonMoveIndex::M0,
+            Choices::TACKLE,
+        );
+        assert!(!outcomes.iter().any(|o| o
+            .instruction_list
+            .iter()
+            .any(|i| matches!(i, Instruction::Damage(_)))));
+    }
+
+    #[test]
+    fn test_rest_sleeps_exactly_two_turns_then_acts_on_the_third() {
+        let mut state = State::default();
+        set_move(&mut state.side_one, PokemonMoveIndex::M0, Choices::REST, 16);
+        set_move(&mut state.side_one, PokemonMoveIndex::M1, Choices::TACKLE, 16);
+        state.side_one.get_active().hp = 10;
+        let rest = use_move(
+            &mut state,
+            SideReference::SideOne,
+            Choices::REST,
+            PokemonMoveIndex::M0,
+            Choices::TACKLE,
+        );
+        assert_eq!(rest.len(), 1);
+        state.apply_instructions(&rest[0].instruction_list);
+        assert_eq!(state.side_one.get_active().status, PokemonStatus::SLEEP);
+        assert_eq!(state.side_one.get_active().rest_turns, 3);
+        let mut turns_without_acting = 0;
+        loop {
+            let outcomes = use_move(
+                &mut state,
+                SideReference::SideOne,
+                Choices::TACKLE,
+                PokemonMoveIndex::M1,
+                Choices::TACKLE,
+            );
+            assert_eq!(outcomes.len(), 1, "Rest sleep is deterministic");
+            let acted = outcomes[0]
+                .instruction_list
+                .iter()
+                .any(|i| matches!(i, Instruction::Damage(d) if d.side_ref == SideReference::SideTwo));
+            state.apply_instructions(&outcomes[0].instruction_list);
+            if acted {
+                break;
+            }
+            turns_without_acting += 1;
+            assert!(turns_without_acting <= 2, "slept more than two turns");
+        }
+        assert_eq!(turns_without_acting, 2);
+        assert_eq!(state.side_one.get_active().status, PokemonStatus::NONE);
+        assert_eq!(state.side_one.get_active().rest_turns, 0);
+    }
+
+    #[test]
+    fn test_heal_block_stops_rest() {
+        let mut state = State::default();
+        set_move(&mut state.side_one, PokemonMoveIndex::M0, Choices::REST, 16);
+        state.side_one.get_active().hp = 10;
+        state
+            .side_one
+            .volatile_statuses
+            .insert(PokemonVolatileStatus::HEALBLOCK);
+        let outcomes = use_move(
+            &mut state,
+            SideReference::SideOne,
+            Choices::REST,
+            PokemonMoveIndex::M0,
+            Choices::TACKLE,
+        );
+        assert!(!changes_status(&outcomes));
+        assert!(!outcomes.iter().any(|o| o
+            .instruction_list
+            .iter()
+            .any(|i| matches!(i, Instruction::Heal(_)))));
+    }
+
+    #[test]
+    fn test_sleep_talk_into_rest_does_nothing_while_asleep_or_heal_blocked() {
+        for heal_block in [false, true] {
+            let mut state = sleeping_state(3);
+            set_move(&mut state.side_one, PokemonMoveIndex::M1, Choices::REST, 5);
+            set_move(&mut state.side_one, PokemonMoveIndex::M2, Choices::NONE, 0);
+            if heal_block {
+                state
+                    .side_one
+                    .volatile_statuses
+                    .insert(PokemonVolatileStatus::HEALBLOCK);
+            }
+            let outcomes = use_move(
+                &mut state,
+                SideReference::SideOne,
+                Choices::SLEEPTALK,
+                PokemonMoveIndex::M0,
+                Choices::TACKLE,
+            );
+            assert!((total_percentage(&outcomes) - 100.0).abs() < 1e-3);
+            assert!(!outcomes.iter().any(|o| o
+                .instruction_list
+                .iter()
+                .any(|i| matches!(i, Instruction::Heal(_) | Instruction::ChangeStatus(_)))));
+        }
+    }
+
+    #[test]
+    fn test_rest_fails_at_full_hp_and_with_insomnia() {
+        for (hp_full, ability) in [(true, Abilities::NONE), (false, Abilities::INSOMNIA)] {
+            let mut state = State::default();
+            set_move(&mut state.side_one, PokemonMoveIndex::M0, Choices::REST, 16);
+            let active = state.side_one.get_active();
+            active.ability = ability;
+            if !hp_full {
+                active.hp = 10;
+            }
+            let outcomes = use_move(
+                &mut state,
+                SideReference::SideOne,
+                Choices::REST,
+                PokemonMoveIndex::M0,
+                Choices::TACKLE,
+            );
+            assert!(!changes_status(&outcomes), "hp_full={hp_full} {ability:?}");
+        }
+    }
+
+    #[test]
+    fn test_thunder_wave_fails_on_an_already_statused_target() {
+        for status in [PokemonStatus::PARALYZE, PokemonStatus::SLEEP, PokemonStatus::BURN] {
+            let mut state = State::default();
+            set_move(&mut state.side_one, PokemonMoveIndex::M0, Choices::THUNDERWAVE, 32);
+            state.side_two.get_active().status = status;
+            let outcomes = use_move(
+                &mut state,
+                SideReference::SideOne,
+                Choices::THUNDERWAVE,
+                PokemonMoveIndex::M0,
+                Choices::TACKLE,
+            );
+            assert!(!changes_status(&outcomes), "{status:?}");
+        }
     }
 }

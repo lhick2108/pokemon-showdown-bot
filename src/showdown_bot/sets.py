@@ -18,7 +18,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
-
+from showdown_bot import sleep as sleep_module
 from showdown_bot.inference import (
     Constraint,
     DamageObs,
@@ -2352,6 +2352,10 @@ class OpponentModelPlayerMixin:
             self.opponent_model.observe_events(
                 battle_tag, split_messages[1:], getattr(self, "_battles", {}).get(battle_tag)
             )
+            try:  # Rest vs ordinary sleep, turns slept (poke-env cannot tell; bead 589.35)
+                sleep_module.observe_events(battle_tag, split_messages[1:])
+            except Exception:  # bookkeeping must never break the battle loop
+                logger.debug("Sleep tracking failed in %s", battle_tag, exc_info=True)
         result = await super()._handle_battle_message(split_messages)
         if battle_tag is not None:
             battle = getattr(self, "_battles", {}).get(battle_tag)
