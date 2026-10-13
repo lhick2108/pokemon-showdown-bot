@@ -14,6 +14,54 @@ const DEFAULT_EVS: (u8, u8, u8, u8, u8, u8) = (85, 85, 85, 85, 85, 85);
 #[cfg(feature = "champions")]
 const DEFAULT_EVS: (u8, u8, u8, u8, u8, u8) = (11, 11, 11, 11, 11, 11);
 
+/// Showdown's `nosleeptalk` flag plus the two-turn `charge` moves (Gen 9 data).
+pub fn can_be_called_by_sleep_talk(id: Choices) -> bool {
+    !matches!(
+        id,
+        Choices::BEAKBLAST
+            | Choices::BELCH
+            | Choices::BOUNCE
+            | Choices::CELEBRATE
+            | Choices::COPYCAT
+            | Choices::DIG
+            | Choices::DIVE
+            | Choices::DYNAMAXCANNON
+            | Choices::ELECTROSHOT
+            | Choices::FLY
+            | Choices::FOCUSPUNCH
+            | Choices::FREEZESHOCK
+            | Choices::ICEBURN
+            | Choices::METEORBEAM
+            | Choices::METRONOME
+            | Choices::MIMIC
+            | Choices::PHANTOMFORCE
+            | Choices::SHADOWFORCE
+            | Choices::SKETCH
+            | Choices::SKYATTACK
+            | Choices::SLEEPTALK
+            | Choices::SOLARBEAM
+            | Choices::SOLARBLADE
+            | Choices::STRUGGLE
+            | Choices::UPROAR
+    )
+}
+
+/// Showdown's `failencore` flag: Encore fails against a target whose last move is one of these.
+pub fn encore_fails_against_last_move(id: Choices) -> bool {
+    matches!(
+        id,
+        Choices::COPYCAT
+            | Choices::DYNAMAXCANNON
+            | Choices::ENCORE
+            | Choices::METRONOME
+            | Choices::MIMIC
+            | Choices::SKETCH
+            | Choices::SLEEPTALK
+            | Choices::STRUGGLE
+            | Choices::TRANSFORM
+    )
+}
+
 #[derive(Debug, PartialEq, Copy, Clone)]
 pub enum SideReference {
     SideOne,
@@ -917,10 +965,14 @@ impl Pokemon {
         self.moves[&move_index].choice = MOVES.get(&new_move_name).unwrap().to_owned();
         self.moves[&move_index].id = new_move_name;
     }
+    /// The moves Sleep Talk can call: every known move except those Showdown flags
+    /// `nosleeptalk` or `charge` (Sleep Talk itself, Metronome, Mimic, Copycat, Focus
+    /// Punch, Uproar, Fly, Dig, Solar Beam, ...). Rest stays in (it fails while asleep).
     pub fn get_sleep_talk_choices(&self) -> Vec<Choice> {
         let mut vec = Vec::with_capacity(4);
         for p in self.moves.into_iter() {
-            if p.id != Choices::SLEEPTALK && p.id != Choices::NONE {
+            if p.id != Choices::NONE && !p.choice.flags.charge && can_be_called_by_sleep_talk(p.id)
+            {
                 vec.push(p.choice.clone());
             }
         }

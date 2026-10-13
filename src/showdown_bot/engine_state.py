@@ -37,8 +37,10 @@ track the value). Every one of these is silently approximated or dropped:
   neutral natures, so this is exact for randbats).
 * Substitute HP (poke-env does not track it): a present substitute is given a
   quarter of max HP.
-* Sleep counter is the number of turns observed asleep. Rest's 2-turn timer
-  (``rest_turns``) is not distinguished from ordinary sleep.
+* Sleep counter is the number of ``cant|slp`` turns observed (``showdown_bot.sleep``,
+  fed from the raw protocol; poke-env's own counter over-counts Sleep Talk turns);
+  Rest's fixed 2-turn sleep is passed as ``rest_turns`` (3 minus turns lost). Early
+  Bird's double decrement and the sleep clause are not modelled.
 * Volatile durations: Confusion/Encore/Taunt/Lockedmove use poke-env's observed
   turn counters (clamped to the engine's valid range); Yawn is set from presence
   only; Slow Start is derived as 5 minus observed turns.
@@ -84,6 +86,7 @@ from poke_env.battle.weather import Weather
 from poke_env.data import GenData
 from poke_env.player.battle_order import BattleOrder, SingleBattleOrder
 
+from showdown_bot import sleep as sleep_module
 from showdown_bot.sets import RandbatsData, SampledSet, SetTracker, to_id
 
 logger = logging.getLogger(__name__)
@@ -783,6 +786,27 @@ def _sleep_turns(mon: Any, status: str) -> int:
     return max(0, min(_MAX_SLEEP_TURNS, int(mon.status_counter or 0)))
 
 
+def _sleep_fields(battle: Any, mon: Any, status: str) -> tuple[int, int]:
+    """``(sleep_turns, rest_turns)`` for a sleeping Pokemon.
+
+    Uses the protocol-level ``showdown_bot.sleep`` records when the battle has them
+    (Rest's two fixed turns vs 1-3 random turns, turns actually lost). poke-env's own
+    counter also ticks on Sleep Talk's ``move`` events and cannot tell Rest from sleep,
+    so it is only the fallback when no record exists (e.g. hand-driven test battles).
+    """
+    if status != "sleep":
+        return 0, 0
+    tracker = sleep_module.for_battle(getattr(battle, "battle_tag", "") or "")
+    if tracker is not None:
+        for team in (battle.team, battle.opponent_team):
+            for ident, candidate in team.items():
+                if candidate is mon:
+                    record = tracker.record(ident)
+                    if record is not None:
+                        return record.engine_fields()
+    return _sleep_turns(mon, status), 0
+
+
 def _status_of(mon: Any) -> str:
     status = mon.status
     return _STATUS_IDS.get(status, "none") if status is not None else "none"
@@ -848,6 +872,7 @@ def _own_pokemon(battle: Any, mon: Any, is_active: bool) -> tuple[pe.Pokemon, li
     tera_name = request.get("teraType") or getattr(mon.tera_type, "name", None)
     tera_type = to_id(tera_name) or "typeless"
     status = _status_of(mon)
+    sleep_turns, rest_turns = _sleep_fields(battle, mon, status)
     moves = _own_moves(battle, mon, is_active)
     weight = float(entry["weightkg"]) if entry else 0.0
     pokemon = pe.Pokemon(
@@ -866,7 +891,8 @@ def _own_pokemon(battle: Any, mon: Any, is_active: bool) -> tuple[pe.Pokemon, li
         special_defense=int(stats["spd"] or 100),
         speed=int(stats["spe"] or 100),
         status=status,
-        sleep_turns=_sleep_turns(mon, status),
+        sleep_turns=sleep_turns,
+        rest_turns=rest_turns,
         weight_kg=weight,
         terastallized=bool(mon.is_terastallized or request.get("terastallized")),
         tera_type=tera_type,
@@ -935,13 +961,14 @@ def _opponent_pokemon(slot: OpponentSlot, battle: Any) -> tuple[pe.Pokemon, list
     hp = max_hp
     status = "none"
     sleep_turns = 0
+    rest_turns = 0
     if mon is not None:
         if mon.fainted:
             hp = 0
         else:
             hp = max(1, int(round(max_hp * float(mon.current_hp_fraction)))) if mon.current_hp else 0
         status = _status_of(mon)
-        sleep_turns = _sleep_turns(mon, status)
+        sleep_turns, rest_turns = _sleep_fields(battle, mon, status)
     locked_to = _locked_move(mon, item, move_ids)
     moves: list[pe.Move] = []
     for move_id in move_ids:
@@ -969,6 +996,7 @@ def _opponent_pokemon(slot: OpponentSlot, battle: Any) -> tuple[pe.Pokemon, list
         speed=stats["spe"],
         status=status,
         sleep_turns=sleep_turns,
+        rest_turns=rest_turns,
         weight_kg=weight,
         terastallized=bool(mon is not None and mon.is_terastallized),
         tera_type=tera_type,
@@ -977,26 +1005,33 @@ def _opponent_pokemon(slot: OpponentSlot, battle: Any) -> tuple[pe.Pokemon, list
     return pokemon, moves, mon
 
 
-def _engine_supports_transform() -> bool:
-    """Whether the installed engine knows the ``transformed`` volatile / Imposter.
-
-    Added in ``0.0.48+sdb.3``; older builds panic on an unknown volatile name.
-    """
+def _engine_sdb_level() -> int:
+    """The ``N`` of the installed engine's ``0.0.48+sdb.N`` version (0 if unknown)."""
     try:
         from importlib.metadata import version
 
         text = version("poke_engine")
     except Exception:
-        return False
+        return 0
     if "+sdb." not in text:
-        return False
+        return 0
     try:
-        return int(text.rsplit("+sdb.", 1)[1].split(".")[0]) >= 3
+        return int(text.rsplit("+sdb.", 1)[1].split(".")[0])
     except ValueError:
-        return False
+        return 0
+
+
+def _engine_supports_transform() -> bool:
+    """Whether the installed engine knows the ``transformed`` volatile / Imposter.
+
+    Added in ``0.0.48+sdb.3``; older builds panic on an unknown volatile name.
+    """
+    return _engine_sdb_level() >= 3
 
 
 _ENGINE_TRANSFORMS = _engine_supports_transform()
+#: ``0.0.48+sdb.4``: Encore honours ``failencore`` last moves, Sleep Talk is exact (589.35).
+_ENGINE_SLEEP_FIXES = _engine_sdb_level() >= 4
 
 
 def _rebuild_pokemon(pokemon: pe.Pokemon, **changes: Any) -> pe.Pokemon:
