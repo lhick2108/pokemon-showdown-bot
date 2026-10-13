@@ -14,9 +14,11 @@ fn main() {
     let ev = if a[2].starts_with("zero") {
         // net compute with w2 = 0 and stock_coef = 0.0125: identical search tree to stock,
         // so the it/s ratio isolates the pure evaluation overhead
-        let h: usize = a[2][4..].parse().unwrap();
-        let w1: Vec<f32> = (0..h * FEATURE_LEN).map(|i| ((i * 7919) % 1000) as f32 / 1000.0 - 0.5).collect();
-        Evaluator::mlp(h, w1, vec![0.1; h], vec![0.0; h], 0.0)
+        let (hs, ver) = match a[2][4..].split_once('v') { Some((h, v)) => (h, v.parse::<u32>().unwrap()), None => (&a[2][4..], 1) };
+        let h: usize = hs.parse().unwrap();
+        let n_in = poke_engine::features::feature_len(ver).unwrap();
+        let w1: Vec<f32> = (0..h * n_in).map(|i| ((i * 7919) % 1000) as f32 / 1000.0 - 0.5).collect();
+        Evaluator::mlp_v(ver, h, w1, vec![0.1; h], vec![0.0; h], 0.0)
             .unwrap()
             .with_stock_coef(0.0125)
             .unwrap()
@@ -31,8 +33,9 @@ fn main() {
         .map(State::deserialize)
         .collect();
     println!(
-        "{} states, model hidden={} residual={}",
+        "{} states, model v{} hidden={} residual={}",
         states.len(),
+        ev.feature_version(),
         ev.hidden_size(),
         ev.is_residual()
     );
@@ -79,6 +82,33 @@ fn main() {
     });
     micro("ev.logit_ref", &mut |s| ev.logit_reference(black_box(s), &mut scratch));
     micro("ev.logit", &mut |s| ev.logit(black_box(s), &mut scratch));
+    {
+        use poke_engine::features_v2::{dynamic_blocks, static_key, Sink};
+        struct Null(f32);
+        impl Sink for Null {
+            fn one(&mut self, i: usize) {
+                self.0 += i as f32;
+            }
+            fn val(&mut self, i: usize, v: f32) {
+                self.0 += i as f32 * v;
+            }
+        }
+        micro("v2 dynamic", &mut |s| {
+            let mut n = Null(0.0);
+            dynamic_blocks(&mut n, black_box(s), SideReference::SideOne);
+            n.0
+        });
+        micro("v2 keys x12", &mut |s| {
+            let mut a = 0u64;
+            for side in [&s.side_one, &s.side_two] {
+                for p in side.pokemon.pkmn.iter() {
+                    let k = static_key(black_box(p));
+                    a = a.wrapping_add(k[0] ^ k[1]);
+                }
+            }
+            a as f32
+        });
+    }
 
     // MCTS it/s: per state, interleave stock / net `reps` times and keep the fastest of each
     let mut tot = [0f64; 2];

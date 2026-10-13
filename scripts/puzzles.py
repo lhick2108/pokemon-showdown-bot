@@ -446,6 +446,10 @@ def _evals(args):
     out = [("stock", None, 1.0)]
     if args.net and MODEL.is_file():
         out.append(("net", str(MODEL), MODEL_SCALE))
+    for spec in getattr(args, "extra_model", None) or []:
+        label, _, rest = spec.partition("=")
+        path, _, scale = rest.rpartition(":")
+        out.append((label, path, float(scale)))
     return out
 
 
@@ -590,6 +594,8 @@ def main(argv=None) -> int:
         s.add_argument("--worlds", type=int, default=8)
         s.add_argument("--only", default="")
         s.add_argument("--no-net", dest="net", action="store_false")
+        s.add_argument("--extra-model", action="append", default=[],
+                       help="extra learned evaluator to run: label=path.pev:leaf_scale (repeatable)")
         if name == "rollouts":
             s.add_argument("--n", type=int, default=100)
             s.add_argument("--write", action="store_true")

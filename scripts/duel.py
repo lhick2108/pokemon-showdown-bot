@@ -77,6 +77,11 @@ def _parser() -> argparse.ArgumentParser:
                    help="exploration rate in (0, 1] for exp3/rm sides")
     p.add_argument("--stock-uses-evaluator", action="store_true",
                    help="give the second side the same evaluator/leaf scale (isolates selection)")
+    p.add_argument("--opponent-evaluator", type=Path, default=None,
+                   help="learned .pev for the second side (e.g. the v1 net when --evaluator is a "
+                        "v2 net); overrides --stock-uses-evaluator")
+    p.add_argument("--opponent-leaf-scale", type=float, default=1.0,
+                   help="leaf scale of --opponent-evaluator (default 1.0)")
     p.add_argument("--games", type=bench._positive_int, default=100)
     p.add_argument("--pairs", type=bench._positive_int, default=4, help="parallel pairs")
     p.add_argument("--format", default="gen9randombattle")
@@ -128,11 +133,18 @@ async def _duel_pair(args, share: int, pool):
                           **_tendency_fields(args, args.net_tendency)}),
         executor=pool, **options,
     )
-    stock_cls = SearchNetPlayer if (args.stock_uses_evaluator and args.evaluator) else SearchPlayer
+    if args.opponent_evaluator:
+        stock_eval_fields = {"evaluator": str(args.opponent_evaluator.resolve()),
+                             "evaluator_scale": args.opponent_leaf_scale}
+    elif args.stock_uses_evaluator and args.evaluator:
+        stock_eval_fields = evaluator_fields
+    else:
+        stock_eval_fields = {}
+    stock_cls = SearchNetPlayer if stock_eval_fields else SearchPlayer
     stock = stock_cls(
         account_configuration=AccountConfiguration("ds" + secrets.token_hex(5), None),
         config=SearchConfig(**{
-            **base.__dict__, **(evaluator_fields if args.stock_uses_evaluator and args.evaluator else {}),
+            **base.__dict__, **stock_eval_fields,
             "selection": args.stock_selection,
             "inference": args.stock_inference == "on",
             "damage_inference": args.stock_damage_inference == "on",
@@ -184,8 +196,13 @@ def main(argv=None) -> int:
     if "nash" in (args.net_mode, args.stock_mode) and args.threads > 1:
         print("nash mode needs --threads 1", file=sys.stderr)
         return 2
-    if args.evaluator is not None and not args.evaluator.is_file():
-        print(f"no such evaluator: {args.evaluator}", file=sys.stderr)
+    for ev in (args.evaluator, args.opponent_evaluator):
+        if ev is not None and not ev.is_file():
+            print(f"no such evaluator: {ev}", file=sys.stderr)
+            return 2
+    if not (math.isfinite(args.opponent_leaf_scale) and args.opponent_leaf_scale > 0):
+        print(f"--opponent-leaf-scale must be finite and > 0, got {args.opponent_leaf_scale}",
+              file=sys.stderr)
         return 2
     start = time.perf_counter()
     try:
@@ -206,6 +223,9 @@ def main(argv=None) -> int:
               f"{'both sides' if args.stock_uses_evaluator else 'net side only'})")
     else:
         print("evaluator: none (stock search on both sides)")
+    if args.opponent_evaluator:
+        print(f"opponent evaluator: {args.opponent_evaluator} "
+              f"(leaf scale {args.opponent_leaf_scale:g})")
     print(f"selection: net={args.net_selection} stock={args.stock_selection} "
           f"(gamma {args.selection_gamma:g} for exp3/rm); "
           f"mode: net={args.net_mode} stock={args.stock_mode}; "

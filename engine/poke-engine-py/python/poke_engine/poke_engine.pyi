@@ -437,6 +437,10 @@ class MctsResult:
 
 FEATURE_VERSION: int
 FEATURE_LENGTH: int
+FEATURE_LENGTH_V2: int
+FEATURE_VERSIONS: List[int]
+
+def feature_length(version: Optional[int] = None) -> int: ...
 
 class Evaluator:
     """Learned leaf evaluator for MCTS (linear or 2-layer MLP). Output is a logit of P(side one wins)."""
@@ -452,6 +456,7 @@ class Evaluator:
         relative_to_root: bool = True,
         leaf_scale: float = 1.0,
         stock_coef: float = 0.0,
+        feature_version: int = 1,
     ) -> "Evaluator": ...
     @staticmethod
     def mlp(
@@ -462,8 +467,11 @@ class Evaluator:
         relative_to_root: bool = True,
         leaf_scale: float = 1.0,
         stock_coef: float = 0.0,
+        feature_version: int = 1,
     ) -> "Evaluator": ...
     def save(self, path: str) -> None: ...
+    @property
+    def feature_version(self) -> int: ...
     def evaluate(self, py_state: State) -> float: ...
     def logit(self, py_state: State) -> float:
         """Model logit of P(side one wins); same as ``evaluate``."""
@@ -489,11 +497,11 @@ def evaluate(py_state: State) -> float:
     """Stock hand-written evaluation (eval points) of the state."""
     ...
 
-def state_features(py_state: State, side: int = 1) -> List[float]:
+def state_features(py_state: State, side: int = 1, version: Optional[int] = None) -> List[float]:
     """Fixed-length feature vector (length FEATURE_LENGTH) from side's perspective."""
     ...
 
-def state_feature_names() -> List[str]: ...
+def state_feature_names(version: Optional[int] = None) -> List[str]: ...
 
 def mcts(
     py_state: State,
