@@ -562,29 +562,31 @@ def q_z_correlation(data: Data) -> tuple[float, int]:
 def stock_eval_logistic_bce(
     train: Data, val: Data, scale: float = dataset.Q_EVAL_SCALE
 ) -> tuple[float, float, float]:
-    """The "stock eval as predictor" baseline on pure outcome z.
+    """The "stock eval as predictor" reference on the pure outcome z.
 
-    Fits ``P = sigmoid(a * scale * eval + b)`` on train (weighted, Newton) and
-    returns ``(val weighted BCE, a, b)``. NaN when evaluations are unavailable.
+    Fits ``P = sigmoid(a * scale * eval + b)`` on TRAIN (weighted, same Newton fit as
+    the residual net's initialisation, ``fit_stock_logistic``) against the pure outcome
+    ``train.y``, then scores it on VAL with the val weights: the same samples, weights
+    and label as the net's ``val BCE`` line, so the two are directly comparable. It
+    equals the "stock-only logistic (fitted on train)" val BCE printed in residual mode
+    (which fits ``y_fit`` and scores ``y``; they differ only when the training target
+    is not the outcome). Returns ``(val weighted BCE, a, b)``; NaN when evaluations
+    are unavailable.
+
+    A net can legitimately score worse than this on outcome BCE without being weaker
+    in play: nets trained on search-value targets fit q, not z, and the val split is a
+    few dozen battles (noisy). Treat it as a reference point, not a pass/fail bar.
     """
     if train.stock_eval is None or val.stock_eval is None:
         return float("nan"), float("nan"), float("nan")
-    xt = np.clip(scale * train.stock_eval.astype(np.float64), -30, 30)
-    A = np.stack([xt, np.ones_like(xt)], 1)
-    w = train.w.astype(np.float64)
-    beta = np.zeros(2)
-    for _ in range(50):
-        p = 1 / (1 + np.exp(-A @ beta))
-        grad = A.T @ (w * (p - train.y))
-        hess = (A * (w * p * (1 - p))[:, None]).T @ A + 1e-9 * np.eye(2)
-        step = np.linalg.solve(hess, grad)
-        beta -= step
-        if np.abs(step).max() < 1e-9:
-            break
-    xv = np.clip(scale * val.stock_eval.astype(np.float64), -30, 30)
-    logits = torch.from_numpy(beta[0] * xv + beta[1]).float()
+    ratio = scale / STOCK_SCALE  # fit_stock_logistic works in STOCK_SCALE units
+    lim = 30 / STOCK_SCALE
+    ev_t = np.clip(ratio * train.stock_eval.astype(np.float64), -lim, lim)
+    ev_v = np.clip(ratio * val.stock_eval.astype(np.float64), -lim, lim)
+    a, b = fit_stock_logistic(ev_t, train.y, train.w)
+    logits = torch.from_numpy((STOCK_SCALE * a * ev_v + b).astype(np.float32))
     bce = weighted_bce(logits, torch.from_numpy(val.y), torch.from_numpy(val.w))
-    return bce, float(beta[0]), float(beta[1])
+    return bce, a, b
 
 
 def report(model: nn.Module, train: Data, val: Data, device: torch.device) -> dict[str, float]:
@@ -622,8 +624,10 @@ def report(model: nn.Module, train: Data, val: Data, device: torch.device) -> di
     print(f"val BCE improvement over constant: "
           f"weighted {out['base_val_bce_w'] - out['val_bce_w']:+.4f}  "
           f"unweighted {out['base_val_bce'] - out['val_bce']:+.4f}")
-    print(f"stock-eval logistic baseline val BCE weighted {out['stock_logistic_val_bce_w']:.4f}  "
-          f"(P = sigmoid({slope:.3f}*0.0125*eval + {icpt:.3f}); the net must beat this)")
+    print(f"stock-eval-only logistic, fitted on TRAIN, scored on VAL (same samples/weights/"
+          f"label z as the net's val BCE) weighted {out['stock_logistic_val_bce_w']:.4f}  "
+          f"(P = sigmoid({slope:.3f}*0.0125*eval + {icpt:.3f}); a reference, not a pass/fail "
+          f"bar: nets fit to search targets can score worse on z yet play stronger)")
     print(f"val accuracy on decisive positions: {out['val_acc']:.3f}  ({n_dec} positions)")
     if soft:
         print(f"training-target BCE  train weighted {out['train_target_bce_w']:.4f}   "
