@@ -248,14 +248,47 @@ def rating_after_from_log(replay_data: Sequence[Sequence[str]], username: str) -
     return None
 
 
+def parse_player_lines(text: str) -> list[dict]:
+    """``|player|SIDE|NAME|AVATAR|RATING`` lines of a protocol log -> dicts.
+
+    The rating field may be absent or empty (unrated); it is then None.
+    """
+    out = []
+    for line in text.splitlines():
+        if not line.startswith("|player|"):
+            continue
+        parts = line.split("|")  # ['', 'player', side, name, avatar, rating]
+        if len(parts) < 4 or not parts[3]:
+            continue
+        out.append({
+            "side": parts[2],
+            "username": parts[3],
+            "rating": _as_int(parts[5]) if len(parts) > 5 else None,
+        })
+    return out
+
+
+def ratings_from_players(players: Sequence[Mapping], username: str) -> tuple[int | None, int | None, str | None]:
+    """(our rating, opponent rating, opponent name) at battle start from |player| entries."""
+    mine = theirs = opp_name = None
+    for entry in players or []:
+        name = str(entry.get("username", ""))
+        rating = _as_int(entry.get("rating"))
+        if name.lower().replace(" ", "") == username.lower().replace(" ", ""):
+            mine = rating
+        elif name:
+            theirs, opp_name = rating, name
+    return mine, theirs, opp_name
+
+
 def game_from_battle(battle: Any, username: str) -> LadderGame:
     """Record of a finished poke-env battle (ratings only if the server sent them)."""
     from showdown_bot.recorder import result_from_battle
 
-    before = None
-    for entry in getattr(battle, "_players", None) or []:
-        if str(entry.get("username", "")).lower() == username.lower():
-            before = _as_int(entry.get("rating"))
+    players = getattr(battle, "_players", None) or []
+    before, opp_rating, _ = ratings_from_players(players, username)
+    if opp_rating is None:
+        opp_rating = _as_int(getattr(battle, "opponent_rating", None))
     return LadderGame(
         battle_tag=battle.battle_tag,
         opponent=getattr(battle, "opponent_username", None) or "?",
@@ -263,7 +296,7 @@ def game_from_battle(battle: Any, username: str) -> LadderGame:
         turns=int(battle.turn),
         rating_before=before,
         rating_after=rating_after_from_log(getattr(battle, "_replay_data", None), username),
-        opponent_rating=_as_int(getattr(battle, "opponent_rating", None)),
+        opponent_rating=opp_rating,
     )
 
 
