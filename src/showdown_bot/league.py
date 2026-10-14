@@ -43,7 +43,7 @@ logger = logging.getLogger("showdown_bot.league")
 SCHEMA_VERSION = 1
 TIE = "tie"
 ALIASES = {"heuristic": "heuristics", "fp": FOULPLAY_NAME}
-SEARCH_BOTS = ("search", "search-net")
+SEARCH_BOTS = ("search", "search-net", "humansearch")
 PRIOR_WEIGHT = 0.5  # virtual tie games added between every pair of bots
 
 
@@ -74,6 +74,8 @@ PRIOR_KEYS = {"prior": str, "prior_opp": str, "c_puct": float, "prior_eps": floa
 PRIOR_FIELDS = {"prior": "prior", "prior_opp": "prior_opp", "c_puct": "c_puct",
                 "prior_eps": "prior_eps", "fpu": "prior_fpu", "prior_human": "prior_human"}
 
+HUMAN_BLEND_KEYS = {"model": str, "w": float, "pick": str, "blend": str, "temp": float, "elo": str}
+
 SPEC_KEYS = {
     # a no-search bot that plays like a ladder human (showdown_bot.players.human)
     "human": {"model": str, "pick": str, "elo": str, "temp": float},
@@ -85,6 +87,15 @@ SPEC_KEYS = {
                 "escalate_steps": int, "escalate_cap_ms": int, "prune_noop": int, "noop_switches": int,
                 "tera_margin": float, "ev2": str, "scale2": float,
                 **ENDGAME_KEYS, **EXPLOIT_KEYS, **PRIOR_KEYS},
+    # search + final move blended with the human model: p ~ search^(1-w) * human^w (players.humansearch)
+    "humansearch": {"evaluator": str, "scale": float, "time_ms": int, "worlds": int,
+                    "selection": str, "gamma": float, "mode": str,
+                    "tendency": str, "tkappa": float, "tdelta": float,
+                    "belief": int, "btau": float, "bfloor": float,
+                    "escalate": int, "escalate_gap": float, "escalate_factor": float,
+                    "escalate_steps": int, "escalate_cap_ms": int, "prune_noop": int, "noop_switches": int,
+                    "tera_margin": float, "ev2": str, "scale2": float,
+                    **ENDGAME_KEYS, **EXPLOIT_KEYS, **PRIOR_KEYS, **HUMAN_BLEND_KEYS},
     "search-net": {"evaluator": str, "scale": float, "time_ms": int, "worlds": int,
                    "selection": str, "gamma": float, "mode": str,
                "tendency": str, "tkappa": float, "tdelta": float,
@@ -191,6 +202,10 @@ def parse_spec(text: str) -> BotSpec:
                 raise ValueError(f"eg_side must be >= 0 in bot spec {raw!r}")
             if key == "pick" and parsed.lower() not in ("sample", "argmax"):
                 raise ValueError(f"pick must be sample or argmax in bot spec {raw!r}")
+            if key == "w" and not (math.isfinite(parsed) and 0 <= parsed <= 1):
+                raise ValueError(f"w must be in [0, 1] in bot spec {raw!r}")
+            if key == "blend" and parsed.lower() not in ("geo", "mix"):
+                raise ValueError(f"blend must be geo or mix in bot spec {raw!r}")
             if key == "temp" and not (math.isfinite(parsed) and parsed > 0):
                 raise ValueError(f"temp must be > 0 in bot spec {raw!r}")
             if key == "exploit_delta" and not (math.isfinite(parsed) and 0 <= parsed < 1):
@@ -217,7 +232,7 @@ def parse_spec(text: str) -> BotSpec:
                 raise ValueError(f"{key} must be >= 0 in bot spec {raw!r}")
             if key == "prior_opp" and parsed.lower() in ("self", "none", "human"):
                 parsed = parsed.lower()
-            params.append((key, parsed.lower() if key in ("selection", "mode", "tendency", "endgame", "pick") else parsed))
+            params.append((key, parsed.lower() if key in ("selection", "mode", "tendency", "endgame", "pick", "blend") else parsed))
     keys = dict(params)
     if "prior" not in keys and any(k in keys for k in ("prior_opp", "c_puct", "prior_eps", "fpu", "prior_human")):
         raise ValueError(f"prior_opp / c_puct / prior_eps / fpu / prior_human need prior=<path.ppol> in bot spec {raw!r}")
@@ -228,6 +243,8 @@ def parse_spec(text: str) -> BotSpec:
             raise ValueError(f"ev2 needs a primary evaluator=<path.pev> in bot spec {raw!r}")
         if keys.get("worlds", 2) < 2:
             raise ValueError(f"the ev2 ensemble needs worlds >= 2 in bot spec {raw!r}")
+    if type_name == "humansearch" and "model" not in keys:
+        raise ValueError(f"humansearch spec {raw!r} needs model=<human-policy .npz>")
     if type_name == "search-net" and not any(k == "evaluator" for k, _ in params) \
             and not os.environ.get("SHOWDOWN_SEARCH_EVALUATOR"):
         raise ValueError(f"search-net spec {raw!r} needs evaluator=<path.pev>")
@@ -766,6 +783,13 @@ def _make_player(spec: BotSpec, cfg: LeagueConfig, recorder, concurrency: int, s
             if spec.param(key) is not None:
                 kwargs[key] = spec.param(key)
         kwargs["seed"] = cfg.seed * 1000 + salt
+    if spec.type == "humansearch":
+        kwargs["model"] = spec.param("model")
+        if spec.param("w") is not None:
+            kwargs["human_weight"] = spec.param("w")
+        for key in ("pick", "blend", "elo", "temp"):
+            if spec.param(key) is not None:
+                kwargs[key] = spec.param(key)
     if spec.type in SEARCH_BOTS:
         from showdown_bot.players.search import SearchConfig, get_pool
 
@@ -1200,7 +1224,7 @@ def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     p.add_argument("--bots", help="comma-separated label=type[:key=value...] or plain type. Types: "
                    + ", ".join(sorted(bench.PLAYER_REGISTRY)) + ", foulplay. search keys: "
-                   "evaluator, scale, time_ms, worlds, selection (ucb1|exp3|rm), gamma, mode (mixed|argmax|nash), tendency (on|off), tkappa, tdelta, endgame (off|safest|nash), eg_alive, eg_side, eg_ms, eg_worlds, eg_cap, opp_model, opp_elo, exploit_delta, exploit_weight, exploit_kappa, exploit_gain (docs/human-policy.md), prior, prior_opp (self|none|human|path), c_puct, prior_eps, fpu, prior_human (docs/policy-prior.md). human keys: model, pick (sample|argmax), temp, elo. e.g. net=search-net:evaluator=m.pev:scale=4:endgame=safest:eg_alive=5:eg_ms=1500")
+                   "evaluator, scale, time_ms, worlds, selection (ucb1|exp3|rm), gamma, mode (mixed|argmax|nash), tendency (on|off), tkappa, tdelta, endgame (off|safest|nash), eg_alive, eg_side, eg_ms, eg_worlds, eg_cap, opp_model, opp_elo, exploit_delta, exploit_weight, exploit_kappa, exploit_gain (docs/human-policy.md), prior, prior_opp (self|none|human|path), c_puct, prior_eps, fpu, prior_human (docs/policy-prior.md). human keys: model, pick (sample|argmax), temp, elo. humansearch: search keys + model, w (human weight 0..1), pick, blend (geo|mix), temp, elo. e.g. net=search-net:evaluator=m.pev:scale=4:endgame=safest:eg_alive=5:eg_ms=1500")
     p.add_argument("--games-per-pair", type=bench._positive_int, default=20)
     p.add_argument("--out", type=Path, help="output dir, e.g. data/league/<run-id>")
     p.add_argument("--rate-only", type=Path, metavar="DIR", help="recompute results from DIR/games.jsonl")
