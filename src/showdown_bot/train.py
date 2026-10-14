@@ -87,11 +87,13 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import random
 import re
 import sys
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict, deque
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -99,7 +101,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from showdown_bot import augment, dataset
+from showdown_bot import augment, dataset, recorder
 
 WEIGHTINGS = ("sqrt", "game", "none")
 STATE_CHOICES = ("both", "truth", "worlds", "prefer-truth")
@@ -228,6 +230,79 @@ def make_targets(
     return target.astype(np.float32), int(missing.sum())
 
 
+LOAD_CHUNK_FILES = 200  # game files per worker job
+
+
+def _load_chunk(job: tuple) -> dict:
+    """Worker: load one chunk of game files into compact numpy arrays (top level for spawn)."""
+    (files, max_per_game, kw) = job
+    stats = dataset.LoadStats()
+    states, q_kind = kw["states"], kw["q_kind"]
+    feats, ys, qs, evals, dqs, didx = [], [], [], [], [], []
+    tags, strings, gids = [], [], []
+    seen = set()
+    for s in dataset.iter_samples(
+        files[0], sides=(1,), max_per_game=max_per_game, seed=kw["seed"],
+        worlds="fallback" if states == "prefer-truth" else states in ("both", "worlds"),
+        truth=states in ("both", "truth", "prefer-truth"), stats=stats, q_source=kw["q_source"],
+        q_eval_scale=kw["q_eval_scale"], feature_version=kw["feature_version"], files=files,
+    ):
+        feats.append(np.asarray(s.features, dtype=np.dtype(kw["x_dtype"])))
+        ys.append(s.value)
+        q = s.search_value_abs if q_kind == "absolute" else s.search_value
+        qs.append(np.nan if q is None else q)
+        evals.append(s.stock_eval)
+        tags.append(s.battle_tag)
+        strings.append(s.state)
+        gids.append(s.game_id)
+        didx.append(s.decision_idx)
+        seen.add((s.game_id, s.decision_idx))
+        dq = s.decision_q_abs if q_kind == "absolute" else s.decision_q
+        dqs.append(np.nan if dq is None else dq)
+    return {
+        "x": np.stack(feats) if feats else None,
+        "ys": np.asarray(ys, dtype=np.float32), "qs": np.asarray(qs, dtype=np.float32),
+        "evals": np.asarray(evals, dtype=np.float32), "dqs": np.asarray(dqs, dtype=np.float64),
+        "didx": np.asarray(didx, dtype=np.int64),
+        "tags": tags, "strings": strings, "gids": gids, "decisions": len(seen),
+        "stats": {"games": stats.games, "skipped_games": stats.skipped_games,
+                  "bad_states": stats.bad_states, "results": dict(stats.results)},
+    }
+
+
+def _load_source_parallel(path: Path, k: int, workers: int, kw: dict) -> dict:
+    chunk = LOAD_CHUNK_FILES
+    files = list(recorder.iter_game_files(path))
+    jobs = [(files[i:i + chunk], k, kw) for i in range(0, len(files), chunk)]
+    out: dict = {n: [] for n in ("x", "ys", "qs", "evals", "dqs", "didx", "tags", "strings", "gids")}
+    out["decisions"] = 0
+    out["stats"] = {"games": 0, "skipped_games": 0, "bad_states": 0, "results": Counter()}
+
+    def absorb(r: dict) -> None:
+        if r["x"] is not None:
+            out["x"].append(r["x"])
+        for n in ("ys", "qs", "evals", "dqs", "didx"):
+            out[n].append(r[n])
+        for n in ("tags", "strings", "gids"):
+            out[n] += r[n]
+        out["decisions"] += r["decisions"]
+        for n in ("games", "skipped_games", "bad_states"):
+            out["stats"][n] += r["stats"][n]
+        out["stats"]["results"].update(r["stats"]["results"])
+
+    if not jobs:
+        return out
+    pending: deque = deque()
+    with ProcessPoolExecutor(max_workers=workers) as ex:
+        for job in jobs:  # results are consumed in submission order -> deterministic
+            pending.append(ex.submit(_load_chunk, job))
+            if len(pending) >= 2 * workers:
+                absorb(pending.popleft().result())
+        while pending:
+            absorb(pending.popleft().result())
+    return out
+
+
 def load_data(
     paths: list[Path | str | Source],
     states: str = "both",
@@ -245,6 +320,7 @@ def load_data(
     x_dtype: str = "float32",
     max_per_game: int = 0,
     seed: int = 0,
+    workers: int = 0,
 ) -> Data:
     """Load the samples of the given run directories (``Source`` / path / spec) into memory.
 
@@ -256,7 +332,13 @@ def load_data(
     (with ``x_dtype="float16"`` it is kept in a separate float32 array instead).
     ``feature_version`` selects the engine feature layout (1 or 2); float16 halves the memory
     of the (N, n_in) matrix, which matters for the 2.1k-wide version 2.
+
+    ``workers``: 0 = ``os.cpu_count() - 2`` (min 1), 1 = serial, >1 = that many processes
+    each loading a chunk of game files (results are identical to serial: the per-game
+    subsampling RNG depends only on ``seed`` and the file name, and chunks are joined in order).
     """
+    if workers <= 0:
+        workers = max(1, (os.cpu_count() or 1) - 2)
     np_dtype = np.dtype(x_dtype)
     feats, ys, qs, evals, tags, strings = [], [], [], [], [], []
     gids, didx, dqs = [], [], []
@@ -264,7 +346,32 @@ def load_data(
     sources = [parse_source(p) for p in paths]
     src_ids: list[int] = []
     src_records, src_decisions = [], []
-    for si, source in enumerate(sources):
+    par_x: np.ndarray | None = None
+    if workers > 1:
+        kw = dict(states=states, q_source=q_source, q_kind=q_kind, q_eval_scale=q_eval_scale,
+                  feature_version=feature_version, x_dtype=x_dtype, seed=seed)
+        px, pcols = [], {n: [] for n in ("ys", "qs", "evals", "dqs", "didx")}
+        for si, source in enumerate(sources):
+            k = max_per_game if source.max_per_game is None else source.max_per_game
+            r = _load_source_parallel(source.path, k, workers, kw)
+            px += r["x"]
+            for n in pcols:
+                pcols[n] += r[n]
+            tags += r["tags"]; strings += r["strings"]; gids += r["gids"]
+            src_ids += [si] * len(r["tags"])
+            load.games += r["stats"]["games"]
+            load.skipped_games += r["stats"]["skipped_games"]
+            load.bad_states += r["stats"]["bad_states"]
+            load.results.update(r["stats"]["results"])
+            src_records.append(r["stats"]["games"])
+            src_decisions.append(r["decisions"])
+        if px:
+            par_x = np.concatenate(px)
+            del px
+            ys, qs, evals, dqs, didx = (
+                np.concatenate(pcols[n]) for n in ("ys", "qs", "evals", "dqs", "didx"))
+            feats = [None]  # non-empty marker
+    for si, source in enumerate(sources if workers <= 1 else ()):
         path = source.path
         k = max_per_game if source.max_per_game is None else source.max_per_game
         games_before, seen = load.games, set()
@@ -293,7 +400,7 @@ def load_data(
         print(f"warning: {load.bad_states} unparsable states skipped", file=sys.stderr)
     if not feats:
         raise SystemExit("no samples found in " + ", ".join(map(str, paths)))
-    x = np.stack(feats)
+    x = par_x if par_x is not None else np.stack(feats)
     del feats
     e_sep = None
     if residual and np_dtype == np.float32:
@@ -769,6 +876,8 @@ def _parser() -> argparse.ArgumentParser:
                    help="default decisions kept per game record, uniformly at random (seeded by "
                         "--seed and the record), before feature extraction; 0 = all (default); "
                         "a per-source @K overrides it")
+    p.add_argument("--load-workers", type=int, default=0, metavar="N",
+                   help="processes for loading game files; 0 = cpu_count-2 (default), 1 = serial")
     p.add_argument("--val-data", type=parse_source, action="append", default=[],
                    metavar="PATH[@K][:wW]",
                    help="extra held-out set (repeatable), never trained on: BCE vs the outcome "
@@ -873,7 +982,7 @@ def main(argv=None) -> int:
         args.q_kind, args.q_eval_scale, residual=args.residual,
         td_lambda=args.td_lambda, td_n=args.td_n, td_mu=mu,
         feature_version=feature_version, x_dtype=x_dtype,
-        max_per_game=args.max_per_game, seed=args.seed,
+        max_per_game=args.max_per_game, seed=args.seed, workers=args.load_workers,
     )
     extra_val: list[tuple[str, Data]] = []
     for vsrc in args.val_data:
@@ -881,7 +990,7 @@ def main(argv=None) -> int:
         extra_val.append((str(vsrc.path), load_data(
             [vsrc], args.states, args.weighting, "outcome", residual=args.residual,
             feature_version=feature_version, x_dtype=x_dtype,
-            max_per_game=args.max_per_game, seed=args.seed,
+            max_per_game=args.max_per_game, seed=args.seed, workers=args.load_workers,
         )))
     tr_idx, va_idx = split_by_battle(data.tags, args.val_fraction, args.seed)
     if len(va_idx) == 0 or len(tr_idx) == 0:

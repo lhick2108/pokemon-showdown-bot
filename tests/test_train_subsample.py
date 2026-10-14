@@ -144,3 +144,25 @@ def test_cli_end_to_end_with_val_data(tmp_path, state_strings, capsys):  # noqa:
     assert out.count("val-data[") == 2 and f"val-data {va}: BCE vs outcome" in out
     assert (tmp_path / "m.pev").exists()
     assert train.main(["--data", str(tr), "--early-stop-on", "val-data", "--out", "x.pev"]) == 2
+
+
+@pytest.mark.parametrize("kwargs", [
+    dict(states="truth", max_per_game=3, seed=5),
+    dict(states="both", value_target="search", residual=True, x_dtype="float16"),
+])
+def test_load_data_parallel_matches_serial(tmp_path, state_strings, monkeypatch, kwargs):  # noqa: F811
+    human, selfp = tmp_path / "human", tmp_path / "selfplay"
+    _write_games(human, state_strings, 5, 6, searched=False, prefix="h", result="loss")
+    _write_games(selfp, state_strings, 5, 6, searched=True, prefix="s", result="win")
+    monkeypatch.setattr(train, "LOAD_CHUNK_FILES", 2)  # several chunks per source
+    srcs = [train.Source(human, 2, 0.5), train.Source(selfp, None, 2.0)]
+    a = train.load_data(srcs, workers=1, **kwargs)
+    b = train.load_data(srcs, workers=2, **kwargs)
+    assert a.x.dtype == b.x.dtype and a.x.shape == b.x.shape
+    assert np.array_equal(a.x, b.x)
+    for f in ("y", "w", "q", "target", "stock_eval", "e_sep"):
+        u, v = getattr(a, f), getattr(b, f)
+        assert (u is None) == (v is None)
+        if u is not None:
+            assert np.array_equal(u, v, equal_nan=True), f
+    assert a.tags == b.tags and a.states == b.states
