@@ -217,6 +217,7 @@ class LadderGame:
     rating_after: int | None = None
     opponent_rating: int | None = None
     log_file: str | None = None
+    arm: str | None = None  # A/B arm name (scripts/ladder.py --arm)
 
     def to_dict(self) -> dict:
         return asdict(self)
