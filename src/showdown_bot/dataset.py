@@ -125,6 +125,7 @@ def iter_samples(
     feature_version: int | None = None,
     max_per_game: int = 0,
     seed: int = 0,
+    files: Sequence[Path] | None = None,
 ) -> Iterator[Sample]:
     """Yield one ``Sample`` per stored state (every searched world, plus truth).
 
@@ -150,7 +151,8 @@ def iter_samples(
     # None = the engine's default feature version (old engines have no ``version`` argument)
     feat_kwargs = {} if feature_version in (None, 1) else {"version": feature_version}
     stats = stats if stats is not None else LoadStats()
-    for path in recorder.iter_game_files(root):
+    # ``files`` restricts the walk to those game files (used by the parallel loader)
+    for path in (recorder.iter_game_files(root) if files is None else files):
         try:
             game = recorder.read_game(path)
         except (OSError, ValueError, EOFError) as exc:
