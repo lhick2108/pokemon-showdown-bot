@@ -498,5 +498,7 @@ pub fn perform_mcts_shared_tree_with(
         s1: side(&options.s1),
         s2: side(&options.s2),
         iteration_count: root.times_visited.load(Ordering::Acquire),
+        depth_max: 0,
+        depth_mean: 0.0,
     }
 }

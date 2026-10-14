@@ -11292,7 +11292,7 @@ mod tests {
                 std::time::Duration::from_millis(5),
                 3000,
                 None,
-                &SelectionConfig { mode, gamma: 0.1 },
+                &SelectionConfig { mode, gamma: 0.1, prior: None },
             );
             assert!(result.iteration_count >= 3000);
             assert_eq!(state.serialize(), before, "{:?} must restore the state", mode);
@@ -11314,7 +11314,7 @@ mod tests {
             let mut state = state_with_tackle();
             let (s1, s2) = state.root_get_all_options();
             let (k1, k2) = (s1.len(), s2.len());
-            let sel = SelectionConfig { mode, gamma: 0.1 };
+            let sel = SelectionConfig { mode, gamma: 0.1, prior: None };
             let plain = crate::mcts::perform_mcts_selecting(
                 &mut state, s1.clone(), s2.clone(),
                 std::time::Duration::from_millis(5), 500, None, &sel,

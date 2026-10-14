@@ -66,6 +66,14 @@ ENDGAME_FIELDS = {"eg_alive": "endgame_max_alive", "eg_side": "endgame_max_side"
 EXPLOIT_KEYS = {"opp_model": str, "opp_elo": str, "exploit_delta": float, "exploit_weight": float,
                 "exploit_kappa": float, "exploit_gain": float}
 
+# Policy priors (docs/policy-prior.md): prior=<.ppol> turns on PUCT selection; prior_opp = self |
+# none | human | <.ppol>; c_puct, prior_eps, fpu tune it; prior_human = human-policy .npz for
+# prior_opp=human (default: opp_model).
+PRIOR_KEYS = {"prior": str, "prior_opp": str, "c_puct": float, "prior_eps": float, "fpu": float,
+              "prior_human": str}
+PRIOR_FIELDS = {"prior": "prior", "prior_opp": "prior_opp", "c_puct": "c_puct",
+                "prior_eps": "prior_eps", "fpu": "prior_fpu", "prior_human": "prior_human"}
+
 SPEC_KEYS = {
     # a no-search bot that plays like a ladder human (showdown_bot.players.human)
     "human": {"model": str, "pick": str, "elo": str, "temp": float},
@@ -76,7 +84,7 @@ SPEC_KEYS = {
                 "escalate": int, "escalate_gap": float, "escalate_factor": float,
                 "escalate_steps": int, "escalate_cap_ms": int, "prune_noop": int, "noop_switches": int,
                 "tera_margin": float, "ev2": str, "scale2": float,
-                **ENDGAME_KEYS, **EXPLOIT_KEYS},
+                **ENDGAME_KEYS, **EXPLOIT_KEYS, **PRIOR_KEYS},
     "search-net": {"evaluator": str, "scale": float, "time_ms": int, "worlds": int,
                    "selection": str, "gamma": float, "mode": str,
                "tendency": str, "tkappa": float, "tdelta": float,
@@ -84,7 +92,7 @@ SPEC_KEYS = {
                 "escalate": int, "escalate_gap": float, "escalate_factor": float,
                 "escalate_steps": int, "escalate_cap_ms": int, "prune_noop": int, "noop_switches": int,
                 "tera_margin": float, "ev2": str, "scale2": float,
-                **ENDGAME_KEYS, **EXPLOIT_KEYS},
+                **ENDGAME_KEYS, **EXPLOIT_KEYS, **PRIOR_KEYS},
 }
 
 
@@ -191,6 +199,12 @@ def parse_spec(text: str) -> BotSpec:
                 raise ValueError(f"exploit_weight must be in [0, 1] in bot spec {raw!r}")
             if key in ("exploit_kappa", "exploit_gain") and not (math.isfinite(parsed) and parsed >= 0):
                 raise ValueError(f"{key} must be >= 0 in bot spec {raw!r}")
+            if key == "c_puct" and not (math.isfinite(parsed) and parsed > 0):
+                raise ValueError(f"c_puct must be > 0 in bot spec {raw!r}")
+            if key == "prior_eps" and not (math.isfinite(parsed) and 0 <= parsed < 1):
+                raise ValueError(f"prior_eps must be in [0, 1) in bot spec {raw!r}")
+            if key == "fpu" and not math.isfinite(parsed):
+                raise ValueError(f"fpu must be finite in bot spec {raw!r}")
             if key == "tendency" and parsed.lower() not in ("on", "off"):
                 raise ValueError(f"tendency must be on or off in bot spec {raw!r}")
             if key == "belief" and parsed not in (0, 1):
@@ -201,8 +215,12 @@ def parse_spec(text: str) -> BotSpec:
                 raise ValueError(f"bfloor must be in [0, 1) in bot spec {raw!r}")
             if key in ("tkappa", "tdelta") and not (math.isfinite(parsed) and parsed >= 0):
                 raise ValueError(f"{key} must be >= 0 in bot spec {raw!r}")
+            if key == "prior_opp" and parsed.lower() in ("self", "none", "human"):
+                parsed = parsed.lower()
             params.append((key, parsed.lower() if key in ("selection", "mode", "tendency", "endgame", "pick") else parsed))
     keys = dict(params)
+    if "prior" not in keys and any(k in keys for k in ("prior_opp", "c_puct", "prior_eps", "fpu", "prior_human")):
+        raise ValueError(f"prior_opp / c_puct / prior_eps / fpu / prior_human need prior=<path.ppol> in bot spec {raw!r}")
     if "scale2" in keys and "ev2" not in keys:
         raise ValueError(f"scale2 needs ev2=<path.pev> in bot spec {raw!r}")
     if "ev2" in keys:
@@ -694,6 +712,9 @@ def _quality_kwargs(spec: BotSpec) -> dict:
             out[key] = spec.param(key)
     if spec.param("endgame") is not None:
         out["endgame"] = spec.param("endgame")
+    for key, name in PRIOR_FIELDS.items():
+        if spec.param(key) is not None:
+            out[name] = spec.param(key)
     for key, name in ENDGAME_FIELDS.items():
         if spec.param(key) is not None:
             out[name] = spec.param(key)
@@ -1179,7 +1200,7 @@ def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     p.add_argument("--bots", help="comma-separated label=type[:key=value...] or plain type. Types: "
                    + ", ".join(sorted(bench.PLAYER_REGISTRY)) + ", foulplay. search keys: "
-                   "evaluator, scale, time_ms, worlds, selection (ucb1|exp3|rm), gamma, mode (mixed|argmax|nash), tendency (on|off), tkappa, tdelta, endgame (off|safest|nash), eg_alive, eg_side, eg_ms, eg_worlds, eg_cap, opp_model, opp_elo, exploit_delta, exploit_weight, exploit_kappa, exploit_gain (docs/human-policy.md). human keys: model, pick (sample|argmax), temp, elo. e.g. net=search-net:evaluator=m.pev:scale=4:endgame=safest:eg_alive=5:eg_ms=1500")
+                   "evaluator, scale, time_ms, worlds, selection (ucb1|exp3|rm), gamma, mode (mixed|argmax|nash), tendency (on|off), tkappa, tdelta, endgame (off|safest|nash), eg_alive, eg_side, eg_ms, eg_worlds, eg_cap, opp_model, opp_elo, exploit_delta, exploit_weight, exploit_kappa, exploit_gain (docs/human-policy.md), prior, prior_opp (self|none|human|path), c_puct, prior_eps, fpu, prior_human (docs/policy-prior.md). human keys: model, pick (sample|argmax), temp, elo. e.g. net=search-net:evaluator=m.pev:scale=4:endgame=safest:eg_alive=5:eg_ms=1500")
     p.add_argument("--games-per-pair", type=bench._positive_int, default=20)
     p.add_argument("--out", type=Path, help="output dir, e.g. data/league/<run-id>")
     p.add_argument("--rate-only", type=Path, metavar="DIR", help="recompute results from DIR/games.jsonl")

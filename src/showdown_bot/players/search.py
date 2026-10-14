@@ -219,6 +219,14 @@ class SearchConfig:
     ensemble: str = "worlds"
     selection: str = "ucb1"  # engine tree policy: ucb1 | exp3 | rm
     selection_gamma: float = 0.1  # exploration rate for exp3 / rm
+    # Policy priors (docs/policy-prior.md; default off = plain decoupled UCB1): with ``prior`` set
+    # (a .ppol net) the engine selects with PUCT, Q + c_puct * P * sqrt(N) / (1 + n), per side.
+    prior: str | None = None  # path of a .ppol policy net for our side
+    prior_opp: str = "self"  # opponent side: self (mirror our net) | none (UCB1) | human | <.ppol path>
+    c_puct: float = 1.0  # PUCT exploration constant
+    prior_eps: float = 0.03  # share of uniform mixed into every prior
+    prior_fpu: float = 0.0  # unvisited options start from (parent mean - this)
+    prior_human: str | None = None  # human-policy .npz for prior_opp=human (default: opp_model)
     nash_pseudocount: float = nash_module.DEFAULT_PSEUDOCOUNT  # mode="nash": cell shrinkage c
     nash_floor: float = DEFAULT_NASH_FLOOR  # mode="nash": drop actions below this share
     tendency: bool = False  # 589.40 opponent tendency model (implies nash-style root solve)
@@ -292,6 +300,9 @@ class SearchConfig:
             evaluator_scale=_env_scale(EVALUATOR_SCALE_ENV),
             selection=selection,
             selection_gamma=_env_gamma(SELECTION_GAMMA_ENV),
+            prior=(os.environ.get("SHOWDOWN_SEARCH_PRIOR", "").strip() or None),
+            prior_opp=(os.environ.get("SHOWDOWN_SEARCH_PRIOR_OPP", "").strip() or "self"),
+            c_puct=_env_float("SHOWDOWN_SEARCH_C_PUCT", 1.0, 1e-6, math.inf),
             nash_pseudocount=_env_float(
                 NASH_PSEUDOCOUNT_ENV, nash_module.DEFAULT_PSEUDOCOUNT, 0.0, math.inf
             ),
@@ -864,6 +875,8 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             raise ValueError(f"selection_gamma must be in (0, 1], got {self.config.selection_gamma}")
         if self.config.selection != "ucb1" and self.config.threads > 1:
             raise ValueError("selection exp3/rm needs threads == 1 (the shared-tree search is ucb1 only)")
+        if self.config.prior is not None:
+            self._validate_prior()
         if not (math.isfinite(self.config.evaluator_scale) and self.config.evaluator_scale > 0):
             raise ValueError(f"evaluator_scale must be finite and > 0, got {self.config.evaluator_scale}")
         if self.config.evaluator is not None:
@@ -1608,6 +1621,47 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
                 logger.warning("Process pool broke; rebuilt it and retrying")
         raise AssertionError("unreachable")
 
+    def _validate_prior(self) -> None:
+        """Check the policy-prior settings and resolve their file paths."""
+        cfg = self.config
+        if cfg.selection != "ucb1":
+            raise ValueError("a policy prior needs selection=ucb1 (PUCT replaces the UCB1 tree policy)")
+        if cfg.threads > 1:
+            raise ValueError("a policy prior needs threads == 1 (the shared-tree search has none)")
+        if not (math.isfinite(cfg.c_puct) and cfg.c_puct > 0):
+            raise ValueError(f"c_puct must be finite and > 0, got {cfg.c_puct}")
+        if not (math.isfinite(cfg.prior_eps) and 0 <= cfg.prior_eps < 1):
+            raise ValueError(f"prior_eps must be in [0, 1), got {cfg.prior_eps}")
+        if not math.isfinite(cfg.prior_fpu):
+            raise ValueError(f"prior_fpu must be finite, got {cfg.prior_fpu}")
+        if not Path(cfg.prior).is_file():
+            raise FileNotFoundError(f"prior file not found: {cfg.prior}")
+        updates: dict[str, Any] = {"prior": str(Path(cfg.prior).resolve())}
+        opp = (cfg.prior_opp or "self").strip()
+        if opp.lower() in ("self", "none", "human"):
+            opp = opp.lower()
+        else:
+            if not Path(opp).is_file():
+                raise FileNotFoundError(f"prior_opp file not found: {opp}")
+            opp = str(Path(opp).resolve())
+        updates["prior_opp"] = opp
+        if opp == "human":
+            human = cfg.prior_human or cfg.opp_model
+            if not human or not Path(human).is_file():
+                raise ValueError("prior_opp=human needs prior_human=<human-policy .npz> (or opp_model)")
+            updates["prior_human"] = str(Path(human).resolve())
+        self.config = dataclasses.replace(cfg, **updates)
+
+    def _prior_kwargs(self) -> dict[str, Any]:
+        cfg = self.config
+        if cfg.prior is None:
+            return {}
+        return dict(
+            prior_path=cfg.prior, prior_opp=cfg.prior_opp, c_puct=cfg.c_puct,
+            prior_eps=cfg.prior_eps, prior_fpu=cfg.prior_fpu,
+            human_path=cfg.prior_human, human_elo=cfg.opp_elo,
+        )
+
     async def _run_worlds_on(
         self, executor: Executor, state_strings: list[str], time_ms: int
     ) -> list[WorldResult]:
@@ -1617,7 +1671,9 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             _worker.search_world,
             opp_names=bool(self.config.tendency or self.config.opp_model),
             opp_visits=bool(self.config.belief_reweight),
-        ) if (self.config.tendency or self.config.belief_reweight or self.config.opp_model) \
+            **self._prior_kwargs(),
+        ) if (self.config.tendency or self.config.belief_reweight or self.config.opp_model
+              or self.config.prior is not None) \
             else _worker.search_world
         futures = [
             loop.run_in_executor(
