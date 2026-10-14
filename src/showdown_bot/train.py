@@ -174,11 +174,28 @@ class Data:
     def __len__(self) -> int:
         return len(self.y)
 
-    def subset(self, idx: np.ndarray) -> Data:
+    def split_inplace(self, tr_idx: np.ndarray, va_idx: np.ndarray) -> tuple[Data, Data]:
+        """(train, val) without a second full copy of ``x``.
+
+        Val rows are copied out (small); the train rows are compacted to the front of this
+        matrix in chunks (``tr_idx`` ascending, so every source row is at or after its
+        destination and is read before it can be overwritten) and ``train.x`` is a view of
+        that buffer. Peak is ~1x ``x`` + val; ``self.x`` must not be used afterwards.
+        """
+        tr_idx = np.asarray(tr_idx)
+        assert len(tr_idx) < 2 or bool(np.all(np.diff(tr_idx) > 0)), "tr_idx must be ascending"
+        val = self.subset(va_idx)
+        step = 65536
+        for a in range(0, len(tr_idx), step):
+            src = self.x[tr_idx[a:a + step]]  # fancy read is a copy
+            self.x[a:a + len(src)] = src
+        return self.subset(tr_idx, x=self.x[:len(tr_idx)]), val
+
+    def subset(self, idx: np.ndarray, x: np.ndarray | None = None) -> Data:
         w = self.w[idx]
         mean = float(w.mean()) if len(w) else 1.0
         return Data(
-            self.x[idx], self.y[idx], (w / mean).astype(np.float32),
+            self.x[idx] if x is None else x, self.y[idx], (w / mean).astype(np.float32),
             [self.tags[i] for i in idx], [self.states[i] for i in idx],
             None if self.q is None else self.q[idx],
             None if self.target is None else self.target[idx],
@@ -541,16 +558,30 @@ def model_input(x: torch.Tensor, e: torch.Tensor | None = None) -> torch.Tensor:
     return x if e is None else torch.cat([x, e[:, None]], dim=1)
 
 
+GPU_X_LIMIT = 2e9  # bytes: a feature matrix larger than this stays on the CPU (batched transfer)
+
+
+def place_x(arr: np.ndarray, device: torch.device) -> torch.Tensor:
+    """Feature matrix as a tensor: on ``device`` if small, else left on the CPU."""
+    t = torch.from_numpy(arr)
+    return t.to(device) if arr.nbytes <= GPU_X_LIMIT else t
+
+
 def logits_of(
     model: nn.Module, x: torch.Tensor, e: torch.Tensor | None = None, batch: int = 8192
 ) -> torch.Tensor:
-    """Logits for features ``x``; ``e`` is the separately stored stock eval (float16 data)."""
+    """Logits for features ``x`` (may live on the CPU: each batch is moved to the model's
+    device); ``e`` is the separately stored stock eval (float16 data)."""
     model.eval()
     if len(x) == 0:
         return torch.zeros(0)
+    dev = next(model.parameters()).device
     with torch.no_grad():
         return torch.cat([
-            model(model_input(x[i:i + batch], None if e is None else e[i:i + batch])).squeeze(-1)
+            model(model_input(
+                x[i:i + batch].to(dev, non_blocking=True),
+                None if e is None else e[i:i + batch].to(dev),
+            )).squeeze(-1)
             for i in range(0, len(x), batch)
         ])
 
@@ -644,12 +675,13 @@ def fit(
         raise ValueError("early_stop_on='val-data' needs extra_val")
     torch.manual_seed(seed)
     model.to(device)
-    xt, yt, wt = (torch.from_numpy(a).to(device) for a in (train.x, train.y_fit, train.w))
-    xv, yv, wv = (torch.from_numpy(a).to(device) for a in (val.x, val.y_fit, val.w))
+    xt, xv = place_x(train.x, device), place_x(val.x, device)
+    yt, wt = (torch.from_numpy(a).to(device) for a in (train.y_fit, train.w))
+    yv, wv = (torch.from_numpy(a).to(device) for a in (val.y_fit, val.w))
     et = None if train.e_sep is None else torch.from_numpy(train.e_sep).to(device)
     ev = None if val.e_sep is None else torch.from_numpy(val.e_sep).to(device)
     extra_t = [
-        (name, *(torch.from_numpy(a).to(device) for a in (d.x, d.y, d.w)),
+        (name, place_x(d.x, device), *(torch.from_numpy(a).to(device) for a in (d.y, d.w)),
          None if d.e_sep is None else torch.from_numpy(d.e_sep).to(device))
         for name, d in extra_val
     ]
@@ -665,10 +697,13 @@ def fit(
     n = len(yt)
     for epoch in range(1, epochs + 1):
         model.train()
-        perm = torch.randperm(n, generator=gen).to(device)
+        perm = torch.randperm(n, generator=gen)  # CPU: rows of a CPU-resident x are gathered there
+        perm_dev = perm.to(device)
         for i in range(0, n, batch_size):
-            b = perm[i:i + batch_size]
-            xb, yb = model_input(xt[b], None if et is None else et[b]), yt[b]
+            b = perm_dev[i:i + batch_size]
+            xb = xt[perm[i:i + batch_size]] if xt.device.type == "cpu" and device.type != "cpu" else xt[b]
+            xb = model_input(xb.to(device, non_blocking=True), None if et is None else et[b])
+            yb = yt[b]
             if augmenter is not None:
                 xb, yb = augmenter(xb, yb)
             loss = nn.functional.binary_cross_entropy_with_logits(
@@ -701,7 +736,8 @@ def fit(
 def evaluate_extra(model: nn.Module, data: Data, device: torch.device) -> dict[str, float]:
     """BCE against the outcome z on an extra held-out set (weighted, unweighted, accuracy)."""
     model.to(device)
-    x, y, w = (torch.from_numpy(a).to(device) for a in (data.x, data.y, data.w))
+    x = place_x(data.x, device)
+    y, w = (torch.from_numpy(a).to(device) for a in (data.y, data.w))
     e = None if data.e_sep is None else torch.from_numpy(data.e_sep).to(device)
     logits = logits_of(model, x, e)
     acc, n_dec = decisive_accuracy(logits.cpu().numpy(), data.y)
@@ -824,8 +860,9 @@ def stock_eval_logistic_bce(
 
 def report(model: nn.Module, train: Data, val: Data, device: torch.device) -> dict[str, float]:
     model.to(device)
-    t = {k: torch.from_numpy(getattr(train, k)).to(device) for k in ("x", "y", "w")}
-    v = {k: torch.from_numpy(getattr(val, k)).to(device) for k in ("x", "y", "w")}
+    t = {k: torch.from_numpy(getattr(train, k)).to(device) for k in ("y", "w")}
+    v = {k: torch.from_numpy(getattr(val, k)).to(device) for k in ("y", "w")}
+    t["x"], v["x"] = place_x(train.x, device), place_x(val.x, device)
     et = None if train.e_sep is None else torch.from_numpy(train.e_sep).to(device)
     ev = None if val.e_sep is None else torch.from_numpy(val.e_sep).to(device)
     lt, lv = logits_of(model, t["x"], et), logits_of(model, v["x"], ev)
@@ -1005,14 +1042,14 @@ def main(argv=None) -> int:
     if len(va_idx) == 0 or len(tr_idx) == 0:
         print("need at least two battles for a train/val split", file=sys.stderr)
         return 2
-    train, val = data.subset(tr_idx), data.subset(va_idx)
+    train, val = data.split_inplace(tr_idx, va_idx)
     assert not set(train.tags) & set(val.tags)
     print(f"samples {len(data)} ({args.states}); battles {len(set(data.tags))}; "
           f"train {len(train)} samples / {len(set(train.tags))} battles; "
           f"val {len(val)} samples / {len(set(val.tags))} battles; "
           f"mean value {float(data.y.mean()):.3f}")
     n_feat = data.x.shape[1] - (1 if args.residual and data.e_sep is None else 0)
-    del data  # the train/val subsets are copies; drop the full matrix (halves steady-state RAM)
+    del data  # train.x is a view of its buffer; val was copied out (no 2x peak)
     res_init = None
     if args.residual:
         a0, b0 = fit_stock_logistic(train.e, train.y_fit, train.w, args.stock_coef_init)
