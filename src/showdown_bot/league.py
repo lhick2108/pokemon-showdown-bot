@@ -51,6 +51,14 @@ PRIOR_WEIGHT = 0.5  # virtual tie games added between every pair of bots
 # Bot specs: label=type[:key=value[:key=value...]]
 # ---------------------------------------------------------------------------
 
+# Endgame mode (showdown_bot.endgame): endgame=off|safest|nash, eg_alive (total alive trigger),
+# eg_side (per-side alive cap, 0 = none), eg_ms (per-world ms), eg_worlds, eg_cap (decision cap ms).
+ENDGAME_KEYS = {"endgame": str, "eg_alive": int, "eg_side": int, "eg_ms": int,
+                "eg_worlds": int, "eg_cap": int}
+ENDGAME_FIELDS = {"eg_alive": "endgame_max_alive", "eg_side": "endgame_max_side",
+                  "eg_ms": "endgame_time_ms", "eg_worlds": "endgame_worlds",
+                  "eg_cap": "endgame_cap_ms"}
+
 SPEC_KEYS = {
     "search": {"evaluator": str, "scale": float, "time_ms": int, "worlds": int,
                "selection": str, "gamma": float, "mode": str,
@@ -58,14 +66,16 @@ SPEC_KEYS = {
                "belief": int, "btau": float, "bfloor": float,
                 "escalate": int, "escalate_gap": float, "escalate_factor": float,
                 "escalate_steps": int, "escalate_cap_ms": int, "prune_noop": int, "noop_switches": int,
-                "tera_margin": float, "ev2": str, "scale2": float},
+                "tera_margin": float, "ev2": str, "scale2": float,
+                **ENDGAME_KEYS},
     "search-net": {"evaluator": str, "scale": float, "time_ms": int, "worlds": int,
                    "selection": str, "gamma": float, "mode": str,
                "tendency": str, "tkappa": float, "tdelta": float,
                "belief": int, "btau": float, "bfloor": float,
                 "escalate": int, "escalate_gap": float, "escalate_factor": float,
                 "escalate_steps": int, "escalate_cap_ms": int, "prune_noop": int, "noop_switches": int,
-                "tera_margin": float, "ev2": str, "scale2": float},
+                "tera_margin": float, "ev2": str, "scale2": float,
+                **ENDGAME_KEYS},
 }
 
 
@@ -156,6 +166,12 @@ def parse_spec(text: str) -> BotSpec:
                 raise ValueError(f"gamma must be in (0, 1] in bot spec {raw!r}")
             if key == "mode" and parsed.lower() not in ("mixed", "argmax", "nash"):
                 raise ValueError(f"mode must be mixed, argmax or nash in bot spec {raw!r}")
+            if key == "endgame" and parsed.lower() not in ("off", "safest", "nash"):
+                raise ValueError(f"endgame must be off, safest or nash in bot spec {raw!r}")
+            if key in ("eg_alive", "eg_ms", "eg_worlds", "eg_cap") and parsed < 1:
+                raise ValueError(f"{key} must be >= 1 in bot spec {raw!r}")
+            if key == "eg_side" and parsed < 0:
+                raise ValueError(f"eg_side must be >= 0 in bot spec {raw!r}")
             if key == "tendency" and parsed.lower() not in ("on", "off"):
                 raise ValueError(f"tendency must be on or off in bot spec {raw!r}")
             if key == "belief" and parsed not in (0, 1):
@@ -166,7 +182,7 @@ def parse_spec(text: str) -> BotSpec:
                 raise ValueError(f"bfloor must be in [0, 1) in bot spec {raw!r}")
             if key in ("tkappa", "tdelta") and not (math.isfinite(parsed) and parsed >= 0):
                 raise ValueError(f"{key} must be >= 0 in bot spec {raw!r}")
-            params.append((key, parsed.lower() if key in ("selection", "mode", "tendency") else parsed))
+            params.append((key, parsed.lower() if key in ("selection", "mode", "tendency", "endgame") else parsed))
     keys = dict(params)
     if "scale2" in keys and "ev2" not in keys:
         raise ValueError(f"scale2 needs ev2=<path.pev> in bot spec {raw!r}")
@@ -653,6 +669,11 @@ def _quality_kwargs(spec: BotSpec) -> dict:
     for key in ("escalate_gap", "escalate_factor", "escalate_steps", "escalate_cap_ms", "tera_margin"):
         if spec.param(key) is not None:
             out[key] = spec.param(key)
+    if spec.param("endgame") is not None:
+        out["endgame"] = spec.param("endgame")
+    for key, name in ENDGAME_FIELDS.items():
+        if spec.param(key) is not None:
+            out[name] = spec.param(key)
     return out
 
 
@@ -1083,7 +1104,7 @@ def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     p.add_argument("--bots", help="comma-separated label=type[:key=value...] or plain type. Types: "
                    + ", ".join(sorted(bench.PLAYER_REGISTRY)) + ", foulplay. search keys: "
-                   "evaluator, scale, time_ms, worlds, selection (ucb1|exp3|rm), gamma, mode (mixed|argmax|nash), tendency (on|off), tkappa, tdelta. e.g. net=search-net:evaluator=m.pev:scale=4")
+                   "evaluator, scale, time_ms, worlds, selection (ucb1|exp3|rm), gamma, mode (mixed|argmax|nash), tendency (on|off), tkappa, tdelta, endgame (off|safest|nash), eg_alive, eg_side, eg_ms, eg_worlds, eg_cap. e.g. net=search-net:evaluator=m.pev:scale=4:endgame=safest:eg_alive=5:eg_ms=1500")
     p.add_argument("--games-per-pair", type=bench._positive_int, default=20)
     p.add_argument("--out", type=Path, help="output dir, e.g. data/league/<run-id>")
     p.add_argument("--rate-only", type=Path, metavar="DIR", help="recompute results from DIR/games.jsonl")

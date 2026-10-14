@@ -140,3 +140,27 @@ def _format(result, selection: str, joint: bool, opp_names: bool) -> tuple:
 def evaluator_loads() -> int:
     """How many evaluator files this process has loaded (tests; picklable)."""
     return EVALUATOR_LOADS
+
+
+def endgame_world(state_string: str, time_ms: int) -> tuple:
+    """Iterative-deepening expectiminimax on one serialised world (endgame mode).
+
+    Returns ``(our options, their options, flat row-major matrix, depth searched)``; pruned
+    cells are NaN (see ``showdown_bot.endgame``). The search uses the engine's stock
+    evaluation only (no learned evaluator hook); a Rust panic becomes ``RuntimeError``.
+    """
+    from poke_engine import State, iterative_deepening_expectiminimax
+
+    try:
+        state = State.from_string(state_string)
+        result = iterative_deepening_expectiminimax(state, int(time_ms))
+        return (
+            [str(c) for c in result.side_one],
+            [str(c) for c in result.side_two],
+            [float(x) for x in result.matrix],
+            int(result.depth_searched),
+        )
+    except Exception:
+        raise
+    except BaseException as exc:  # pyo3 PanicException
+        raise RuntimeError(f"engine panic: {exc!r}") from None

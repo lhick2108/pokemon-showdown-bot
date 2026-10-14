@@ -51,6 +51,17 @@ only poke-env options), these environment variables:
                                  leaf scale k > 0 for the learned evaluator: leaf score
                                  sigmoid(k * (z_leaf - z_root)) (default 1.0; see the
                                  "Leaf scale" section of docs/training.md)
+    SHOWDOWN_SEARCH_ENDGAME      "off" (default), "safest" or "nash": in small endgames run
+                                 iterative-deepening expectiminimax (stock eval, no learned
+                                 evaluator) instead of MCTS; see showdown_bot.endgame
+    SHOWDOWN_SEARCH_ENDGAME_ALIVE
+                                 trigger when total alive Pokemon on both sides <= N (default 5)
+    SHOWDOWN_SEARCH_ENDGAME_SIDE per-side alive cap, 0 = none (default 0)
+    SHOWDOWN_SEARCH_ENDGAME_MS   per-world endgame search time (default 1500)
+    SHOWDOWN_SEARCH_ENDGAME_WORLDS
+                                 worlds searched in an endgame (default 2)
+    SHOWDOWN_SEARCH_ENDGAME_CAP_MS
+                                 wall-clock cap the endgame plan must fit under (default 4000)
     SHOWDOWN_BELIEF_REWEIGHT     "1" turns on soft Bayesian belief reweighting of the opponent's
                                  candidate sets (default off; see showdown_bot.belief)
     SHOWDOWN_BELIEF_TAU          tempering exponent for action evidence (default 0.5)
@@ -89,6 +100,7 @@ from poke_env.player.battle_order import BattleOrder, DefaultBattleOrder
 
 from showdown_bot import belief as belief_module
 from showdown_bot import decision_quality as dq
+from showdown_bot import endgame as endgame_module
 from showdown_bot import engine_state, nash as nash_module, recorder as recorder_module
 from showdown_bot import opponent_tendency as tendency_module
 from showdown_bot.players import _worker
@@ -222,6 +234,13 @@ class SearchConfig:
     # is recorded; otherwise a cheap fast_time_ms search that is NOT recorded. 1.0 = off.
     full_frac: float = 1.0
     fast_time_ms: int = 50
+    # Endgame mode: exact expectiminimax instead of MCTS when few Pokemon are alive (off by default)
+    endgame: str = endgame_module.OFF  # off | safest | nash
+    endgame_max_alive: int = 5  # trigger: our alive + their alive (unseen count as alive) <= this
+    endgame_max_side: int = 0  # ...and each side's alive <= this when > 0
+    endgame_time_ms: int = 1500  # per-world expectiminimax budget
+    endgame_worlds: int = 2  # sampled worlds (endgames have most opponent info revealed)
+    endgame_cap_ms: int = 4000  # wall-clock budget the whole endgame decision must fit under
     # Self-play bookkeeping only (written to the record header; no effect on play).
     label: str = ""
     opponent: str = ""
@@ -237,6 +256,14 @@ class SearchConfig:
         if selection not in SELECTIONS:
             logger.warning("Unknown %s=%r; using ucb1", SELECTION_ENV, selection)
             selection = "ucb1"
+        endgame_mode = os.environ.get("SHOWDOWN_SEARCH_ENDGAME", "off").strip().lower() or "off"
+        if endgame_mode in ("0", "false", "no"):
+            endgame_mode = endgame_module.OFF
+        elif endgame_mode in ("1", "on", "true", "yes"):
+            endgame_mode = endgame_module.SAFEST
+        if endgame_mode not in endgame_module.MODES:
+            logger.warning("Unknown SHOWDOWN_SEARCH_ENDGAME=%r; using off", endgame_mode)
+            endgame_mode = endgame_module.OFF
         return cls(
             search_time_ms=_env_int("SHOWDOWN_SEARCH_TIME_MS", 100) or 100,
             parallelism=_env_int("SHOWDOWN_SEARCH_PARALLELISM", 1) or 1,
@@ -265,6 +292,12 @@ class SearchConfig:
             not in ("0", "off", "false", "no"),
             eval_lowhp_knee=_env_float("SHOWDOWN_EVAL_LOWHP_KNEE", 0.0, 0.0, 1.0),
             eval_boost_scale=_env_float("SHOWDOWN_EVAL_BOOST_SCALE", 1.0, 0.0, 10.0),
+            endgame=endgame_mode,
+            endgame_max_alive=_env_int("SHOWDOWN_SEARCH_ENDGAME_ALIVE", 5) or 5,
+            endgame_max_side=_env_int("SHOWDOWN_SEARCH_ENDGAME_SIDE", 0) or 0,
+            endgame_time_ms=_env_int("SHOWDOWN_SEARCH_ENDGAME_MS", 1500) or 1500,
+            endgame_worlds=_env_int("SHOWDOWN_SEARCH_ENDGAME_WORLDS", 2) or 2,
+            endgame_cap_ms=_env_int("SHOWDOWN_SEARCH_ENDGAME_CAP_MS", 4000) or 4000,
             belief_reweight=os.environ.get("SHOWDOWN_BELIEF_REWEIGHT", "0").strip().lower()
             in ("1", "on", "true", "yes"),
             belief_tau=_env_float("SHOWDOWN_BELIEF_TAU", belief_module.DEFAULT_TAU, 0.0, 10.0),
@@ -302,6 +335,8 @@ class SearchStats:
     escalations: int = 0  # 589.47: decisions whose search was extended
     noop_pruned: int = 0  # 589.47: decisions where >= 1 no-op option was dropped
     tera_folded: int = 0  # 589.47: decisions where >= 1 tera option was folded away
+    endgame_decisions: int = 0  # decisions decided by endgame expectiminimax
+    endgame_fallbacks: int = 0  # endgame decisions that fell back to MCTS (error / degenerate)
     fallback_reasons: Counter = field(default_factory=Counter)
 
     def summary(self) -> str:
@@ -319,6 +354,11 @@ class SearchStats:
                 if self.escalations or self.noop_pruned or self.tera_folded
                 else ""
             )
+            + (
+                f" endgame={self.endgame_decisions} endgame_fallbacks={self.endgame_fallbacks}"
+                if self.endgame_decisions or self.endgame_fallbacks
+                else ""
+            )
         )
 
 
@@ -332,7 +372,8 @@ def total_stats() -> SearchStats:
         for name in (
             "decisions", "searched", "forced", "fallbacks", "worlds_run",
             "world_errors", "iterations", "search_ms", "unknown_ids", "illusion_worlds",
-            "escalations", "noop_pruned", "tera_folded",
+            "escalations", "noop_pruned", "tera_folded", "endgame_decisions",
+            "endgame_fallbacks",
         ):
             setattr(total, name, getattr(total, name) + getattr(stats, name))
         total.fallback_reasons.update(stats.fallback_reasons)
@@ -634,6 +675,7 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         tendency_kappa: float | None = None,
         tendency_delta: float | None = None,
         belief_reweight: bool | None = None,
+        endgame: str | None = None,
         **kwargs: Any,
     ):
         data = data or (opponent_model.data if opponent_model else default_randbats_data())
@@ -670,6 +712,8 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             self.config = dataclasses.replace(self.config, tendency_delta=float(tendency_delta))
         if belief_reweight is not None:
             self.config = dataclasses.replace(self.config, belief_reweight=bool(belief_reweight))
+        if endgame is not None:
+            self.config = dataclasses.replace(self.config, endgame=str(endgame).lower())
         if not (0.0 <= self.config.full_frac <= 1.0):
             raise ValueError(f"full_frac must be in [0, 1], got {self.config.full_frac}")
         if self.config.fast_time_ms < 1:
@@ -736,6 +780,12 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             raise ValueError("escalate_steps and escalate_cap_ms must be >= 1")
         if not (math.isfinite(cfg.tera_margin) and cfg.tera_margin >= 0):
             raise ValueError(f"tera_margin must be finite and >= 0, got {cfg.tera_margin}")
+        if cfg.endgame not in endgame_module.MODES:
+            raise ValueError(f"endgame must be one of {endgame_module.MODES}, got {cfg.endgame!r}")
+        if cfg.endgame_max_alive < 1 or cfg.endgame_max_side < 0:
+            raise ValueError("endgame_max_alive must be >= 1 and endgame_max_side >= 0")
+        if cfg.endgame_time_ms < 1 or cfg.endgame_worlds < 1 or cfg.endgame_cap_ms < 1:
+            raise ValueError("endgame_time_ms, endgame_worlds and endgame_cap_ms must be >= 1")
         self.stats = SearchStats()
         _ALL_STATS.append(self.stats)
         self._executor = executor
@@ -827,6 +877,12 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             return None
         trackers = self.opponent_model.update(battle)
         full = self._draw_full()
+        if full and self.config.endgame != endgame_module.OFF:
+            ours, theirs = endgame_module.alive_counts(battle)
+            if endgame_module.triggered(self.config, ours, theirs):
+                order = await self._endgame_choice(battle, trackers, ours, theirs)
+                if order is not None:
+                    return order
         plan_cfg = self.config if full else dataclasses.replace(
             self.config, search_time_ms=self.config.fast_time_ms
         )
@@ -836,28 +892,7 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             started = time.perf_counter()
             truth_state, truth_status = self._truth_state(battle)
             opp_facts = _opp_facts(battle, trackers)
-        built = None
-        state_strings: list[str] = []
-        try:
-            illusion = self.opponent_model.illusion_estimate(battle)
-        except Exception:  # a suspicion bug must never cost the decision
-            logger.exception("Illusion estimate failed in %s", battle.battle_tag)
-            illusion = None
-        if illusion is not None and illusion.total <= 0:
-            illusion = None
-        world_slots: list[list[engine_state.OpponentSlot]] = []
-        for _ in range(n_worlds):
-            slots = engine_state.sample_opponent_team(
-                battle, trackers, self._sampler, self._rng,
-                illusion=illusion, illusion_rng=self._illusion_rng,
-            )
-            world_slots.append(slots)
-            if slots and slots[0].disguised:
-                self.stats.illusion_worlds += 1
-            world = engine_state.build_state(battle, slots)
-            built = built or world
-            self.stats.unknown_ids += len(world.unknown_ids)
-            state_strings.append(world.to_string())
+        world_slots, state_strings, built = self._sample_worlds(battle, trackers, n_worlds)
         results = await self._run_worlds(state_strings, time_ms)
         result_worlds = list(self._result_worlds)
         self.stats.searched += 1
@@ -919,6 +954,209 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
                 opp_facts,
             )
         return order
+
+    def _sample_worlds(
+        self, battle: Any, trackers: Any, n_worlds: int
+    ) -> tuple[list[list[engine_state.OpponentSlot]], list[str], Any]:
+        """Sample ``n_worlds`` opposing teams; returns ``(slots, state strings, first built state)``."""
+        built = None
+        state_strings: list[str] = []
+        try:
+            illusion = self.opponent_model.illusion_estimate(battle)
+        except Exception:  # a suspicion bug must never cost the decision
+            logger.exception("Illusion estimate failed in %s", battle.battle_tag)
+            illusion = None
+        if illusion is not None and illusion.total <= 0:
+            illusion = None
+        world_slots: list[list[engine_state.OpponentSlot]] = []
+        for _ in range(n_worlds):
+            slots = engine_state.sample_opponent_team(
+                battle, trackers, self._sampler, self._rng,
+                illusion=illusion, illusion_rng=self._illusion_rng,
+            )
+            world_slots.append(slots)
+            if slots and slots[0].disguised:
+                self.stats.illusion_worlds += 1
+            world = engine_state.build_state(battle, slots)
+            built = built or world
+            self.stats.unknown_ids += len(world.unknown_ids)
+            state_strings.append(world.to_string())
+        return world_slots, state_strings, built
+
+    # -- endgame mode (showdown_bot.endgame) ----------------------------------------
+
+    async def _endgame_choice(
+        self, battle: Any, trackers: Any, ours: int, theirs: int
+    ) -> BattleOrder | None:
+        """Decide an endgame with expectiminimax; None means "fall back to the MCTS path"."""
+        cfg = self.config
+        pool_size = getattr(self._executor, "_max_workers", None) or cfg.parallelism
+        plan = endgame_module.plan_time(cfg, pool_size)
+        if plan is None:
+            return None
+        n_worlds, time_ms = plan
+        recording = self._recorder is not None
+        started = time.perf_counter()
+        truth_state, truth_status, opp_facts = None, "disabled", None
+        if recording:
+            truth_state, truth_status = self._truth_state(battle)
+            opp_facts = _opp_facts(battle, trackers)
+        try:
+            _slots, state_strings, built = self._sample_worlds(battle, trackers, n_worlds)
+            raw = await self._run_endgame_worlds(state_strings, time_ms)
+            usable = []
+            for index, result in raw:
+                world = endgame_module.parse_world(result)
+                if world is not None:
+                    usable.append((index, world))
+            if not usable:
+                raise RuntimeError("no usable expectiminimax world")
+            worlds = [w for _, w in usable]
+            policy, info = endgame_module.aggregate(cfg.endgame, worlds, cfg.nash_floor)
+            if not policy:
+                raise RuntimeError("empty endgame policy")
+            select_mode = NASH if cfg.endgame == endgame_module.NASH else ARGMAX
+            order = self._order_from_policy(policy, built, battle, select_mode)
+            if order is None:
+                raise RuntimeError("no legal endgame order")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.stats.endgame_fallbacks += 1
+            logger.exception("Endgame search failed in %s; using MCTS", battle.battle_tag)
+            return None
+        self.stats.endgame_decisions += 1
+        self.stats.searched += 1
+        self.stats.worlds_run += len(worlds)
+        self.stats.search_ms += time_ms * len(worlds)
+        self.last_policy = policy
+        self.last_changes = {
+            "endgame": True, "endgame_mode": cfg.endgame, "search_time_ms": time_ms,
+            "depth_searched": [w.depth for w in worlds], "alive": [ours, theirs],
+        }
+        if recording:
+            nash_info = info.get("nash") if cfg.endgame == endgame_module.NASH else None
+            self._record_endgame(
+                battle, order, policy, n_worlds, time_ms, started, truth_state, truth_status,
+                [(state_strings[i], w) for i, w in usable], nash_info, opp_facts, ours, theirs,
+            )
+        return order
+
+    async def _run_endgame_worlds(
+        self, state_strings: list[str], time_ms: int
+    ) -> list[tuple[int, Any]]:
+        """Expectiminimax on every world: ``[(world index, raw result)]`` of those that
+        succeeded (a broken shared pool is rebuilt once and retried)."""
+        for attempt in (0, 1):
+            executor = self._executor or get_pool(self.config.parallelism)
+            try:
+                return await self._run_endgame_on(executor, state_strings, time_ms)
+            except BrokenProcessPool:
+                if self._executor is not None:
+                    raise
+                reset_pool(self.config.parallelism, only=executor)
+                if attempt:
+                    raise
+                logger.warning("Process pool broke; rebuilt it and retrying")
+        raise AssertionError("unreachable")
+
+    async def _run_endgame_on(
+        self, executor: Executor, state_strings: list[str], time_ms: int
+    ) -> list[tuple[int, Any]]:
+        loop = asyncio.get_running_loop()
+        futures = [
+            loop.run_in_executor(executor, _worker.endgame_world, state, time_ms)
+            for state in state_strings
+        ]
+        pool_size = getattr(executor, "_max_workers", None) or self.config.parallelism
+        waves = -(-len(futures) // max(1, pool_size))
+        timeout = waves * (time_ms / 1000.0 + 1.0) + 10.0
+        try:
+            outcomes = await asyncio.wait_for(
+                asyncio.gather(*futures, return_exceptions=True), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            logger.error("Endgame search timed out after %.0fs", timeout)
+            if self._executor is None:
+                reset_pool(self.config.parallelism, only=executor, kill=True)
+            raise
+        good: list[tuple[int, Any]] = []
+        for index, outcome in enumerate(outcomes):
+            if isinstance(outcome, BaseException):
+                if isinstance(outcome, BrokenProcessPool):
+                    raise outcome
+                self.stats.world_errors += 1
+                logger.warning(
+                    "Endgame world failed: %r STATE[%d] %s", outcome, index, state_strings[index]
+                )
+                continue
+            good.append((index, outcome))
+        return good
+
+    def _record_endgame(
+        self,
+        battle: Any,
+        order: BattleOrder | None,
+        policy: dict[str, float],
+        n_worlds: int,
+        time_ms: int,
+        started: float,
+        truth_state: str | None,
+        truth_status: str,
+        worlds: list[tuple[str, endgame_module.WorldMatrix]],
+        nash_info: list[dict[str, Any] | None] | None,
+        opp_facts: list[dict[str, Any]] | None,
+        ours: int,
+        theirs: int,
+    ) -> None:
+        try:
+            recorder = self._recorder
+            tag = battle.battle_tag
+            if not recorder.has_game(tag, self.username):
+                recorder.start_game(
+                    tag, self.username, role=getattr(battle, "player_role", None),
+                    battle_format=self.format, config=asdict(self.config),
+                    teams=getattr(self, "team_info", None),
+                )
+            records = [
+                endgame_module.world_record(
+                    s, w, nash_info[k] if nash_info and k < len(nash_info) else None
+                )
+                for k, (s, w) in enumerate(worlds)
+            ]
+            recorder.add_decision(
+                tag,
+                self.username,
+                {
+                    "turn": battle.turn,
+                    "side": "one",
+                    "worlds": records,
+                    "policy": policy,
+                    "nash": policy if nash_info is not None else None,
+                    "chosen": self.last_choice,
+                    "order": order.message if order is not None else None,
+                    "endgame": True,
+                    "endgame_mode": self.config.endgame,
+                    "endgame_alive": [ours, theirs],
+                    "endgame_depth": [w.depth for _, w in worlds],
+                    "endgame_values": endgame_module.safest_values([w for _, w in worlds]),
+                    "compute": {
+                        "search_time_ms": time_ms,
+                        "worlds_requested": n_worlds,
+                        "worlds_searched": len(worlds),
+                        "parallelism": self.config.parallelism,
+                        "threads": 1,
+                        "iterations": 0,
+                        "wall_ms": round((time.perf_counter() - started) * 1000, 1),
+                    },
+                    "quality": self.last_changes or None,
+                    "truth": {"state": truth_state} if truth_state else None,
+                    "truth_status": truth_status,
+                    "opp_facts": opp_facts,
+                },
+            )
+        except Exception:
+            logger.exception("Endgame recording failed in %s", battle.battle_tag)
 
     # -- soft belief (bead showdown-bot-1wu) -----------------------------------
 

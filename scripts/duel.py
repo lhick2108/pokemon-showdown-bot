@@ -105,6 +105,18 @@ def _parser() -> argparse.ArgumentParser:
                             "(also prunes status into an already-statused target)")
         p.add_argument(f"--{side}-tera-margin", type=float, default=0.0,
                        help="589.47: X-tera needs a mean this much above X, else it folds into X (0 = off)")
+    for side in ("net", "stock"):
+        p.add_argument(f"--{side}-endgame", choices=("off", "safest", "nash"), default="off",
+                       help=f"{side} side: exact expectiminimax in small endgames instead of MCTS "
+                            "(stock eval, no learned evaluator; default off)")
+    p.add_argument("--endgame-alive", type=int, default=5,
+                   help="endgame trigger: total alive Pokemon on both sides <= N (default 5)")
+    p.add_argument("--endgame-side", type=int, default=0,
+                   help="also require each side's alive <= N (0 = no per-side cap)")
+    p.add_argument("--endgame-ms", type=int, default=1500, help="per-world endgame search ms")
+    p.add_argument("--endgame-worlds", type=int, default=2, help="worlds per endgame decision")
+    p.add_argument("--endgame-cap-ms", type=int, default=4000,
+                   help="wall-clock budget one endgame decision must fit under (clamps --endgame-ms)")
     p.add_argument("--selection-gamma", type=float, default=0.1,
                    help="exploration rate in (0, 1] for exp3/rm sides")
     p.add_argument("--stock-uses-evaluator", action="store_true",
@@ -160,6 +172,14 @@ def _belief_fields(args, side: str) -> dict:
     return fields
 
 
+def _endgame_fields(args, side: str) -> dict:
+    return {
+        "endgame": getattr(args, f"{side}_endgame"), "endgame_max_alive": args.endgame_alive,
+        "endgame_max_side": args.endgame_side, "endgame_time_ms": args.endgame_ms,
+        "endgame_worlds": args.endgame_worlds, "endgame_cap_ms": args.endgame_cap_ms,
+    }
+
+
 def _quality(args, side: str) -> dict:
     """SearchConfig fields of the 589.47 decision-quality options for one side."""
     get = lambda name: getattr(args, f"{side}_{name}")  # noqa: E731
@@ -203,7 +223,8 @@ async def _duel_pair(args, share: int, pool, plans=None, live=None):
                           "eval_boost_scale": args.net_eval_boost_scale,
                           **_tendency_fields(args, args.net_tendency),
                           **_belief_fields(args, "net"),
-                          **_quality(args, "net")}),
+                          **_quality(args, "net"),
+                          **_endgame_fields(args, "net")}),
         executor=pool, **options,
     )
     if args.opponent_evaluator:
@@ -227,6 +248,7 @@ async def _duel_pair(args, share: int, pool, plans=None, live=None):
             **_tendency_fields(args, args.stock_tendency),
             **_belief_fields(args, "stock"),
             **_quality(args, "stock"),
+            **_endgame_fields(args, "stock"),
         }),
         executor=pool, **options,
     )
@@ -392,7 +414,8 @@ def main(argv=None) -> int:
           f"(gamma {args.selection_gamma:g} for exp3/rm); "
           f"mode: net={args.net_mode} stock={args.stock_mode}; "
           f"tendency: net={args.net_tendency} stock={args.stock_tendency}; "
-          f"belief: net={args.net_belief} stock={args.stock_belief}")
+          f"belief: net={args.net_belief} stock={args.stock_belief}; "
+          f"endgame: net={args.net_endgame} stock={args.stock_endgame}")
     for side in ("net", "stock"):
         q = _quality(args, side)
         if q["escalate"] or q["prune_noop"] or q["tera_margin"]:
@@ -413,7 +436,9 @@ def main(argv=None) -> int:
         fb = sum(p[idx].stats.fallbacks for p in pairs)
         st = [p[idx].stats for p in pairs]
         print(f"{label}: decisions={sum(x.searched for x in st)} escalations={sum(x.escalations for x in st)} "
-              f"noop_pruned={sum(x.noop_pruned for x in st)} tera_folded={sum(x.tera_folded for x in st)}")
+              f"noop_pruned={sum(x.noop_pruned for x in st)} tera_folded={sum(x.tera_folded for x in st)} "
+              f"endgame={sum(x.endgame_decisions for x in st)} "
+              f"endgame_fallbacks={sum(x.endgame_fallbacks for x in st)}")
         werr = sum(p[idx].stats.world_errors for p in pairs)
         print(compute.iterations_line(label, iters, ms, fallbacks=fb, world_errors=werr))
     print(f"wall time: {elapsed:.0f} s")
