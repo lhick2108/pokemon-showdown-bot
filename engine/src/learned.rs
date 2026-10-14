@@ -430,6 +430,77 @@ fn mlp_side<const H: usize, const V2: bool>(
     axpy_row::<H>(acc, alive_count as f32 / TEAM_SLOTS as f32, w1t, misc + 3);
 }
 
+/// First-layer pre-activations `b1 + W1 x` of the sparse fast path for `state` seen from
+/// `own` (the own side fills the "own" feature blocks, the other side the "opp" blocks).
+/// Shared by the value MLP (`own` = side one) and the policy prior (`prior.rs`).
+/// `model_id` keys the static-feature cache in `scratch`; a `Scratch` must only be used
+/// with one `own` perspective per model id.
+#[inline(always)]
+pub(crate) fn hidden_acc<const H: usize, const V2: bool>(
+    model_id: u64,
+    w1t: &[f32],
+    b1: &[f32],
+    state: &State,
+    own: SideReference,
+    scratch: &mut Scratch,
+) -> [f32; H] {
+    if scratch.cache_model != model_id || scratch.cache_vals.len() != CACHE_SETS * CACHE_WAYS * 2 * H {
+        scratch.cache_model = model_id;
+        scratch.cache_vals.clear();
+        scratch.cache_vals.resize(CACHE_SETS * CACHE_WAYS * 2 * H, 0.0);
+        scratch.cache_keys.clear();
+        scratch.cache_keys.resize(CACHE_SETS * CACHE_WAYS, [u64::MAX; 2]);
+        scratch.cache_recip.clear();
+        scratch.cache_recip.resize(CACHE_SETS * CACHE_WAYS, 1.0);
+        scratch.cache_next.clear();
+        scratch.cache_next.resize(CACHE_SETS, 0);
+    }
+    let mut acc = [0.0f32; H];
+    acc.copy_from_slice(&b1[..H]);
+    let (own_side, opp_side) = match own {
+        SideReference::SideOne => (&state.side_one, &state.side_two),
+        SideReference::SideTwo => (&state.side_two, &state.side_one),
+    };
+    mlp_side::<H, V2>(&mut acc, w1t, own_side, 0, scratch);
+    mlp_side::<H, V2>(&mut acc, w1t, opp_side, 1, scratch);
+
+    let field = 2 * PER_SIDE;
+    let weather = state.get_weather();
+    for (k, w) in [
+        Weather::SUN,
+        Weather::RAIN,
+        Weather::SAND,
+        Weather::HAIL,
+        Weather::SNOW,
+        Weather::HARSHSUN,
+        Weather::HEAVYRAIN,
+    ].iter().copied().enumerate()
+    {
+        if weather == w {
+            add_row::<H>(&mut acc, w1t, field + k);
+        }
+    }
+    let terrain = state.get_terrain();
+    for (k, t) in [
+        Terrain::ELECTRICTERRAIN,
+        Terrain::PSYCHICTERRAIN,
+        Terrain::MISTYTERRAIN,
+        Terrain::GRASSYTERRAIN,
+    ].iter().copied().enumerate()
+    {
+        if terrain == t {
+            add_row::<H>(&mut acc, w1t, field + 7 + k);
+        }
+    }
+    if state.trick_room.active {
+        add_row::<H>(&mut acc, w1t, field + 11);
+    }
+    if V2 {
+        features_v2::dynamic_blocks(&mut AccSink::<H> { acc: &mut acc, w1t }, state, own);
+    }
+    acc
+}
+
 #[inline]
 pub fn logistic(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
@@ -712,61 +783,7 @@ impl Evaluator {
         state: &State,
         scratch: &mut Scratch,
     ) -> f32 {
-        if scratch.cache_model != self.id || scratch.cache_vals.len() != CACHE_SETS * CACHE_WAYS * 2 * H {
-            scratch.cache_model = self.id;
-            scratch.cache_vals.clear();
-            scratch.cache_vals.resize(CACHE_SETS * CACHE_WAYS * 2 * H, 0.0);
-            scratch.cache_keys.clear();
-            scratch.cache_keys.resize(CACHE_SETS * CACHE_WAYS, [u64::MAX; 2]);
-            scratch.cache_recip.clear();
-            scratch.cache_recip.resize(CACHE_SETS * CACHE_WAYS, 1.0);
-            scratch.cache_next.clear();
-            scratch.cache_next.resize(CACHE_SETS, 0);
-        }
-        let mut acc = [0.0f32; H];
-        acc.copy_from_slice(&b1[..H]);
-        mlp_side::<H, V2>(&mut acc, w1t, &state.side_one, 0, scratch);
-        mlp_side::<H, V2>(&mut acc, w1t, &state.side_two, 1, scratch);
-
-        let field = 2 * PER_SIDE;
-        let weather = state.get_weather();
-        for (k, w) in [
-            Weather::SUN,
-            Weather::RAIN,
-            Weather::SAND,
-            Weather::HAIL,
-            Weather::SNOW,
-            Weather::HARSHSUN,
-            Weather::HEAVYRAIN,
-        ].iter().copied().enumerate()
-        {
-            if weather == w {
-                add_row::<H>(&mut acc, w1t, field + k);
-            }
-        }
-        let terrain = state.get_terrain();
-        for (k, t) in [
-            Terrain::ELECTRICTERRAIN,
-            Terrain::PSYCHICTERRAIN,
-            Terrain::MISTYTERRAIN,
-            Terrain::GRASSYTERRAIN,
-        ].iter().copied().enumerate()
-        {
-            if terrain == t {
-                add_row::<H>(&mut acc, w1t, field + 7 + k);
-            }
-        }
-        if state.trick_room.active {
-            add_row::<H>(&mut acc, w1t, field + 11);
-        }
-        if V2 {
-            features_v2::dynamic_blocks(
-                &mut AccSink::<H> { acc: &mut acc, w1t },
-                state,
-                SideReference::SideOne,
-            );
-        }
-
+        let acc = hidden_acc::<H, V2>(self.id, w1t, b1, state, SideReference::SideOne, scratch);
         let mut z = b2;
         for j in 0..H {
             z += acc[j].max(0.0) * w2[j];
@@ -928,6 +945,11 @@ impl Evaluator {
 pub struct LeafEval<'a> {
     learned: Option<&'a Evaluator>,
     scratch: Scratch,
+    /// scratch of the policy prior (`prior.rs`), one per side
+    pub prior_scratch: crate::prior::PriorScratch,
+    /// tree depth statistics of the search this worker runs (see `MctsResult::depth_max`)
+    pub depth_sum: u64,
+    pub depth_max: u32,
 }
 
 impl<'a> LeafEval<'a> {
@@ -935,7 +957,16 @@ impl<'a> LeafEval<'a> {
         LeafEval {
             learned,
             scratch: Scratch::new(),
+            prior_scratch: Default::default(),
+            depth_sum: 0,
+            depth_max: 0,
         }
+    }
+
+    #[inline]
+    pub fn note_depth(&mut self, depth: u32) {
+        self.depth_sum += depth as u64;
+        self.depth_max = self.depth_max.max(depth);
     }
 
     /// Raw value of a non-terminal position: stock evaluation points, or the

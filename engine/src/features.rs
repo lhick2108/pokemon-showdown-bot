@@ -419,7 +419,7 @@ pub fn feature_names() -> Vec<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::state::PokemonIndex;
 

@@ -235,12 +235,12 @@ pub const MOVE_SCALAR_NAMES: [&str; 7] = [
     "best_other_bp",
     "n_attack_types",
 ];
-const N_FLAGS: usize = MOVE_FLAG_NAMES.len();
+pub(crate) const N_FLAGS: usize = MOVE_FLAG_NAMES.len();
 pub const N_MOVE: usize = N_FLAGS + MOVE_SCALAR_NAMES.len();
 
 const ITEM_OFF: usize = 0;
 const ABILITY_OFF: usize = N_ITEM;
-const MOVE_OFF: usize = N_ITEM + N_ABILITY;
+pub(crate) const MOVE_OFF: usize = N_ITEM + N_ABILITY;
 /// Features per Pokemon block.
 pub const PM2: usize = N_ITEM + N_ABILITY + N_MOVE;
 
@@ -279,15 +279,15 @@ pub fn mon_base(side_no: usize, slot: usize) -> usize {
 // Per-Pokemon static block
 // ---------------------------------------------------------------------------
 
-fn moves_of(p: &Pokemon) -> [&Move; 4] {
+pub(crate) fn moves_of(p: &Pokemon) -> [&Move; 4] {
     [&p.moves.m0, &p.moves.m1, &p.moves.m2, &p.moves.m3]
 }
 
-fn is_damaging(c: &Choice) -> bool {
+pub(crate) fn is_damaging(c: &Choice) -> bool {
     c.category != MoveCategory::Status && c.base_power > 0.0
 }
 
-fn has_stab(p: &Pokemon, t: PokemonType) -> bool {
+pub(crate) fn has_stab(p: &Pokemon, t: PokemonType) -> bool {
     p.types.0 == t || p.types.1 == t || (p.terastallized && p.tera_type == t)
 }
 
@@ -300,142 +300,156 @@ fn type_idx(t: PokemonType) -> Option<usize> {
     }
 }
 
+/// Running summary of the move-property features over a Pokemon's moves.
+#[derive(Default)]
+pub(crate) struct MoveAcc {
+    pub flags: [bool; N_FLAGS],
+    pub recovery_frac: f32,
+    pub setup_stages: i32,
+    pub n_damaging: u32,
+    pub n_status: u32,
+    pub best_stab: f32,
+    pub best_other: f32,
+    /// bitmask of the types of damaging moves
+    pub attack_types: u32,
+}
+
+/// Folds one move of `p` into `acc` (the loop body of `static_block`; also used on its own to
+/// describe a single move for the policy prior).
+pub(crate) fn accumulate_move(acc: &mut MoveAcc, p: &Pokemon, m: &Move) {
+    if m.id == Choices::NONE {
+        return;
+    }
+    let c = &m.choice;
+    let dmg = is_damaging(c);
+    if dmg {
+        acc.n_damaging += 1;
+        if let Some(t) = type_idx(c.move_type) {
+            acc.attack_types |= 1 << t;
+        }
+        if has_stab(p, c.move_type) {
+            acc.best_stab = acc.best_stab.max(c.base_power);
+        } else {
+            acc.best_other = acc.best_other.max(c.base_power);
+        }
+        if c.priority > 0 && !matches!(m.id, Choices::FAKEOUT | Choices::FIRSTIMPRESSION) {
+            acc.flags[9] = true;
+        }
+        if c.drain.is_some() {
+            acc.flags[3] = true;
+        }
+    } else if c.category == MoveCategory::Status {
+        acc.n_status += 1;
+    }
+    if c.recoil.is_some() || c.crash.is_some() {
+        acc.flags[25] = true;
+    }
+    if let Some(h) = &c.heal {
+        if h.target == MoveTarget::User && h.amount > 0.0 {
+            acc.flags[0] = true;
+            acc.recovery_frac = acc.recovery_frac.max(h.amount);
+        }
+    }
+    match m.id {
+        Choices::REST => {
+            acc.flags[0] = true;
+            acc.flags[1] = true;
+            acc.recovery_frac = acc.recovery_frac.max(1.0);
+        }
+        Choices::WISH => {
+            acc.flags[2] = true;
+            acc.recovery_frac = acc.recovery_frac.max(0.5);
+        }
+        Choices::FAKEOUT | Choices::FIRSTIMPRESSION => acc.flags[10] = true,
+        Choices::RAPIDSPIN
+        | Choices::DEFOG
+        | Choices::MORTALSPIN
+        | Choices::COURTCHANGE
+        | Choices::TIDYUP => acc.flags[13] = true,
+        Choices::PROTECT
+        | Choices::DETECT
+        | Choices::SPIKYSHIELD
+        | Choices::BANEFULBUNKER
+        | Choices::KINGSSHIELD
+        | Choices::SILKTRAP
+        | Choices::BURNINGBULWARK
+        | Choices::OBSTRUCT => acc.flags[19] = true,
+        Choices::SUBSTITUTE | Choices::SHEDTAIL => acc.flags[20] = true,
+        Choices::REFLECT | Choices::LIGHTSCREEN | Choices::AURORAVEIL => acc.flags[21] = true,
+        Choices::LEECHSEED => acc.flags[22] = true,
+        Choices::TAUNT | Choices::ENCORE | Choices::TORMENT | Choices::DISABLE | Choices::YAWN => {
+            acc.flags[23] = true
+        }
+        Choices::EXPLOSION | Choices::SELFDESTRUCT | Choices::MISTYEXPLOSION => acc.flags[24] = true,
+        Choices::HEALBELL | Choices::AROMATHERAPY => acc.flags[26] = true,
+        Choices::SUNNYDAY
+        | Choices::RAINDANCE
+        | Choices::SANDSTORM
+        | Choices::SNOWSCAPE
+        | Choices::CHILLYRECEPTION
+        | Choices::TRICKROOM
+        | Choices::TAILWIND => acc.flags[27] = true,
+        Choices::TRICK | Choices::SWITCHEROO => acc.flags[28] = true,
+        Choices::SLEEPTALK => acc.flags[29] = true,
+        Choices::BELLYDRUM => {
+            acc.flags[4] = true;
+            acc.setup_stages = acc.setup_stages.max(6);
+        }
+        _ => {}
+    }
+    if c.flags.pivot {
+        acc.flags[11] = true;
+    }
+    if c.flags.drag {
+        acc.flags[18] = true;
+    }
+    if let Some(sc) = &c.side_condition {
+        if sc.target == MoveTarget::Opponent
+            && matches!(sc.condition, SC::Stealthrock | SC::Spikes | SC::ToxicSpikes | SC::StickyWeb)
+        {
+            acc.flags[12] = true;
+        }
+    }
+    if c.category == MoveCategory::Status {
+        if let Some(st) = &c.status {
+            if st.target == MoveTarget::Opponent {
+                match st.status {
+                    PokemonStatus::SLEEP => acc.flags[14] = true,
+                    PokemonStatus::PARALYZE => acc.flags[15] = true,
+                    PokemonStatus::BURN => acc.flags[16] = true,
+                    PokemonStatus::POISON | PokemonStatus::TOXIC => acc.flags[17] = true,
+                    _ => {}
+                }
+            }
+        }
+        if let Some(b) = &c.boost {
+            if b.target == MoveTarget::User {
+                let bs = &b.boosts;
+                let stats = [bs.attack, bs.defense, bs.special_attack, bs.special_defense, bs.speed];
+                let mut total = 0i32;
+                for (i, s) in stats.iter().enumerate() {
+                    if *s > 0 {
+                        acc.flags[4 + i] = true;
+                        total += *s as i32;
+                    }
+                }
+                acc.setup_stages = acc.setup_stages.max(total);
+            }
+        }
+    }
+}
+
 /// Emits the item / ability / move-property features of one Pokemon block at `base`.
 /// Depends only on item, ability, types, tera type, terastallized and the four move ids.
 pub fn static_block<S: Sink>(sink: &mut S, base: usize, p: &Pokemon) {
     sink.one(base + ITEM_OFF + item_slot(p.item));
     sink.one(base + ABILITY_OFF + ability_slot(p.ability));
 
-    let mut flags = [false; N_FLAGS];
-    let mut recovery_frac = 0.0f32;
-    let mut setup_stages = 0i32;
-    let mut n_damaging = 0u32;
-    let mut n_status = 0u32;
-    let mut best_stab = 0.0f32;
-    let mut best_other = 0.0f32;
-    let mut attack_types = 0u32; // bitmask of the types of damaging moves
+    let mut acc = MoveAcc::default();
     for m in moves_of(p) {
-        if m.id == Choices::NONE {
-            continue;
-        }
-        let c = &m.choice;
-        let dmg = is_damaging(c);
-        if dmg {
-            n_damaging += 1;
-            if let Some(t) = type_idx(c.move_type) {
-                attack_types |= 1 << t;
-            }
-            if has_stab(p, c.move_type) {
-                best_stab = best_stab.max(c.base_power);
-            } else {
-                best_other = best_other.max(c.base_power);
-            }
-            if c.priority > 0 && !matches!(m.id, Choices::FAKEOUT | Choices::FIRSTIMPRESSION) {
-                flags[9] = true;
-            }
-            if c.drain.is_some() {
-                flags[3] = true;
-            }
-        } else if c.category == MoveCategory::Status {
-            n_status += 1;
-        }
-        if c.recoil.is_some() || c.crash.is_some() {
-            flags[25] = true;
-        }
-        if let Some(h) = &c.heal {
-            if h.target == MoveTarget::User && h.amount > 0.0 {
-                flags[0] = true;
-                recovery_frac = recovery_frac.max(h.amount);
-            }
-        }
-        match m.id {
-            Choices::REST => {
-                flags[0] = true;
-                flags[1] = true;
-                recovery_frac = recovery_frac.max(1.0);
-            }
-            Choices::WISH => {
-                flags[2] = true;
-                recovery_frac = recovery_frac.max(0.5);
-            }
-            Choices::FAKEOUT | Choices::FIRSTIMPRESSION => flags[10] = true,
-            Choices::RAPIDSPIN
-            | Choices::DEFOG
-            | Choices::MORTALSPIN
-            | Choices::COURTCHANGE
-            | Choices::TIDYUP => flags[13] = true,
-            Choices::PROTECT
-            | Choices::DETECT
-            | Choices::SPIKYSHIELD
-            | Choices::BANEFULBUNKER
-            | Choices::KINGSSHIELD
-            | Choices::SILKTRAP
-            | Choices::BURNINGBULWARK
-            | Choices::OBSTRUCT => flags[19] = true,
-            Choices::SUBSTITUTE | Choices::SHEDTAIL => flags[20] = true,
-            Choices::REFLECT | Choices::LIGHTSCREEN | Choices::AURORAVEIL => flags[21] = true,
-            Choices::LEECHSEED => flags[22] = true,
-            Choices::TAUNT | Choices::ENCORE | Choices::TORMENT | Choices::DISABLE | Choices::YAWN => {
-                flags[23] = true
-            }
-            Choices::EXPLOSION | Choices::SELFDESTRUCT | Choices::MISTYEXPLOSION => flags[24] = true,
-            Choices::HEALBELL | Choices::AROMATHERAPY => flags[26] = true,
-            Choices::SUNNYDAY
-            | Choices::RAINDANCE
-            | Choices::SANDSTORM
-            | Choices::SNOWSCAPE
-            | Choices::CHILLYRECEPTION
-            | Choices::TRICKROOM
-            | Choices::TAILWIND => flags[27] = true,
-            Choices::TRICK | Choices::SWITCHEROO => flags[28] = true,
-            Choices::SLEEPTALK => flags[29] = true,
-            Choices::BELLYDRUM => {
-                flags[4] = true;
-                setup_stages = setup_stages.max(6);
-            }
-            _ => {}
-        }
-        if c.flags.pivot {
-            flags[11] = true;
-        }
-        if c.flags.drag {
-            flags[18] = true;
-        }
-        if let Some(sc) = &c.side_condition {
-            if sc.target == MoveTarget::Opponent
-                && matches!(sc.condition, SC::Stealthrock | SC::Spikes | SC::ToxicSpikes | SC::StickyWeb)
-            {
-                flags[12] = true;
-            }
-        }
-        if c.category == MoveCategory::Status {
-            if let Some(st) = &c.status {
-                if st.target == MoveTarget::Opponent {
-                    match st.status {
-                        PokemonStatus::SLEEP => flags[14] = true,
-                        PokemonStatus::PARALYZE => flags[15] = true,
-                        PokemonStatus::BURN => flags[16] = true,
-                        PokemonStatus::POISON | PokemonStatus::TOXIC => flags[17] = true,
-                        _ => {}
-                    }
-                }
-            }
-            if let Some(b) = &c.boost {
-                if b.target == MoveTarget::User {
-                    let bs = &b.boosts;
-                    let stats = [bs.attack, bs.defense, bs.special_attack, bs.special_defense, bs.speed];
-                    let mut total = 0i32;
-                    for (i, s) in stats.iter().enumerate() {
-                        if *s > 0 {
-                            flags[4 + i] = true;
-                            total += *s as i32;
-                        }
-                    }
-                    setup_stages = setup_stages.max(total);
-                }
-            }
-        }
+        accumulate_move(&mut acc, p, m);
     }
+    let MoveAcc { flags, recovery_frac, setup_stages, n_damaging, n_status, best_stab, best_other, attack_types } = acc;
     for (i, f) in flags.iter().enumerate() {
         if *f {
             sink.one(base + MOVE_OFF + i);
@@ -485,7 +499,7 @@ pub fn static_key(p: &Pokemon) -> [u64; 2] {
 // Active-vs-active block (recomputed per evaluation)
 // ---------------------------------------------------------------------------
 
-fn stage_mult(b: i8) -> f32 {
+pub(crate) fn stage_mult(b: i8) -> f32 {
     if b >= 0 {
         (2 + b as i32) as f32 / 2.0
     } else {
@@ -493,7 +507,7 @@ fn stage_mult(b: i8) -> f32 {
     }
 }
 
-fn effective_speed(p: &Pokemon, side: &Side) -> f32 {
+pub(crate) fn effective_speed(p: &Pokemon, side: &Side) -> f32 {
     let mut s = p.speed as f32 * stage_mult(side.speed_boost);
     if p.status == PokemonStatus::PARALYZE && p.ability != Abilities::QUICKFEET {
         s *= 0.5;
@@ -508,7 +522,7 @@ fn effective_speed(p: &Pokemon, side: &Side) -> f32 {
 }
 
 /// Ability immunity to a move type (a small, common subset).
-fn ability_immune(def: &Pokemon, t: PokemonType) -> bool {
+pub(crate) fn ability_immune(def: &Pokemon, t: PokemonType) -> bool {
     match def.ability {
         Abilities::LEVITATE => t == PokemonType::GROUND,
         Abilities::VOLTABSORB | Abilities::LIGHTNINGROD | Abilities::MOTORDRIVE => t == PokemonType::ELECTRIC,

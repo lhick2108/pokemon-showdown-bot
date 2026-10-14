@@ -37,16 +37,20 @@ impl SelectionMode {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct SelectionConfig {
+pub struct SelectionConfig<'a> {
     pub mode: SelectionMode,
     pub gamma: f64,
+    /// Policy priors (PUCT selection, `prior.rs`). `None` (the default) is the stock search.
+    /// Only meaningful with `SelectionMode::Ucb1`.
+    pub prior: Option<crate::prior::PriorConfig<'a>>,
 }
 
-impl Default for SelectionConfig {
+impl Default for SelectionConfig<'_> {
     fn default() -> Self {
         SelectionConfig {
             mode: SelectionMode::Ucb1,
             gamma: 0.1,
+            prior: None,
         }
     }
 }
@@ -197,8 +201,8 @@ mod tests {
     use rand::rngs::StdRng;
     use rand::SeedableRng;
 
-    fn cfg(mode: SelectionMode, gamma: f64) -> SelectionConfig {
-        SelectionConfig { mode, gamma }
+    fn cfg(mode: SelectionMode, gamma: f64) -> SelectionConfig<'static> {
+        SelectionConfig { mode, gamma, prior: None }
     }
 
     #[test]

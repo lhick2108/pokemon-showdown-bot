@@ -32,6 +32,65 @@ def get_evaluator(path: str, scale: float = 1.0):
     return evaluator
 
 
+# Policy priors (``.ppol``) and human models loaded in this worker process, by path.
+_PRIORS: dict[str, object] = {}
+_HUMAN: dict[str, object] = {}
+
+
+def get_prior(path: str):
+    """The ``poke_engine.PolicyPrior`` for ``path``, loaded once per process."""
+    prior = _PRIORS.get(path)
+    if prior is None:
+        from poke_engine import PolicyPrior
+
+        prior = _PRIORS[path] = PolicyPrior.load(path)
+    return prior
+
+
+def _human_root_prior(state, state_string: str, path: str, elo) -> dict[str, float]:
+    """The human action model's distribution over side two's root options (root-only prior)."""
+    import poke_engine
+
+    model = _HUMAN.get(path)
+    if model is None:
+        from showdown_bot.human_policy import HumanPolicy
+
+        model = _HUMAN[path] = HumanPolicy.load(path)
+    choices = [c for c, _slot in poke_engine.policy_actions(state, 2)]
+    return model.predict(state_string, choices, elo, side=2)
+
+
+def prior_kwargs(
+    state,
+    state_string: str,
+    prior_path: str | None,
+    prior_opp: str,
+    c_puct: float,
+    prior_eps: float,
+    prior_fpu: float,
+    human_path: str | None,
+    human_elo,
+) -> dict:
+    """``monte_carlo_tree_search`` keywords for the PUCT prior settings.
+
+    ``prior_opp``: ``self`` (our net mirrored for the opponent), ``none`` (the opponent keeps
+    UCB1), ``human`` (mirrored net below the root, the human model at the root) or a ``.ppol``
+    path (a different net for the opponent).
+    """
+    out: dict = {"c_puct": float(c_puct), "prior_eps": float(prior_eps), "fpu_reduction": float(prior_fpu)}
+    net = get_prior(prior_path) if prior_path else None
+    out["prior"] = net
+    if prior_opp in ("self", "human"):
+        out["prior_opp"] = net
+    elif prior_opp != "none":
+        out["prior_opp"] = get_prior(prior_opp)
+    if prior_opp == "human":
+        if not human_path:
+            raise RuntimeError("prior_opp=human needs a human-policy model path")
+        out["root_prior_s2"] = _human_root_prior(state, state_string, human_path, human_elo)
+    return out
+
+
 class OppTuple(tuple):
     """A search result tuple that also carries ``opp``: the opponent's ``(choice, visits)``
     root options (soft belief, bead showdown-bot-1wu).  Equal to the plain tuple; the
@@ -61,6 +120,13 @@ def search_world(
     eval_boost_scale: float = 1.0,
     opp_names: bool = False,
     opp_visits: bool = False,
+    prior_path: str | None = None,
+    prior_opp: str = "self",
+    c_puct: float = 1.0,
+    prior_eps: float = 0.03,
+    prior_fpu: float = 0.0,
+    human_path: str | None = None,
+    human_elo=None,
     export_nodes: int = 0,
     export_min_visits: int = 16,
 ) -> tuple:
@@ -80,6 +146,8 @@ def search_world(
     opponent's option choice strings, aligned with the joint matrix columns.
     With ``opp_visits`` the result is an ``OppTuple`` whose ``.opp`` lists the opponent's
     (side_two) root ``(choice, visits)`` options.
+    With ``prior_path`` (a ``.ppol`` policy net) side one's selection becomes PUCT; see
+    ``prior_kwargs`` for ``prior_opp``. Single-threaded only; the result shape is unchanged.
     With ``export_nodes`` > 0 (single-threaded only) the result is an ``OppTuple`` whose
     ``.nodes`` lists up to that many sampled interior search nodes as
     ``(state, visits, value, static_value, depth)`` (values are absolute P(side one wins); see
@@ -108,6 +176,13 @@ def search_world(
             kwargs["gamma"] = float(selection_gamma)
         if joint:
             kwargs["return_joint"] = True
+        if prior_path:
+            if threads > 1:
+                raise RuntimeError("policy priors need threads == 1")
+            kwargs.update(prior_kwargs(
+                state, state_string, prior_path, prior_opp, c_puct, prior_eps, prior_fpu,
+                human_path, human_elo,
+            ))
         if export_nodes:
             kwargs["export_nodes"] = int(export_nodes)
             kwargs["export_min_visits"] = int(export_min_visits)

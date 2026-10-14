@@ -142,6 +142,8 @@ class MctsResult:
     side_two: list[MctsSideResult]
     total_visits: int
     joint: "list[tuple[int, int, int, float]] | None" = None
+    depth_max: int = 0
+    depth_mean: float = 0.0
     nodes: "list[tuple[str, int, float, float, int]] | None" = None
     root_value: float = float("nan")
     root_search_value: float = float("nan")
@@ -169,6 +171,8 @@ class MctsResult:
             ],
             total_visits=rust_result.iteration_count,
             joint=(None if rust_result.joint is None else list(rust_result.joint)),
+            depth_max=rust_result.depth_max,
+            depth_mean=rust_result.depth_mean,
             nodes=(None if rust_result.nodes is None else list(rust_result.nodes)),
             root_value=rust_result.root_value,
             root_search_value=rust_result.root_search_value,
@@ -184,6 +188,13 @@ def monte_carlo_tree_search(
     selection: str = "ucb1",
     gamma: float = 0.1,
     return_joint: bool = False,
+    prior: "PolicyPrior | None" = None,
+    prior_opp: "PolicyPrior | None" = None,
+    c_puct: float = 1.0,
+    prior_eps: float = 0.03,
+    fpu_reduction: float = 0.0,
+    root_prior_s1: "dict[str, float] | None" = None,
+    root_prior_s2: "dict[str, float] | None" = None,
     export_nodes: int = 0,
     export_min_visits: int = 16,
 ) -> MctsResult:
@@ -209,18 +220,27 @@ def monte_carlo_tree_search(
     :param return_joint: also return the root joint-action matrix (``MctsResult.joint``);
         single-threaded only (threads > 1 raises ValueError)
     :type return_joint: bool
+    :param prior: a ``PolicyPrior`` for side one: switches side one's selection from UCB1 to PUCT
+        (``Q + c_puct * P * sqrt(N) / (1 + n)``). None keeps UCB1 for that side
+    :param prior_opp: same for side two (evaluated from side two's perspective). Pass the same
+        object as ``prior`` to mirror it
+    :param c_puct: PUCT exploration constant; ``prior_eps`` mixes the prior with uniform;
+        ``fpu_reduction`` is subtracted from the parent mean to value unvisited options
+    :param root_prior_s1: / ``root_prior_s2``: ``{choice: probability}`` that replaces the net's
+        prior at the root only (e.g. a human action model for the opponent)
+    :return: the result of the search (``depth_max`` / ``depth_mean`` are tree depth statistics)
     :param export_nodes: also return up to this many sampled interior nodes of the search tree
         (``MctsResult.nodes``; sampled without replacement, probability proportional to visits,
         among nodes with at least ``export_min_visits`` visits); 0 = off. Single-threaded only
     :type export_nodes: int
     :param export_min_visits: minimum visits of an exported node
     :type export_min_visits: int
-    :return: the result of the search
     :rtype: MctsResult
     """
     return MctsResult._from_rust(
         mcts(
             state, duration_ms, iterations, threads, evaluator, selection, gamma, return_joint,
+            prior, prior_opp, c_puct, prior_eps, fpu_reduction, root_prior_s1, root_prior_s2,
             export_nodes, export_min_visits,
         )
     )

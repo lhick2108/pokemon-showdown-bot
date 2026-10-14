@@ -17,6 +17,9 @@ use poke_engine::features::{
 };
 use poke_engine::learned::{Evaluator, Scratch};
 use poke_engine::mcts::{perform_mcts_export, ExportConfig, MctsResult, MctsSideResult};
+use poke_engine::prior::{
+    action_features, action_slot, PolicyNet, PolicyWeights, PriorConfig, N_ACTIONS, N_AFEAT, N_EMB,
+};
 use poke_engine::selection::{SelectionConfig, SelectionMode};
 use poke_engine::mcts_threaded::perform_mcts_shared_tree_with;
 use poke_engine::pokemon::PokemonName;
@@ -884,6 +887,8 @@ struct PyMctsResult {
     s1: Vec<PyMctsSideResult>,
     s2: Vec<PyMctsSideResult>,
     iteration_count: u32,
+    depth_max: u32,
+    depth_mean: f32,
     /// (s1 index, s2 index, visits, mean score for side one); None unless return_joint
     joint: Option<Vec<(usize, usize, u32, f32)>>,
     /// sampled interior search nodes (state string, visits, search value, static value,
@@ -909,6 +914,8 @@ impl PyMctsResult {
                 .map(|r| PyMctsSideResult::from_mcts_side_result(r.clone(), &state.side_two))
                 .collect(),
             iteration_count: result.iteration_count,
+            depth_max: result.depth_max,
+            depth_mean: result.depth_mean,
             joint: result
                 .joint
                 .map(|cells| cells.iter().map(|c| (c.s1, c.s2, c.visits, c.mean)).collect()),
@@ -1084,6 +1091,138 @@ impl PyEvaluator {
 }
 
 /// The stock hand-written evaluation of `state` (eval points, side one's view).
+/// A learned policy prior (`.ppol`) for PUCT selection in MCTS. See docs/policy-prior.md.
+#[derive(Clone)]
+#[pyclass(name = "PolicyPrior", module = "poke_engine", from_py_object)]
+struct PyPolicyPrior {
+    inner: Arc<PolicyNet>,
+}
+
+fn root_options(state: &State, side: u8) -> (&Side, Vec<MoveChoice>) {
+    let (o1, o2) = state.root_get_all_options();
+    if side == 1 {
+        (&state.side_one, o1)
+    } else {
+        (&state.side_two, o2)
+    }
+}
+
+#[pymethods]
+impl PyPolicyPrior {
+    #[staticmethod]
+    fn load(path: &str) -> PyResult<PyPolicyPrior> {
+        Ok(PyPolicyPrior { inner: Arc::new(PolicyNet::load(path).map_err(value_err)?) })
+    }
+
+    /// Flat row-major weights in file order: `w1` [hidden][feature_len], `w2` [13][hidden],
+    /// `p` [emb][hidden], `a` [emb][n_afeat] (see engine/src/prior.rs).
+    #[staticmethod]
+    #[pyo3(signature = (w1, b1, w2, b2, p, c, a, v, feature_version=2))]
+    #[allow(clippy::too_many_arguments)]
+    fn mlp(
+        w1: Vec<f32>,
+        b1: Vec<f32>,
+        w2: Vec<f32>,
+        b2: Vec<f32>,
+        p: Vec<f32>,
+        c: Vec<f32>,
+        a: Vec<f32>,
+        v: Vec<f32>,
+        feature_version: u32,
+    ) -> PyResult<PyPolicyPrior> {
+        let hidden = b1.len();
+        let net = PolicyNet::new(feature_version, hidden, PolicyWeights { w1, b1, w2, b2, p, c, a, v })
+            .map_err(value_err)?;
+        Ok(PyPolicyPrior { inner: Arc::new(net) })
+    }
+
+    fn save(&self, path: &str) -> PyResult<()> {
+        self.inner.save(path).map_err(value_err)
+    }
+
+    #[getter]
+    fn hidden_size(&self) -> usize {
+        self.inner.hidden_size()
+    }
+
+    #[getter]
+    fn feature_version(&self) -> u32 {
+        self.inner.feature_version()
+    }
+
+    /// Raw logits of the legal root options of `side` (1 or 2): [(choice, slot, logit)].
+    #[pyo3(signature = (py_state, side=1))]
+    fn option_logits(&self, py_state: PyState, side: u8) -> PyResult<Vec<(String, i32, f32)>> {
+        let r = side_ref(side)?;
+        let state: State = py_state.into();
+        let (own, opts) = root_options(&state, side);
+        let mut scratch = Scratch::new();
+        let z = self.inner.option_logits(&state, r, &opts, &mut scratch);
+        Ok(opts
+            .iter()
+            .zip(z)
+            .map(|(o, z)| {
+                (movechoice_to_string(own, o), action_slot(own, o).map(|s| s as i32).unwrap_or(-1), z)
+            })
+            .collect())
+    }
+
+    /// Softmax prior over the legal root options of `side`: [(choice, probability)].
+    #[pyo3(signature = (py_state, side=1))]
+    fn priors(&self, py_state: PyState, side: u8) -> PyResult<Vec<(String, f32)>> {
+        let rows = self.option_logits(py_state, side)?;
+        let max = rows.iter().map(|r| r.2).fold(f32::NEG_INFINITY, f32::max);
+        let e: Vec<f32> = rows.iter().map(|r| (r.2 - max).exp()).collect();
+        let sum: f32 = e.iter().sum();
+        Ok(rows.into_iter().zip(e).map(|(r, x)| (r.0, x / sum)).collect())
+    }
+}
+
+fn side_ref(side: u8) -> PyResult<SideReference> {
+    match side {
+        1 => Ok(SideReference::SideOne),
+        2 => Ok(SideReference::SideTwo),
+        _ => Err(value_err(format!("side must be 1 or 2, got {side}"))),
+    }
+}
+
+/// The legal root options of `side` with their action slot (-1: none) and the `N_POLICY_AFEAT`
+/// action features the policy prior sees: [(choice, slot, features)]. Training code must use
+/// this (it is the engine's own computation) to build inputs and targets.
+#[pyfunction]
+#[pyo3(signature = (py_state, side=1))]
+fn policy_action_features(py_state: PyState, side: u8) -> PyResult<Vec<(String, i32, Vec<f32>)>> {
+    let r = side_ref(side)?;
+    let state: State = py_state.into();
+    let (own, opts) = root_options(&state, side);
+    Ok(opts
+        .iter()
+        .map(|o| {
+            let mut f = [0.0f32; N_AFEAT];
+            action_features(&state, r, o, &mut f);
+            (
+                movechoice_to_string(own, o),
+                action_slot(own, o).map(|s| s as i32).unwrap_or(-1),
+                f.to_vec(),
+            )
+        })
+        .collect())
+}
+
+/// The root options of `side` as `(choice string, action slot)`; slot is -1 for an option with
+/// no learned slot.
+#[pyfunction]
+#[pyo3(signature = (py_state, side=1))]
+fn policy_actions(py_state: PyState, side: u8) -> PyResult<Vec<(String, i32)>> {
+    side_ref(side)?;
+    let state: State = py_state.into();
+    let (own, opts) = root_options(&state, side);
+    Ok(opts
+        .iter()
+        .map(|o| (movechoice_to_string(own, o), action_slot(own, o).map(|s| s as i32).unwrap_or(-1)))
+        .collect())
+}
+
 #[pyfunction(name = "evaluate")]
 fn stock_evaluate(py_state: PyState) -> f32 {
     let state: State = py_state.into();
@@ -1147,7 +1286,7 @@ fn feature_length(version: Option<u32>) -> PyResult<usize> {
 }
 
 #[pyfunction]
-#[pyo3(signature = (py_state, duration_ms, iterations, threads, evaluator=None, selection="ucb1", gamma=0.1, return_joint=false, export_nodes=0, export_min_visits=16))]
+#[pyo3(signature = (py_state, duration_ms, iterations, threads, evaluator=None, selection="ucb1", gamma=0.1, return_joint=false, prior=None, prior_opp=None, c_puct=1.0, prior_eps=0.03, fpu_reduction=0.0, root_prior_s1=None, root_prior_s2=None, export_nodes=0, export_min_visits=16))]
 fn mcts(
     py_state: PyState,
     duration_ms: u64,
@@ -1157,6 +1296,13 @@ fn mcts(
     selection: &str,
     gamma: f64,
     return_joint: bool,
+    prior: Option<PyPolicyPrior>,
+    prior_opp: Option<PyPolicyPrior>,
+    c_puct: f32,
+    prior_eps: f32,
+    fpu_reduction: f32,
+    root_prior_s1: Option<std::collections::HashMap<String, f32>>,
+    root_prior_s2: Option<std::collections::HashMap<String, f32>>,
     export_nodes: usize,
     export_min_visits: u32,
 ) -> PyResult<PyMctsResult> {
@@ -1180,6 +1326,20 @@ fn mcts(
             "return_joint is single-threaded only (use threads=1)",
         ));
     }
+    let use_prior = prior.is_some() || prior_opp.is_some() || root_prior_s1.is_some() || root_prior_s2.is_some();
+    if use_prior {
+        if mode != SelectionMode::Ucb1 {
+            return Err(value_err("policy priors (PUCT) need selection=\"ucb1\"".to_string()));
+        }
+        if threads > 1 {
+            return Err(value_err("policy priors are single-threaded only (use threads=1)".to_string()));
+        }
+        if !(c_puct.is_finite() && c_puct > 0.0) || !(0.0..1.0).contains(&prior_eps) || !fpu_reduction.is_finite() {
+            return Err(value_err(format!(
+                "need c_puct > 0 and 0 <= prior_eps < 1 (got c_puct={c_puct}, prior_eps={prior_eps})"
+            )));
+        }
+    }
     if export_nodes > 0 && threads > 1 {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "export_nodes is single-threaded only (use threads=1)",
@@ -1189,11 +1349,33 @@ fn mcts(
         max_nodes: export_nodes,
         min_visits: export_min_visits.max(1),
     };
-    let selection_config = SelectionConfig { mode, gamma };
     let evaluator_ref: Option<&Evaluator> = evaluator.as_ref().map(|e| e.inner.as_ref());
     let mut state: State = py_state.into();
     let duration = Duration::from_millis(duration_ms);
     let (s1_options, s2_options) = state.root_get_all_options();
+    // root-only overrides, aligned with the root option order (unlisted options get 0)
+    let root_vec = |m: &Option<std::collections::HashMap<String, f32>>, side: &Side, opts: &[MoveChoice]| {
+        m.as_ref().map(|m| {
+            opts.iter()
+                .map(|o| m.get(&movechoice_to_string(side, o)).copied().unwrap_or(0.0))
+                .collect::<Vec<f32>>()
+        })
+    };
+    let root_s1 = root_vec(&root_prior_s1, &state.side_one, &s1_options);
+    let root_s2 = root_vec(&root_prior_s2, &state.side_two, &s2_options);
+    let prior_config = if use_prior {
+        let mut pc = PriorConfig::new(c_puct);
+        pc.net_s1 = prior.as_ref().map(|p| p.inner.as_ref());
+        pc.net_s2 = prior_opp.as_ref().map(|p| p.inner.as_ref());
+        pc.root_s1 = root_s1.as_deref();
+        pc.root_s2 = root_s2.as_deref();
+        pc.eps = prior_eps;
+        pc.fpu_reduction = fpu_reduction;
+        Some(pc)
+    } else {
+        None
+    };
+    let selection_config = SelectionConfig { mode, gamma, prior: prior_config };
     if s1_options.len() <= 1 {
         iterations = 100; // if there's only one option, force a quick exit
     }
@@ -1416,6 +1598,12 @@ fn py_poke_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("FEATURE_VERSIONS", vec![1u32, 2u32])?;
     m.add_function(wrap_pyfunction!(feature_length, m)?)?;
     m.add_class::<PyEvaluator>()?;
+    m.add_class::<PyPolicyPrior>()?;
+    m.add_function(wrap_pyfunction!(policy_actions, m)?)?;
+    m.add_function(wrap_pyfunction!(policy_action_features, m)?)?;
+    m.add("N_POLICY_ACTIONS", N_ACTIONS)?;
+    m.add("N_POLICY_AFEAT", N_AFEAT)?;
+    m.add("N_POLICY_EMB", N_EMB)?;
     m.add_class::<PyState>()?;
     m.add_class::<PySide>()?;
     m.add_class::<PySideConditions>()?;

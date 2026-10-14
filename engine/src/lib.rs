@@ -25,6 +25,7 @@ pub mod mcts;
 pub mod mcts_threaded;
 pub mod selection;
 pub mod pokemon;
+pub mod prior;
 pub mod search;
 pub mod state;
 
