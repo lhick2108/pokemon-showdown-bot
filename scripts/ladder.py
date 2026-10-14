@@ -48,6 +48,8 @@ def _parser() -> argparse.ArgumentParser:
                    help="append one JSON line per battle (default data/ladder/ab.jsonl)")
     p.add_argument("--dry-run", action="store_true",
                    help="ladder on the LOCAL server 127.0.0.1:8000 with throwaway accounts")
+    p.add_argument("--dry-opponent", default="heuristics", metavar="PLAYER",
+                   help="--dry-run only: registered bot that plays the ladder opposite (default heuristics)")
     p.add_argument("--accept-challenges", action="store_true",
                    help="challenge mode: accept gen9randombattle challenges (one battle at a "
                         "time, others are rejected) instead of laddering; --games = battles to play")
@@ -162,6 +164,33 @@ class Run:
             except Exception:
                 logger.exception("forfeit failed for %s", tag)
 
+    def watchdog(self, player, quiet_s: float = 180.0) -> None:
+        """Print (once per episode) task and thread dumps when a decision or the server hangs."""
+        now = time.monotonic()
+        deciding = getattr(player, "deciding_since", None)
+        last = getattr(player, "last_server_msg", None)
+        stuck = None
+        if deciding is not None and now - deciding > self.args.move_cap + 15:
+            stuck = f"a decision has run {now - deciding:.0f}s (cap {self.args.move_cap:g}s)"
+        elif (deciding is None and last is not None and now - last > quiet_s
+              and any(not b.finished for b in player.battles.values())):
+            stuck = f"no server message for {now - last:.0f}s in a running battle"
+        if stuck is None:
+            self._stalled = False
+            return
+        if getattr(self, "_stalled", False):
+            return
+        self._stalled = True
+        print(f"WARNING: possible stall: {stuck}", file=sys.stderr, flush=True)
+        import faulthandler
+        faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+        try:
+            loop = player.ps_client.loop
+            for t in asyncio.all_tasks(loop):
+                print(f"TASK {t.get_name()}: {t!r}", file=sys.stderr, flush=True)
+        except Exception as exc:
+            print(f"(could not list tasks: {exc!r})", file=sys.stderr, flush=True)
+
     @staticmethod
     def disconnected(player) -> bool:
         ws = getattr(player.ps_client, "websocket", None)
@@ -226,7 +255,7 @@ class Run:
         opponent = None
         opp_task = None
         if args.dry_run:
-            cls = bench.get_player_class("heuristics")
+            cls = bench.get_player_class(args.dry_opponent)
             opponent = cls(
                 battle_format="gen9randombattle", max_concurrent_battles=1,
                 account_configuration=AccountConfiguration("ldo" + secrets.token_hex(4), None),
@@ -253,6 +282,7 @@ class Run:
                 reason = None
                 while not task.done():
                     await asyncio.sleep(1.0)
+                    self.watchdog(player)
                     if self.disconnected(player):
                         reason = "disconnect"
                         break
