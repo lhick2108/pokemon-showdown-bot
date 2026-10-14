@@ -17,7 +17,9 @@ eg_alive, eg_side, eg_ms, eg_worlds (unused here: one true world), time_ms (MCTS
 evaluator, scale, mode (mixed|argmax). --time-ms is the default for B's time_ms and for A's
 time_ms and eg_ms. Note the endgame search uses the stock evaluation; evaluator/scale only
 affect the MCTS fallback and bot B.
-Run with --workers 1 for a quick in-process smoke test.
+Every game runs in its own process (--workers at once), is killed after --game-timeout s, and a
+process that dies is reported as an error; each finished game is appended to --out at once and
+the summary is computed from that file, so --resume continues an interrupted run.
 """
 
 from __future__ import annotations
@@ -25,7 +27,6 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import glob
-import multiprocessing as mp
 import random
 import sys
 import time
@@ -50,6 +51,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="default ms per move for MCTS and for A's endgame search (default 1000)")
     p.add_argument("--max-turns", type=int, default=60, help="turn limit per game (capped = tie)")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--out", type=Path, default=None,
+                   help="JSON-lines file, one finished game per line, written as games finish "
+                        "(default data/review/endgame_ab_<seed>.jsonl)")
+    p.add_argument("--resume", action="store_true",
+                   help="keep --out and skip the (position, seat) games already done ok")
+    p.add_argument("--game-timeout", type=float, default=300.0,
+                   help="kill a game (counted as an error) after this many seconds (default 300)")
     return p
 
 
@@ -104,26 +112,30 @@ def main(argv: list[str] | None = None) -> int:
          "max_turns": args.max_turns, "seed": args.seed}
         for i, pos in enumerate(positions) for side in (1, 2)
     ]
-    results: list[dict] = []
+    out_path = args.out or (REPO_ROOT / "data" / "review" / f"endgame_ab_{args.seed}.jsonl")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    done = ev.load_results(out_path) if args.resume else []
+    if not args.resume and out_path.exists():
+        out_path.unlink()
+    finished = {(r["index"], r["a_side"]) for r in done if r.get("ok")}
+    tasks = [t for t in tasks if (t["index"], t["a_side"]) not in finished]
+    print(f"results -> {out_path} ({len(finished)} games already done, {len(tasks)} to play)",
+          file=sys.stderr)
     started = time.time()
+    count = [0]
 
-    def progress(n: int, res: dict) -> None:
+    def record(res: dict) -> None:
+        ev.append_result(out_path, res)
+        count[0] += 1
         elapsed = time.time() - started
-        print(f"\r[{n}/{len(tasks)}] {60 * n / max(elapsed, 1e-9):.1f} games/min"
-              + (f"  ERROR {res['error']}" if not res.get("ok") else ""),
-              end="", file=sys.stderr, flush=True)
+        print(f"\r[{count[0]}/{len(tasks)}] {60 * count[0] / max(elapsed, 1e-9):.1f} games/min"
+              + (f"  ERROR (position {res['index']}, side {res['a_side']}): {res['error']}"
+                 if not res.get("ok") else ""),
+              end="" if res.get("ok") else "\n", file=sys.stderr, flush=True)
 
-    if args.workers <= 1:
-        for n, task in enumerate(tasks, 1):
-            res = ev.run_task(task)
-            results.append(res)
-            progress(n, res)
-    else:
-        with mp.get_context("spawn").Pool(args.workers) as pool:
-            for n, res in enumerate(pool.imap_unordered(ev.run_task, tasks), 1):
-                results.append(res)
-                progress(n, res)
+    ev.run_games(tasks, args.workers, args.game_timeout, record)
     print(file=sys.stderr)
+    results = ev.latest_results(ev.load_results(out_path))
 
     ok = [r for r in results if r.get("ok")]
     errors = [r for r in results if not r.get("ok")]

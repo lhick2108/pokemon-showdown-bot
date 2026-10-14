@@ -158,6 +158,15 @@ fn re_order_moves_for_iterative_deepening(
     (new_s1_vec, side_two_options)
 }
 
+/// Deepest iteration of the iterative deepening. `depth` is an `i8`: without a cap a tiny or
+/// stalling position (forced single moves, protect loops) reaches 127 within the time budget,
+/// wraps to a negative depth that never counts down to 0, and the search then recurses until
+/// the stack overflows and kills the process (bead sdb.8). Hitting the cap ends the search early.
+pub const MAX_ITERATIVE_DEPTH: i8 = 100;
+
+/// Stack for the search thread (the recursion is up to `MAX_ITERATIVE_DEPTH` plies deep).
+const SEARCH_THREAD_STACK_BYTES: usize = 64 * 1024 * 1024;
+
 pub fn iterative_deepen_expectiminimax(
     state: &mut State,
     side_one_options: Vec<MoveChoice>,
@@ -185,7 +194,9 @@ pub fn iterative_deepen_expectiminimax(
         Receiver<IterativeDeependingThreadMessage>,
     ) = channel();
 
-    let handle = thread::spawn(move || {
+    let handle = thread::Builder::new()
+        .stack_size(SEARCH_THREAD_STACK_BYTES)
+        .spawn(move || {
         let mut previous_turn_s1_options = re_ordered_s1_options.clone();
         let mut previous_turn_s2_options = re_ordered_s2_options.clone();
         loop {
@@ -213,6 +224,18 @@ pub fn iterative_deepen_expectiminimax(
                     .unwrap();
                 break;
             }
+            // depth cap reached: this result is complete, report it without waiting for the timer
+            if i >= MAX_ITERATIVE_DEPTH {
+                sender
+                    .send(IterativeDeependingThreadMessage::Stop((
+                        re_ordered_s1_options,
+                        re_ordered_s2_options,
+                        result,
+                        i,
+                    )))
+                    .unwrap();
+                break;
+            }
             previous_turn_s1_options = re_ordered_s1_options.clone();
             previous_turn_s2_options = re_ordered_s2_options.clone();
             (re_ordered_s1_options, re_ordered_s2_options) = re_order_moves_for_iterative_deepening(
@@ -221,15 +244,20 @@ pub fn iterative_deepen_expectiminimax(
                 re_ordered_s2_options,
             );
         }
-    });
+    })
+    .expect("failed to spawn the search thread");
 
-    thread::sleep(max_time);
+    // Wait for the timer, or for the search thread to finish early (depth cap).
+    let early = receiver.recv_timeout(max_time);
     *running.lock().unwrap() = false;
-    match receiver.recv() {
-        Ok(IterativeDeependingThreadMessage::Stop(result)) => {
+    let message = match early {
+        Ok(message) => message,
+        Err(_) => receiver.recv().expect("Failed to receive stop message"),
+    };
+    match message {
+        IterativeDeependingThreadMessage::Stop(result) => {
             handle.join().unwrap();
             result
         }
-        _ => panic!("Failed to receive stop message"),
     }
 }
