@@ -14,6 +14,8 @@ import logging
 import math
 import os
 import re
+import sys
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -163,17 +165,71 @@ def with_ladder_hooks(
     class LadderPlayer(cls):  # type: ignore[valid-type, misc]
         cap_s = move_cap_s
         cap_hits = 0
+        rejections = 0
+        last_server_msg: float | None = None
+        deciding_since: float | None = None
 
         async def _handle_battle_message(self, split_messages):
             # keep every |request| (our full real sets) in order, before poke-env consumes it
+            self.last_server_msg = time.monotonic()
             try:
                 capture_requests(self.__dict__.setdefault("battle_requests", {}), split_messages,
                                  getattr(self, "battles", {}))
             except Exception:
                 logger.exception("could not capture request")
-            return await super()._handle_battle_message(split_messages)
+            try:
+                self._note_server_messages(split_messages)
+            except Exception:
+                logger.exception("could not inspect server messages")
+            try:
+                return await super()._handle_battle_message(split_messages)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # poke-env's handler would otherwise die silently (its logger is at ERROR)
+                # (an exception in a per-message task is otherwise only printed at garbage
+                # collection, and the missing reply leaves the game idle until the server
+                # timer forfeits it). If the chunk held a request, still answer it.
+                logger.exception("battle message handler failed: %r", split_messages[:3])
+                print(f"ERROR: battle message handler failed in "
+                      f"{split_messages[0][0] if split_messages and split_messages[0] else '?'}",
+                      file=sys.stderr, flush=True)
+                if any(len(m) > 2 and m[1] == "request" and m[2].strip() for m in split_messages[1:]):
+                    type(self).handler_failures = getattr(type(self), "handler_failures", 0) + 1
+                    try:
+                        await self.ps_client.send_message("/choose default",
+                                                          split_messages[0][0].lstrip(">"))
+                    except Exception:
+                        logger.exception("default-choice fallback failed")
+                    return None
+                raise
+
+        def _note_server_messages(self, split_messages):
+            """Make rejected choices visible and remember them for the next decision."""
+            if not split_messages or not split_messages[0]:
+                return
+            tag = split_messages[0][0].lstrip(">")
+            rejected = self.__dict__.setdefault("rejected_tags", set())
+            for msg in split_messages[1:]:
+                if len(msg) >= 2 and msg[1] == "error":
+                    text = "|".join(msg[2:])
+                    type(self).rejections = getattr(type(self), "rejections", 0) + 1
+                    logger.warning("server rejected our choice in %s: %s", tag, text)
+                    print(f"WARNING: server rejected our choice in {tag}: {text}",
+                          file=sys.stderr, flush=True)
+                    rejected.add(tag)
+                elif len(msg) >= 2 and msg[1] == "request":
+                    rejected.discard(tag)  # a fresh request: decide normally again
 
         async def choose_move(self, battle):
+            tag = battle.battle_tag
+            if tag in self.__dict__.get("rejected_tags", ()):
+                # the server refused the previous (deterministic) search answer: a retry
+                # of the same search would loop forever, so pick a random legal order
+                self.rejected_tags.discard(tag)
+                logger.warning("retrying %s turn %s with a random legal order", tag, battle.turn)
+                return self.choose_random_move(battle)
+            self.deciding_since = time.monotonic()
             try:
                 return await asyncio.wait_for(super().choose_move(battle), self.cap_s)
             except asyncio.TimeoutError:
@@ -183,6 +239,14 @@ def with_ladder_hooks(
                     self.cap_s, battle.battle_tag, battle.turn,
                 )
                 return heuristic_order(self, battle)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("decision failed in %s turn %s; heuristic move",
+                                 battle.battle_tag, battle.turn)
+                return heuristic_order(self, battle)
+            finally:
+                self.deciding_since = None
 
         def _battle_finished_callback(self, battle):
             super()._battle_finished_callback(battle)
