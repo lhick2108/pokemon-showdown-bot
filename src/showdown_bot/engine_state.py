@@ -486,6 +486,19 @@ def sample_opponent_team(
     return slots
 
 
+def sampled_set_key(slot: OpponentSlot) -> tuple:
+    """``inference.set_key`` of the set a world gave ``slot`` (to find its belief weight)."""
+    sampled = slot.sampled
+    return (
+        slot.species_id,
+        int(sampled.level),
+        to_id(sampled.item) if sampled.item else "",
+        to_id(sampled.ability),
+        to_id(sampled.tera_type),
+        tuple(to_id(m) for m in sampled.moves),
+    )
+
+
 def _apply_illusion(
     slots: list[OpponentSlot],
     active: Any,

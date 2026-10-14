@@ -51,6 +51,10 @@ only poke-env options), these environment variables:
                                  leaf scale k > 0 for the learned evaluator: leaf score
                                  sigmoid(k * (z_leaf - z_root)) (default 1.0; see the
                                  "Leaf scale" section of docs/training.md)
+    SHOWDOWN_BELIEF_REWEIGHT     "1" turns on soft Bayesian belief reweighting of the opponent's
+                                 candidate sets (default off; see showdown_bot.belief)
+    SHOWDOWN_BELIEF_TAU          tempering exponent for action evidence (default 0.5)
+    SHOWDOWN_BELIEF_FLOOR        no set drops below this share of the likeliest (default 0.05)
     SHOWDOWN_RECORD_DIR          record every searched decision here (default: off;
                                  see showdown_bot.recorder / docs/selfplay-data.md)
 
@@ -83,6 +87,7 @@ from poke_env.player import Player
 from poke_env.ps_client import AccountConfiguration
 from poke_env.player.battle_order import BattleOrder, DefaultBattleOrder
 
+from showdown_bot import belief as belief_module
 from showdown_bot import decision_quality as dq
 from showdown_bot import engine_state, nash as nash_module, recorder as recorder_module
 from showdown_bot import opponent_tendency as tendency_module
@@ -194,6 +199,10 @@ class SearchConfig:
     damage_inference: bool = True  # ...of which: damage-roll inference (needs inference)
     eval_lowhp_knee: float = 0.0  # 589.32 experiment: >0 discounts alive/item/boost value of low-HP mons
     eval_boost_scale: float = 1.0  # 589.32 experiment: multiplier on all stat-boost eval terms
+    # Soft Bayesian belief reweighting of opponent sets (bead showdown-bot-1wu; default off)
+    belief_reweight: bool = False
+    belief_tau: float = belief_module.DEFAULT_TAU  # tempering exponent of the action evidence
+    belief_floor: float = belief_module.DEFAULT_FLOOR  # min share of the likeliest set
     # 589.47 decision quality (all default off)
     escalate: bool = False  # flat-root escalation: re-search longer when the top two are close
     escalate_gap: float = 0.02  # ...flat when the top two options' mean scores differ by less
@@ -249,6 +258,10 @@ class SearchConfig:
             not in ("0", "off", "false", "no"),
             eval_lowhp_knee=_env_float("SHOWDOWN_EVAL_LOWHP_KNEE", 0.0, 0.0, 1.0),
             eval_boost_scale=_env_float("SHOWDOWN_EVAL_BOOST_SCALE", 1.0, 0.0, 10.0),
+            belief_reweight=os.environ.get("SHOWDOWN_BELIEF_REWEIGHT", "0").strip().lower()
+            in ("1", "on", "true", "yes"),
+            belief_tau=_env_float("SHOWDOWN_BELIEF_TAU", belief_module.DEFAULT_TAU, 0.0, 10.0),
+            belief_floor=_env_float("SHOWDOWN_BELIEF_FLOOR", belief_module.DEFAULT_FLOOR, 0.0, 1.0),
         )
 
     def plan(self, early: bool) -> tuple[int, int]:
@@ -319,6 +332,7 @@ def inference_summary() -> str:
     return (
         f"event_inference_seconds={sets.INFERENCE_SECONDS[0]:.2f} "
         f"damage[{damage_infer.total_damage_stats().summary()}]"
+        + (f" belief[{belief_module.STATS.summary()}]" if belief_module.STATS.seconds else "")
     )
 
 
@@ -570,6 +584,8 @@ def _opp_facts(battle: Any, trackers: Any) -> list[dict[str, Any]]:
                     ],
                     inconsistent=bool(tracker.inconsistent),
                 )
+                if tracker.belief_enabled:
+                    row["belief"] = tracker.belief_summary()
             out.append(row)
     except Exception:
         logger.debug("opp_facts failed", exc_info=True)
@@ -603,6 +619,7 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         tendency: bool | None = None,
         tendency_kappa: float | None = None,
         tendency_delta: float | None = None,
+        belief_reweight: bool | None = None,
         **kwargs: Any,
     ):
         data = data or (opponent_model.data if opponent_model else default_randbats_data())
@@ -637,6 +654,8 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             self.config = dataclasses.replace(self.config, tendency_kappa=float(tendency_kappa))
         if tendency_delta is not None:
             self.config = dataclasses.replace(self.config, tendency_delta=float(tendency_delta))
+        if belief_reweight is not None:
+            self.config = dataclasses.replace(self.config, belief_reweight=bool(belief_reweight))
         if not (0.0 <= self.config.full_frac <= 1.0):
             raise ValueError(f"full_frac must be in [0, 1], got {self.config.full_frac}")
         if self.config.fast_time_ms < 1:
@@ -645,6 +664,14 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             self.opponent_model.inference_enabled = False
         if not self.config.damage_inference:
             self.opponent_model.damage_enabled = False
+        if not (math.isfinite(self.config.belief_tau) and self.config.belief_tau >= 0):
+            raise ValueError(f"belief_tau must be finite and >= 0, got {self.config.belief_tau}")
+        if not (math.isfinite(self.config.belief_floor) and 0 <= self.config.belief_floor < 1):
+            raise ValueError(f"belief_floor must be in [0, 1), got {self.config.belief_floor}")
+        if self.config.belief_reweight:
+            self.opponent_model.belief_enabled = True
+            self.opponent_model.belief_tau = self.config.belief_tau
+            self.opponent_model.belief_floor = self.config.belief_floor
         if self.config.mode not in MODES:
             raise ValueError(f"mode must be one of {MODES}, got {self.config.mode!r}")
         if not (math.isfinite(self.config.tendency_kappa) and self.config.tendency_kappa >= 0):
@@ -701,6 +728,8 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         # Recording is off unless a recorder is passed or SHOWDOWN_RECORD_DIR is set.
         self._recorder = recorder if recorder is not None else recorder_module.from_env()
         self._paired: list[tuple[str, WorldResult]] = []
+        self._result_worlds: list[int] = []  # world index of each result of the last run
+        self._belief_pending: dict[str, belief_module.ActionRecord] = {}
         if self._recorder is not None and self._recorder.truth:
             recorder_module.register_player(self)
 
@@ -762,6 +791,8 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
                 query = self._tendency_query(battle)
             except Exception:  # the model must never cost a decision
                 logger.exception("Tendency query failed in %s", battle.battle_tag)
+        if self.config.belief_reweight:
+            self._apply_belief_action(battle)
         legal = battle.valid_orders
         if len(legal) == 1:
             self.stats.forced += 1
@@ -788,11 +819,13 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             illusion = None
         if illusion is not None and illusion.total <= 0:
             illusion = None
+        world_slots: list[list[engine_state.OpponentSlot]] = []
         for _ in range(n_worlds):
             slots = engine_state.sample_opponent_team(
                 battle, trackers, self._sampler, self._rng,
                 illusion=illusion, illusion_rng=self._illusion_rng,
             )
+            world_slots.append(slots)
             if slots and slots[0].disguised:
                 self.stats.illusion_worlds += 1
             world = engine_state.build_state(battle, slots)
@@ -800,6 +833,7 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             self.stats.unknown_ids += len(world.unknown_ids)
             state_strings.append(world.to_string())
         results = await self._run_worlds(state_strings, time_ms)
+        result_worlds = list(self._result_worlds)
         self.stats.searched += 1
         if not results:
             raise RuntimeError("every world failed")
@@ -836,6 +870,7 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
                     break
                 spent_s += waves * new_ms / 1000.0
                 results, final_ms = more, new_ms
+                result_worlds = list(self._result_worlds)
                 escalated += 1
                 policy, nash_records, mode = self._policy_of(results, battle, query)
                 adjusted, changes = dq.adjust_policy(
@@ -849,6 +884,8 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         self.last_changes = {**changes, "escalated": escalated, "search_time_ms": final_ms}
         assert built is not None
         order = self._order_from_policy(policy, built, battle, mode)
+        if self.config.belief_reweight:
+            self._remember_action(battle, trackers, world_slots, results, result_worlds)
         if recording:
             self._record_decision(
                 battle, order, policy, n_worlds, final_ms, started, truth_state, truth_status,
@@ -856,6 +893,56 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
                 opp_facts,
             )
         return order
+
+    # -- soft belief (bead showdown-bot-1wu) -----------------------------------
+
+    def _apply_belief_action(self, battle: Any) -> None:
+        """Fold the opponent's last observed action into its active Pokemon's belief."""
+        record = self._belief_pending.get(battle.battle_tag)
+        if record is None:
+            return
+        try:
+            if self.opponent_model.observed_action(battle.battle_tag, record.turn) is None:
+                if battle.turn > record.turn:
+                    self._belief_pending.pop(battle.battle_tag, None)  # it never showed
+                return
+            self._belief_pending.pop(battle.battle_tag, None)
+            self.opponent_model.update(battle)
+            self.opponent_model.apply_action_belief(battle, record)
+        except Exception:  # the belief must never cost a decision
+            logger.exception("Belief action update failed in %s", battle.battle_tag)
+
+    def _remember_action(
+        self, battle: Any, trackers: Any, world_slots: list, results: list, result_worlds: list[int]
+    ) -> None:
+        """Keep the opponent's root visit shares per searched world for the next update."""
+        try:
+            if getattr(battle, "force_switch", False):
+                return  # no simultaneous opponent choice to learn from
+            active = battle.opponent_active_pokemon
+            if active is None:
+                return
+            key = next((str(k) for k, v in battle.opponent_team.items() if v is active), None)
+            tracker = trackers.get(key) if key else None
+            if tracker is None or not tracker.belief_enabled:
+                return
+            worlds: list[belief_module.WorldAction] = []
+            for result, index in zip(results, result_worlds):
+                opp = getattr(result, "opp", None)
+                slots = world_slots[index] if index < len(world_slots) else None
+                if not opp or not slots:
+                    continue
+                slot = slots[0]
+                set_key = None
+                if slot.mon is active and not slot.disguised:
+                    set_key = engine_state.sampled_set_key(slot)
+                worlds.append(belief_module.WorldAction(set_key, belief_module.visit_shares(opp)))
+            if worlds:
+                self._belief_pending[battle.battle_tag] = belief_module.ActionRecord(
+                    int(battle.turn), key, worlds
+                )
+        except Exception:
+            logger.exception("Belief bookkeeping failed in %s", battle.battle_tag)
 
     def _policy_of(
         self, results: list[WorldResult], battle: Any, query: TendencyQuery | None = None
@@ -946,10 +1033,11 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
     ) -> list[WorldResult]:
         loop = asyncio.get_running_loop()
         self._paired = []
-        search_fn = (
-            functools.partial(_worker.search_world, opp_names=True)
-            if self.config.tendency else _worker.search_world
-        )
+        search_fn = functools.partial(
+            _worker.search_world,
+            opp_names=bool(self.config.tendency),
+            opp_visits=bool(self.config.belief_reweight),
+        ) if (self.config.tendency or self.config.belief_reweight) else _worker.search_world
         futures = [
             loop.run_in_executor(
                 executor, search_fn, state, time_ms, self.config.threads,
@@ -978,6 +1066,7 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
                 reset_pool(self.config.parallelism, only=executor, kill=True)
             raise
         results: list[WorldResult] = []
+        self._result_worlds = []
         for index, outcome in enumerate(outcomes):
             if isinstance(outcome, BaseException):
                 if isinstance(outcome, BrokenProcessPool):
@@ -991,6 +1080,7 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             self.stats.iterations += outcome[0]
             self.stats.search_ms += time_ms
             results.append(outcome)
+            self._result_worlds.append(index)
             if self._recorder is not None:
                 self._paired.append((state_strings[index], outcome))
         return results

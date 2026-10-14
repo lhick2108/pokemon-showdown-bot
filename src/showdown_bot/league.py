@@ -55,12 +55,14 @@ SPEC_KEYS = {
     "search": {"evaluator": str, "scale": float, "time_ms": int, "worlds": int,
                "selection": str, "gamma": float, "mode": str,
                "tendency": str, "tkappa": float, "tdelta": float,
+               "belief": int, "btau": float, "bfloor": float,
                 "escalate": int, "escalate_gap": float, "escalate_factor": float,
                 "escalate_steps": int, "escalate_cap_ms": int, "prune_noop": int, "noop_switches": int,
                 "tera_margin": float},
     "search-net": {"evaluator": str, "scale": float, "time_ms": int, "worlds": int,
                    "selection": str, "gamma": float, "mode": str,
                "tendency": str, "tkappa": float, "tdelta": float,
+               "belief": int, "btau": float, "bfloor": float,
                 "escalate": int, "escalate_gap": float, "escalate_factor": float,
                 "escalate_steps": int, "escalate_cap_ms": int, "prune_noop": int, "noop_switches": int,
                 "tera_margin": float},
@@ -156,6 +158,12 @@ def parse_spec(text: str) -> BotSpec:
                 raise ValueError(f"mode must be mixed, argmax or nash in bot spec {raw!r}")
             if key == "tendency" and parsed.lower() not in ("on", "off"):
                 raise ValueError(f"tendency must be on or off in bot spec {raw!r}")
+            if key == "belief" and parsed not in (0, 1):
+                raise ValueError(f"belief must be 0 or 1 in bot spec {raw!r}")
+            if key == "btau" and not (math.isfinite(parsed) and parsed >= 0):
+                raise ValueError(f"btau must be >= 0 in bot spec {raw!r}")
+            if key == "bfloor" and not (math.isfinite(parsed) and 0 <= parsed < 1):
+                raise ValueError(f"bfloor must be in [0, 1) in bot spec {raw!r}")
             if key in ("tkappa", "tdelta") and not (math.isfinite(parsed) and parsed >= 0):
                 raise ValueError(f"{key} must be >= 0 in bot spec {raw!r}")
             params.append((key, parsed.lower() if key in ("selection", "mode", "tendency") else parsed))
@@ -623,6 +631,12 @@ def _quality_kwargs(spec: BotSpec) -> dict:
     for key in ("escalate", "prune_noop"):
         if spec.param(key) is not None:
             out[key] = bool(spec.param(key))
+    if spec.param("belief") is not None:  # bead showdown-bot-1wu
+        out["belief_reweight"] = bool(spec.param("belief"))
+    if spec.param("btau") is not None:
+        out["belief_tau"] = spec.param("btau")
+    if spec.param("bfloor") is not None:
+        out["belief_floor"] = spec.param("bfloor")
     if spec.param("noop_switches") is not None:
         out["noop_vs_switches"] = bool(spec.param("noop_switches"))
     for key in ("escalate_gap", "escalate_factor", "escalate_steps", "escalate_cap_ms", "tera_margin"):
