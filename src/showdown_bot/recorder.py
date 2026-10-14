@@ -204,7 +204,10 @@ def iter_game_files(root: str | os.PathLike[str]) -> Iterator[Path]:
     if root.is_file():
         yield root
         return
-    yield from sorted(root.rglob("*.jsonl.gz"))
+    for path in sorted(root.rglob("*.jsonl.gz")):
+        if "policy" in path.relative_to(root).parts[:-1]:
+            continue  # human-replay policy rows (scripts/human_replays.py), not game records
+        yield path
 
 
 # ---------------------------------------------------------------------------

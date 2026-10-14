@@ -102,6 +102,11 @@ Known gaps:
 Self-play with the same net on both sides makes the two files of a battle opposite
 labels for nearly identical positions; keep both (or one) deliberately.
 
+## Human records (`source: "human"`)
+
+`scripts/human_replays.py` converts human ladder logs into this schema (truth states with
+hindsight teams, no search, `policy: null`) plus separate policy rows; see `docs/human-replays.md`.
+
 ## Fork-augmented records (`source: "fork"`)
 
 `scripts/fork_augment.py` (code: `src/showdown_bot/fork_augment.py`, bead showdown-bot-sd0) forks
