@@ -91,7 +91,9 @@ import os
 import random
 import re
 import sys
+import tempfile
 import time
+import zlib
 from collections import Counter, defaultdict, deque
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
@@ -230,12 +232,25 @@ def make_targets(
     return target.astype(np.float32), int(missing.sum())
 
 
-LOAD_CHUNK_FILES = 200  # game files per worker job
+LOAD_CHUNK_FILES = 200  # game files per load job (the unit of spilling and of parallelism)
+# Only about 1 in STATE_KEEP_EVERY samples keeps its State string (``Data.states``): they are
+# ~3 KB each (more than the feature row itself) and only used to pick export-check states.
+STATE_KEEP_EVERY = 50
+
+
+def keep_state(game_id: str, decision_idx: int, every: int = STATE_KEEP_EVERY) -> bool:
+    """Deterministic (hash of game id + decision index) choice of samples that keep their state."""
+    return zlib.crc32(f"{game_id}:{decision_idx}".encode()) % every == 0
 
 
 def _load_chunk(job: tuple) -> dict:
-    """Worker: load one chunk of game files into compact numpy arrays (top level for spawn)."""
-    (files, max_per_game, kw) = job
+    """Load one chunk of game files (top level for spawn).
+
+    The feature matrix is spilled to ``<spill_dir>/chunk-<index>.npy`` (only its path comes
+    back), so the parent can assemble the final matrix without holding every chunk and the
+    result in memory at once. Serial and parallel loading both go through here.
+    """
+    (index, files, max_per_game, kw, spill_dir) = job
     stats = dataset.LoadStats()
     states, q_kind = kw["states"], kw["q_kind"]
     feats, ys, qs, evals, dqs, didx = [], [], [], [], [], []
@@ -252,15 +267,20 @@ def _load_chunk(job: tuple) -> dict:
         q = s.search_value_abs if q_kind == "absolute" else s.search_value
         qs.append(np.nan if q is None else q)
         evals.append(s.stock_eval)
-        tags.append(s.battle_tag)
-        strings.append(s.state)
-        gids.append(s.game_id)
+        tags.append(sys.intern(s.battle_tag))
+        strings.append(s.state if keep_state(s.game_id, s.decision_idx, kw["keep_every"]) else None)
+        gids.append(sys.intern(s.game_id))
         didx.append(s.decision_idx)
         seen.add((s.game_id, s.decision_idx))
         dq = s.decision_q_abs if q_kind == "absolute" else s.decision_q
         dqs.append(np.nan if dq is None else dq)
+    x_path = None
+    if feats:
+        x_path = os.path.join(spill_dir, f"chunk-{index:07d}.npy")
+        np.save(x_path, np.stack(feats))
+    del feats
     return {
-        "x": np.stack(feats) if feats else None,
+        "x_path": x_path, "rows": len(ys),
         "ys": np.asarray(ys, dtype=np.float32), "qs": np.asarray(qs, dtype=np.float32),
         "evals": np.asarray(evals, dtype=np.float32), "dqs": np.asarray(dqs, dtype=np.float64),
         "didx": np.asarray(didx, dtype=np.int64),
@@ -270,17 +290,21 @@ def _load_chunk(job: tuple) -> dict:
     }
 
 
-def _load_source_parallel(path: Path, k: int, workers: int, kw: dict) -> dict:
+def _load_source(path: Path, k: int, workers: int, kw: dict, spill_dir: str, job0: int) -> dict:
+    """Load one source in chunks of ``LOAD_CHUNK_FILES`` files, in order (``workers`` > 1: pool)."""
     chunk = LOAD_CHUNK_FILES
     files = list(recorder.iter_game_files(path))
-    jobs = [(files[i:i + chunk], k, kw) for i in range(0, len(files), chunk)]
-    out: dict = {n: [] for n in ("x", "ys", "qs", "evals", "dqs", "didx", "tags", "strings", "gids")}
+    jobs = [(job0 + n, files[i:i + chunk], k, kw, spill_dir)
+            for n, i in enumerate(range(0, len(files), chunk))]
+    out: dict = {n: [] for n in ("ys", "qs", "evals", "dqs", "didx", "tags", "strings", "gids")}
+    out["x_parts"] = []  # (npy path, rows) in order
     out["decisions"] = 0
+    out["jobs"] = len(jobs)
     out["stats"] = {"games": 0, "skipped_games": 0, "bad_states": 0, "results": Counter()}
 
     def absorb(r: dict) -> None:
-        if r["x"] is not None:
-            out["x"].append(r["x"])
+        if r["x_path"] is not None:
+            out["x_parts"].append((r["x_path"], r["rows"]))
         for n in ("ys", "qs", "evals", "dqs", "didx"):
             out[n].append(r[n])
         for n in ("tags", "strings", "gids"):
@@ -290,7 +314,9 @@ def _load_source_parallel(path: Path, k: int, workers: int, kw: dict) -> dict:
             out["stats"][n] += r["stats"][n]
         out["stats"]["results"].update(r["stats"]["results"])
 
-    if not jobs:
+    if workers <= 1 or len(jobs) <= 1:
+        for job in jobs:
+            absorb(_load_chunk(job))
         return out
     pending: deque = deque()
     with ProcessPoolExecutor(max_workers=workers) as ex:
@@ -324,9 +350,9 @@ def load_data(
 ) -> Data:
     """Load the samples of the given run directories (``Source`` / path / spec) into memory.
 
-    ``max_per_game`` is the default cap on decisions per game record (0 = all); a
-    ``Source.max_per_game`` overrides it, and ``Source.weight`` multiplies the sample
-    weights. Prints per-source counts.
+    ``max_per_game`` is the default cap on decisions per game record (= per ``.jsonl.gz``
+    file; 0 = all); a ``Source.max_per_game`` overrides it, and ``Source.weight`` multiplies
+    the sample weights. Prints per-source counts and the feature-matrix size.
 
     ``residual`` appends the raw stock ``evaluate(state)`` as the last column of ``x``
     (with ``x_dtype="float16"`` it is kept in a separate float32 array instead).
@@ -336,85 +362,68 @@ def load_data(
     ``workers``: 0 = ``os.cpu_count() - 2`` (min 1), 1 = serial, >1 = that many processes
     each loading a chunk of game files (results are identical to serial: the per-game
     subsampling RNG depends only on ``seed`` and the file name, and chunks are joined in order).
+
+    Memory: each chunk's feature rows are spilled to a temporary ``.npy`` and copied into the
+    final preallocated matrix, so the peak is about one copy of ``x`` (not two). ``Data.states``
+    keeps a State string for only ~1 in ``STATE_KEEP_EVERY`` samples (None elsewhere).
     """
     if workers <= 0:
         workers = max(1, (os.cpu_count() or 1) - 2)
     np_dtype = np.dtype(x_dtype)
-    feats, ys, qs, evals, tags, strings = [], [], [], [], [], []
-    gids, didx, dqs = [], [], []
+    tags, strings, gids = [], [], []
+    cols: dict[str, list] = {n: [] for n in ("ys", "qs", "evals", "dqs", "didx")}
     load = dataset.LoadStats()
     sources = [parse_source(p) for p in paths]
-    src_ids: list[int] = []
-    src_records, src_decisions = [], []
-    par_x: np.ndarray | None = None
-    if workers > 1:
-        kw = dict(states=states, q_source=q_source, q_kind=q_kind, q_eval_scale=q_eval_scale,
-                  feature_version=feature_version, x_dtype=x_dtype, seed=seed)
-        px, pcols = [], {n: [] for n in ("ys", "qs", "evals", "dqs", "didx")}
-        for si, source in enumerate(sources):
+    src_records, src_decisions, src_rows = [], [], []
+    x_parts: list[tuple[str, int]] = []
+    kw = dict(states=states, q_source=q_source, q_kind=q_kind, q_eval_scale=q_eval_scale,
+              feature_version=feature_version, x_dtype=x_dtype, seed=seed, keep_every=STATE_KEEP_EVERY)
+    with tempfile.TemporaryDirectory(prefix="pev-load-") as spill:
+        job0 = 0
+        for source in sources:
             k = max_per_game if source.max_per_game is None else source.max_per_game
-            r = _load_source_parallel(source.path, k, workers, kw)
-            px += r["x"]
-            for n in pcols:
-                pcols[n] += r[n]
+            r = _load_source(source.path, k, workers, kw, spill, job0)
+            job0 += r["jobs"]
+            x_parts += r.pop("x_parts")
+            for n in cols:
+                cols[n] += r[n]
             tags += r["tags"]; strings += r["strings"]; gids += r["gids"]
-            src_ids += [si] * len(r["tags"])
+            src_rows.append(len(r["tags"]))
             load.games += r["stats"]["games"]
             load.skipped_games += r["stats"]["skipped_games"]
             load.bad_states += r["stats"]["bad_states"]
             load.results.update(r["stats"]["results"])
             src_records.append(r["stats"]["games"])
             src_decisions.append(r["decisions"])
-        if px:
-            par_x = np.concatenate(px)
-            del px
-            ys, qs, evals, dqs, didx = (
-                np.concatenate(pcols[n]) for n in ("ys", "qs", "evals", "dqs", "didx"))
-            feats = [None]  # non-empty marker
-    for si, source in enumerate(sources if workers <= 1 else ()):
-        path = source.path
-        k = max_per_game if source.max_per_game is None else source.max_per_game
-        games_before, seen = load.games, set()
-        for s in dataset.iter_samples(
-            path, sides=(1,), max_per_game=k, seed=seed,
-            worlds="fallback" if states == "prefer-truth" else states in ("both", "worlds"),
-            truth=states in ("both", "truth", "prefer-truth"), stats=load, q_source=q_source,
-            q_eval_scale=q_eval_scale, feature_version=feature_version,
-        ):
-            feats.append(np.asarray(s.features, dtype=np_dtype))  # a list of Python floats costs ~8x the memory
-            ys.append(s.value)
-            q = s.search_value_abs if q_kind == "absolute" else s.search_value
-            qs.append(np.nan if q is None else q)
-            evals.append(s.stock_eval)
-            tags.append(s.battle_tag)
-            src_ids.append(si)
-            seen.add((s.game_id, s.decision_idx))
-            strings.append(s.state)
-            gids.append(s.game_id)
-            didx.append(s.decision_idx)
-            dq = s.decision_q_abs if q_kind == "absolute" else s.decision_q
-            dqs.append(np.nan if dq is None else dq)
-        src_records.append(load.games - games_before)
-        src_decisions.append(len(seen))
-    if load.bad_states:
-        print(f"warning: {load.bad_states} unparsable states skipped", file=sys.stderr)
-    if not feats:
-        raise SystemExit("no samples found in " + ", ".join(map(str, paths)))
-    x = par_x if par_x is not None else np.stack(feats)
-    del feats
-    e_sep = None
-    if residual and np_dtype == np.float32:
-        x = np.concatenate([x, np.asarray(evals, dtype=np.float32)[:, None]], axis=1)
-    elif residual:
-        e_sep = np.asarray(evals, dtype=np.float32)
-    y = np.asarray(ys, dtype=np.float32)
-    q = np.asarray(qs, dtype=np.float32)
-    src = np.asarray(src_ids, dtype=np.int64)
+        if load.bad_states:
+            print(f"warning: {load.bad_states} unparsable states skipped", file=sys.stderr)
+        if not x_parts:
+            raise SystemExit("no samples found in " + ", ".join(map(str, paths)))
+        n_rows = sum(rows for _, rows in x_parts)
+        n_in = np.load(x_parts[0][0], mmap_mode="r").shape[1]
+        y, q, evals, dqs, didx = (
+            np.concatenate(cols[n]) for n in ("ys", "qs", "evals", "dqs", "didx"))
+        del cols
+        extra = 1 if residual and np_dtype == np.float32 else 0
+        x = np.empty((n_rows, n_in + extra), dtype=np_dtype)
+        off = 0
+        for p, rows in x_parts:  # free each spilled chunk as it is copied
+            x[off:off + rows, :n_in] = np.load(p)
+            os.remove(p)
+            off += rows
+    if extra:
+        x[:, n_in] = evals
+    e_sep = np.asarray(evals, dtype=np.float32) if residual and not extra else None
+    src = np.repeat(np.arange(len(sources), dtype=np.int64), src_rows)
     for si, source in enumerate(sources):
         k = max_per_game if source.max_per_game is None else source.max_per_game
+        gb = src_rows[si] * x.shape[1] * x.itemsize / 1e9
         print(f"source {source.path}: max-per-game {k or 'all'}, weight x{source.weight:g}: "
               f"{src_records[si]} records, {src_decisions[si]} decisions kept, "
-              f"{int((src == si).sum())} samples")
+              f"{src_rows[si]} samples, x {gb:.2f} GB")
+    kept = sum(1 for s_ in strings if s_ is not None)
+    print(f"loaded {len(y)} samples: x {tuple(x.shape)} {x.dtype} = {x.nbytes / 1e9:.2f} GB; "
+          f"{kept} state strings kept for export checks")
     if value_target in ("td", "nstep"):
         target, st = dataset.bootstrapped_targets(
             gids, didx, dqs, y, value_target, td_lambda, td_n, td_mu)
@@ -1003,6 +1012,7 @@ def main(argv=None) -> int:
           f"val {len(val)} samples / {len(set(val.tags))} battles; "
           f"mean value {float(data.y.mean()):.3f}")
     n_feat = data.x.shape[1] - (1 if args.residual and data.e_sep is None else 0)
+    del data  # the train/val subsets are copies; drop the full matrix (halves steady-state RAM)
     res_init = None
     if args.residual:
         a0, b0 = fit_stock_logistic(train.e, train.y_fit, train.w, args.stock_coef_init)
@@ -1043,11 +1053,16 @@ def main(argv=None) -> int:
               f"{m['n_decisive']} decisive)")
     export_pev(result.model, args.out, feature_version)
     rng = random.Random(args.seed)
+    # val.states only keeps a ~1/STATE_KEEP_EVERY subset of the state strings (the rest None)
     pool = [s for s in val.states if s]
     check = rng.sample(pool, min(100, len(pool)))
-    worst = verify_export(result.model, args.out, check)
-    print(f"\nexported {args.out}  ({args.out.stat().st_size} bytes); verified on {len(check)} "
-          f"val states, max |evaluate - torch logit| = {worst:.2e}")
+    if check:
+        worst = verify_export(result.model, args.out, check)
+        print(f"\nexported {args.out}  ({args.out.stat().st_size} bytes); verified on {len(check)} "
+              f"val states, max |evaluate - torch logit| = {worst:.2e}")
+    else:
+        print(f"\nexported {args.out}  ({args.out.stat().st_size} bytes); WARNING: no val state "
+              f"strings kept, export not verified", file=sys.stderr)
     print(f"value target: {target_desc}")
     print(f"total time {time.perf_counter() - started:.1f} s")
     return 0
