@@ -102,6 +102,7 @@ class GameRecorder:
         config: dict[str, Any] | None = None,
         player: str = "search",
         teams: dict[str, Any] | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> None:
         header = {
             "type": "game",
@@ -117,6 +118,8 @@ class GameRecorder:
         }
         if teams:  # fixed-team duels (showdown_bot.teams): mode, team pair id, team ids
             header["teams"] = teams
+        if extra:  # e.g. {"source": "fork", ...} (scripts/fork_augment.py)
+            header.update(extra)
         with self._lock:
             self._games[(battle_tag, username)] = [header]
 
