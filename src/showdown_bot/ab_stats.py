@@ -24,6 +24,42 @@ def read_records(path: Path) -> list[dict]:
     return out
 
 
+def default_log_dirs(ab_path: Path) -> list[Path]:
+    """``logs/`` dirs of every ``data/ladder/*`` run next to the ab.jsonl file."""
+    return sorted(d for d in Path(ab_path).resolve().parent.glob("*/logs") if d.is_dir())
+
+
+def backfill_ratings(records: Sequence[dict], log_dirs: Sequence[Path], *,
+                     proxy_opp_rating: bool = False) -> list[dict]:
+    """Copies of ``records`` with null opponent_rating / rating_before filled from the
+    ``|player|`` lines of ``<log_dir>/<safe battle_tag>.log``. rating_after is never faked.
+    With ``proxy_opp_rating`` a still-missing opponent rating falls back to our own
+    rating_before (a crude stand-in; off by default)."""
+    from showdown_bot import ladder  # local: ladder pulls in more than stats needs
+
+    out = []
+    for r in records:
+        r = dict(r)
+        if r.get("opponent_rating") is None or r.get("rating_before") is None:
+            name = f"{ladder.safe_filename(r.get('battle_tag', ''))}.log"
+            for d in log_dirs:
+                f = Path(d) / name
+                if not f.is_file():
+                    continue
+                mine, theirs, _ = ladder.ratings_from_players(
+                    ladder.parse_player_lines(f.read_text(encoding="utf-8", errors="replace")),
+                    r.get("username", ""))
+                if r.get("rating_before") is None:
+                    r["rating_before"] = mine
+                if r.get("opponent_rating") is None:
+                    r["opponent_rating"] = theirs
+                break
+        if proxy_opp_rating and r.get("opponent_rating") is None:
+            r["opponent_rating"] = r.get("rating_before")
+        out.append(r)
+    return out
+
+
 def arm_summary(records: Sequence[dict]) -> dict[str, dict]:
     """Per arm: games (decided), wins, ties, win rate + Wilson CI, mean opponent rating."""
     out: dict[str, dict] = {}

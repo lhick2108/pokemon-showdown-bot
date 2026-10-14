@@ -149,3 +149,60 @@ def test_ties_and_missing_ratings_are_skipped():
     assert s["a"]["games"] == 1 and s["a"]["ties"] == 1
     assert ab_stats.adjusted_effects(recs, ["a", "b"])["effects"] == {}
     assert "skipped" in ab_stats.format_report(recs)
+
+
+# --- |player| rating parsing and ab_report backfill ----------------------------------
+
+_LOG_P1 = "|player|p1|Me-bot|169|1819\n|player|p2|Foe|swimmerf|1822\n|turn|1\n"
+_LOG_P2 = "|player|p1|Foe|swimmerf|1822\n|player|p2|Me-bot|169|1819\n"
+
+
+def test_parse_player_lines_orders_and_missing():
+    for text in (_LOG_P1, _LOG_P2):
+        players = ladder.parse_player_lines(text)
+        assert ladder.ratings_from_players(players, "me-bot") == (1819, 1822, "Foe")
+    assert ladder.parse_player_lines("|player|p1|A|1\n")[0]["rating"] is None  # no field
+    assert ladder.parse_player_lines("|player|p1|A|1|\n")[0]["rating"] is None  # unrated ''
+    unrated = ladder.parse_player_lines("|player|p1|Me-bot|1|\n|player|p2|Foe|2|\n")
+    assert ladder.ratings_from_players(unrated, "Me-bot") == (None, None, "Foe")
+
+
+def test_game_from_battle_uses_players_for_opponent_rating():
+    class B:
+        battle_tag = "battle-x-1"
+        turn = 3
+        opponent_username = "Foe"
+        opponent_rating = None
+        _players = [{"username": "Foe", "rating": "1822"},
+                    {"username": "Me-bot", "rating": "1819"}]
+        _replay_data = []
+        won = True
+        lost = False
+
+    g = ladder.game_from_battle(B(), "Me-bot")
+    assert (g.rating_before, g.opponent_rating) == (1819, 1822)
+
+
+def _rec(tag, **kw):
+    r = {"battle_tag": tag, "arm": "a", "username": "Me-bot", "rating_before": None,
+         "rating_after": None, "opponent_rating": None, "result": "win"}
+    r.update(kw)
+    return r
+
+
+def test_backfill_ratings(tmp_path):
+    logs = tmp_path / "run1" / "logs"
+    logs.mkdir(parents=True)
+    (logs / "battle-x-1.log").write_text(_LOG_P2)
+    ab = tmp_path / "ab.jsonl"
+    recs = [_rec("battle-x-1"), _rec("battle-x-2"), _rec("battle-x-1", opponent_rating=1500)]
+    assert ab_stats.default_log_dirs(ab) == [logs.resolve()]
+    out = ab_stats.backfill_ratings(recs, ab_stats.default_log_dirs(ab))
+    assert (out[0]["rating_before"], out[0]["opponent_rating"]) == (1819, 1822)
+    assert out[0]["rating_after"] is None
+    assert out[1]["opponent_rating"] is None
+    assert out[2]["opponent_rating"] == 1500 and out[2]["rating_before"] == 1819
+    assert recs[0]["opponent_rating"] is None  # inputs untouched
+    prox = ab_stats.backfill_ratings([_rec("battle-x-2", rating_before=1700)], [logs],
+                                     proxy_opp_rating=True)
+    assert prox[0]["opponent_rating"] == 1700
