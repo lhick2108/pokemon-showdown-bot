@@ -80,6 +80,7 @@ import asyncio
 import atexit
 import dataclasses
 import functools
+import itertools
 import logging
 import math
 import os
@@ -337,6 +338,7 @@ class SearchStats:
     tera_folded: int = 0  # 589.47: decisions where >= 1 tera option was folded away
     endgame_decisions: int = 0  # decisions decided by endgame expectiminimax
     endgame_fallbacks: int = 0  # endgame decisions that fell back to MCTS (error / degenerate)
+    decision_timeouts: int = 0  # decisions whose pool search hit the hard cap (pool recycled)
     fallback_reasons: Counter = field(default_factory=Counter)
 
     def summary(self) -> str:
@@ -354,6 +356,7 @@ class SearchStats:
                 if self.escalations or self.noop_pruned or self.tera_folded
                 else ""
             )
+            + (f" decision_timeouts={self.decision_timeouts}" if self.decision_timeouts else "")
             + (
                 f" endgame={self.endgame_decisions} endgame_fallbacks={self.endgame_fallbacks}"
                 if self.endgame_decisions or self.endgame_fallbacks
@@ -373,7 +376,7 @@ def total_stats() -> SearchStats:
             "decisions", "searched", "forced", "fallbacks", "worlds_run",
             "world_errors", "iterations", "search_ms", "unknown_ids", "illusion_worlds",
             "escalations", "noop_pruned", "tera_folded", "endgame_decisions",
-            "endgame_fallbacks",
+            "endgame_fallbacks", "decision_timeouts",
         ):
             setattr(total, name, getattr(total, name) + getattr(stats, name))
         total.fallback_reasons.update(stats.fallback_reasons)
@@ -401,6 +404,8 @@ atexit.register(_print_total_stats)
 
 
 _POOLS: dict[int, ProcessPoolExecutor] = {}
+_CAP_SLACK_S = 10.0  # added to the planned wave time for the hard cap on one decision
+_TIMED_OUT = object()  # outcome marker of a pool job still running at the hard cap
 
 
 def get_pool(workers: int) -> ProcessPoolExecutor:
@@ -412,6 +417,46 @@ def get_pool(workers: int) -> ProcessPoolExecutor:
         for _ in range(workers):
             pool.submit(_worker.ping)
     return pool
+
+
+# Pool searches currently awaited by some player: id -> (started, battle tag, kind, worlds, ms).
+# Read by ``pool_diagnostics`` (stall dumps); touched only from the event-loop threads.
+_INFLIGHT: dict[int, tuple[float, str, str, int, int]] = {}
+_INFLIGHT_IDS = itertools.count(1)
+
+
+def pool_diagnostics() -> str:
+    """What the shared search pools are doing and which decisions are waiting on them."""
+    now = time.monotonic()
+    lines = []
+    for workers, pool in list(_POOLS.items()):
+        procs = list(getattr(pool, "_processes", {}).values())
+        manager = getattr(pool, "_executor_manager_thread", None)
+        pending = getattr(pool, "_pending_work_items", None)
+        lines.append(
+            f"pool[{workers}]: processes alive={sum(1 for p in procs if p.is_alive())}/"
+            f"{len(procs)} manager_thread_alive="
+            f"{manager.is_alive() if manager is not None else None} "
+            f"pending_work_items={len(pending) if pending is not None else '?'} "
+            f"broken={getattr(pool, '_broken', False) or False} "
+            f"shutdown={getattr(pool, '_shutdown_thread', '?')}"
+        )
+    for _key, (started, tag, kind, worlds, ms) in sorted(_INFLIGHT.items()):
+        lines.append(
+            f"inflight {kind}: battle={tag} worlds={worlds} budget_ms={ms} "
+            f"running_for={now - started:.1f}s"
+        )
+    if not _INFLIGHT:
+        lines.append("no pool searches in flight")
+    return "\n".join(lines)
+
+
+def _shared_pool_key(executor: Any) -> int | None:
+    """The ``_POOLS`` key of ``executor`` if it is a shared pool (else None)."""
+    for workers, pool in _POOLS.items():
+        if pool is executor:
+            return workers
+    return None
 
 
 def _kill_workers(pool: ProcessPoolExecutor) -> None:
@@ -789,6 +834,10 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         self.stats = SearchStats()
         _ALL_STATS.append(self.stats)
         self._executor = executor
+        # Key of the shared pool ``executor`` came from: after a hung-pool recycle the player
+        # follows the rebuilt pool instead of submitting to the dead one.
+        self._shared_workers = _shared_pool_key(executor) if executor is not None else None
+        self._tag = ""  # battle tag of the decision in progress (diagnostics only)
         self._rng = random.Random(seed)
         # Separate stream for the Illusion roll so worlds are unchanged at P = 0.
         self._illusion_rng = random.Random(None if seed is None else f"illusion-{seed}")
@@ -813,6 +862,7 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
 
     async def choose_move(self, battle: Any) -> BattleOrder:
         self.stats.decisions += 1
+        self._tag = str(getattr(battle, "battle_tag", ""))
         reason = "no-order"
         try:
             order = await self._choose(battle)
@@ -1048,13 +1098,13 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         """Expectiminimax on every world: ``[(world index, raw result)]`` of those that
         succeeded (a broken shared pool is rebuilt once and retried)."""
         for attempt in (0, 1):
-            executor = self._executor or get_pool(self.config.parallelism)
+            executor = self._pick_executor()
             try:
                 return await self._run_endgame_on(executor, state_strings, time_ms)
             except BrokenProcessPool:
-                if self._executor is not None:
+                if self._recycle_key(executor) is None:
                     raise
-                reset_pool(self.config.parallelism, only=executor)
+                self._recycle(executor)
                 if attempt:
                     raise
                 logger.warning("Process pool broke; rebuilt it and retrying")
@@ -1073,19 +1123,13 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         # Hard wall-clock limit: the planned compute plus 1 s of IPC grace, never beyond the
         # decision cap, so a wedged worker costs at most this before MCTS answers instead.
         timeout = min(waves * time_ms / 1000.0 + 1.0, self.config.endgame_cap_ms / 1000.0)
-        try:
-            outcomes = await asyncio.wait_for(
-                asyncio.gather(*futures, return_exceptions=True), timeout=timeout
-            )
-        except asyncio.TimeoutError:
-            # A hung engine call cannot be interrupted: kill the (owned) pool's workers so the
-            # next decision gets a healthy one; a caller-supplied executor is left alone.
-            logger.error("Endgame search timed out after %.1fs", timeout)
-            if self._executor is None:
-                reset_pool(self.config.parallelism, only=executor, kill=True)
-            raise
+        outcomes = await self._collect(
+            futures, timeout, executor, "endgame", len(state_strings), time_ms, state_strings
+        )
         good: list[tuple[int, Any]] = []
         for index, outcome in enumerate(outcomes):
+            if outcome is _TIMED_OUT:
+                continue
             if isinstance(outcome, BaseException):
                 if isinstance(outcome, BrokenProcessPool):
                     raise outcome
@@ -1095,6 +1139,8 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
                 )
                 continue
             good.append((index, outcome))
+        if not good and any(o is _TIMED_OUT for o in outcomes):
+            raise asyncio.TimeoutError(f"endgame search timed out after {timeout:.1f}s")
         return good
 
     def _record_endgame(
@@ -1281,16 +1327,74 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
                 self.cond_used += 1
         return orders[choice] if choice is not None else None
 
+    def _pick_executor(self) -> Executor:
+        """The pool to submit to: the caller's, following a recycled shared pool."""
+        if self._executor is None:
+            return get_pool(self.config.parallelism)
+        if self._shared_workers is not None:
+            return get_pool(self._shared_workers)
+        return self._executor
+
+    def _recycle_key(self, executor: Executor) -> int | None:
+        """Pool-registry key if ``executor`` may be rebuilt (owned or shared), else None."""
+        if self._executor is None:
+            return self.config.parallelism
+        return _shared_pool_key(executor)
+
+    def _recycle(self, executor: Executor, *, kill: bool = False) -> None:
+        key = self._recycle_key(executor)
+        if key is not None:
+            reset_pool(key, only=executor, kill=kill)
+
+    async def _collect(
+        self,
+        futures: list[Any],
+        timeout: float,
+        executor: Executor,
+        kind: str,
+        n_worlds: int,
+        time_ms: int,
+        state_strings: list[str],
+    ) -> list[Any]:
+        """Await ``futures`` for at most ``timeout`` s: results/exceptions, ``_TIMED_OUT`` for
+        jobs still running. A timeout is a hung engine call that cannot be interrupted, so it
+        counts a ``decision_timeouts`` and kills the (owned or shared) pool's workers; the
+        next decision gets a healthy one."""
+        key = next(_INFLIGHT_IDS)
+        _INFLIGHT[key] = (time.monotonic(), self._tag, kind, n_worlds, time_ms)
+        try:
+            _done, pending = await asyncio.wait(futures, timeout=timeout)
+        finally:
+            _INFLIGHT.pop(key, None)
+        outcomes: list[Any] = []
+        for future in futures:
+            if future in pending or future.cancelled():
+                outcomes.append(_TIMED_OUT)
+            else:
+                outcomes.append(future.exception() or future.result())
+        if pending:
+            for future in pending:
+                future.cancel()
+            self.stats.decision_timeouts += 1
+            logger.error(
+                "%s search timed out after %.0fs (%d/%d worlds unfinished) in %s; "
+                "recycling the pool; world states: %s",
+                kind, timeout, len(pending), len(futures), self._tag,
+                " || ".join(f"STATE[{i}] {st}" for i, st in enumerate(state_strings)),
+            )
+            self._recycle(executor, kill=True)
+        return outcomes
+
     async def _run_worlds(self, state_strings: list[str], time_ms: int) -> list[WorldResult]:
         """Search every world; a broken shared pool is rebuilt and retried once."""
         for attempt in (0, 1):
-            executor = self._executor or get_pool(self.config.parallelism)
+            executor = self._pick_executor()
             try:
                 return await self._run_worlds_on(executor, state_strings, time_ms)
             except BrokenProcessPool:
-                if self._executor is not None:
+                if self._recycle_key(executor) is None:
                     raise
-                reset_pool(self.config.parallelism, only=executor)
+                self._recycle(executor)
                 if attempt:
                     raise
                 logger.warning("Process pool broke; rebuilt it and retrying")
@@ -1318,25 +1422,20 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
                 state_strings, self.config.world_evaluators(len(state_strings)))
         ]
         waves = -(-len(futures) // max(1, self.config.parallelism))
-        timeout = waves * (time_ms / 1000.0 + 1.0) + 10.0
-        try:
-            outcomes = await asyncio.wait_for(
-                asyncio.gather(*futures, return_exceptions=True), timeout=timeout
-            )
-        except asyncio.TimeoutError:
-            # A hung engine call cannot be interrupted; kill the workers so the
-            # next decision gets a healthy pool.
-            logger.error(
-                "MCTS timed out after %.0fs; world states: %s",
-                timeout,
-                " || ".join(f"STATE[{i}] {state}" for i, state in enumerate(state_strings)),
-            )
-            if self._executor is None:
-                reset_pool(self.config.parallelism, only=executor, kill=True)
-            raise
+        # Hard cap on one decision's pool search: the planned wave time plus slack, and never
+        # below 5x the compute budget. Past it the stuck workers are recycled and whatever
+        # worlds finished are used (none: the caller falls back to a legal move).
+        timeout = max(waves * (time_ms / 1000.0 + 1.0) + _CAP_SLACK_S, 5.0 * waves * time_ms / 1000.0)
+        outcomes = await self._collect(
+            futures, timeout, executor, "mcts", len(state_strings), time_ms, state_strings
+        )
+        if all(o is _TIMED_OUT for o in outcomes):
+            raise asyncio.TimeoutError(f"MCTS timed out after {timeout:.0f}s")
         results: list[WorldResult] = []
         self._result_worlds = []
         for index, outcome in enumerate(outcomes):
+            if outcome is _TIMED_OUT:
+                continue
             if isinstance(outcome, BaseException):
                 if isinstance(outcome, BrokenProcessPool):
                     raise outcome

@@ -606,6 +606,7 @@ class LeagueConfig:
     team_seed: int = 0
     port: int = 8000
     strict_compute: bool = False  # refuse to start when search_workers > cores - 2
+    stall_dump_s: float = 180.0  # no game finished for this long: dump stacks + pool state (0: off)
     specs: dict = field(default_factory=dict)  # label -> BotSpec
     compute: dict = field(default_factory=dict)  # filled by run_league: preflight + throughput
 
@@ -992,20 +993,64 @@ def emit_progress(tracker: Tracker, printer: compute.ProgressPrinter) -> None:
     printer.update(done, f"{a} v {b}", w1, w2, t, others or None)
 
 
+def format_thread_stacks() -> str:
+    """Python stack of every thread in this process (the poke-env game loop runs in its own)."""
+    import threading
+    import traceback
+
+    names = {t.ident: t.name for t in threading.enumerate()}
+    parts = []
+    for ident, frame in sys._current_frames().items():
+        parts.append(f"--- thread {names.get(ident, '?')} ({ident}) ---\n"
+                     + "".join(traceback.format_stack(frame)))
+    return "\n".join(parts)
+
+
+def dump_stall(quiet_s: float) -> str:
+    """Log (and return) all-thread stacks plus what the search pool is waiting on."""
+    text = f"STALL: no game finished for {quiet_s:.0f}s\n"
+    try:
+        from showdown_bot.players.search import pool_diagnostics
+
+        text += pool_diagnostics() + "\n"
+    except Exception as exc:  # diagnostics must never take the run down
+        text += f"(pool diagnostics failed: {exc!r})\n"
+    try:
+        text += format_thread_stacks()
+    except Exception as exc:
+        text += f"(stack dump failed: {exc!r})\n"
+    logger.error("%s", text)
+    try:  # C-level view too (works even if a thread is stuck in native code)
+        import faulthandler
+
+        faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+    except Exception:
+        pass
+    return text
+
+
 async def _progress(tracker: Tracker, total: int, interval: float = 3.0,
-                    heartbeat: float = 120.0) -> None:
-    """Print a progress line whenever a game finishes (and every ``heartbeat`` s)."""
+                    heartbeat: float = 120.0, stall_s: float = 0.0) -> None:
+    """Print a progress line whenever a game finishes (and every ``heartbeat`` s).
+
+    With ``stall_s`` > 0, also dump stacks and pool state each time that long passes with no
+    game finishing (a frozen game loop cannot report on itself; this loop is a different one)."""
     printer = compute.ProgressPrinter(total)
     quiet_since = time.monotonic()
+    last_dump = quiet_since
     while True:
         await asyncio.sleep(interval)
         emit_progress(tracker, printer)
         if printer.changed:
-            quiet_since = time.monotonic()
+            quiet_since = last_dump = time.monotonic()
         elif time.monotonic() - quiet_since > heartbeat:
             printer.last = -1  # still running, no game finished: say so
             emit_progress(tracker, printer)
             quiet_since = time.monotonic()
+        now = time.monotonic()
+        if stall_s > 0 and now - last_dump >= stall_s:
+            dump_stall(now - last_dump)
+            last_dump = now
 
 
 async def run_league(specs: Sequence[BotSpec], cfg: LeagueConfig) -> tuple[list[Game], list[str]]:
@@ -1055,7 +1100,7 @@ async def run_league(specs: Sequence[BotSpec], cfg: LeagueConfig) -> tuple[list[
         return job
 
     total = len(pairs) * cfg.games_per_pair
-    ticker = asyncio.ensure_future(_progress(tracker, total))
+    ticker = asyncio.ensure_future(_progress(tracker, total, stall_s=cfg.stall_dump_s))
     try:
         results = await run_limited(
             [make_job(i, a, b) for i, (a, b) in enumerate(pairs)], cfg.parallel_pairs)
@@ -1127,6 +1172,9 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--connect-timeout", type=bench._positive_seconds, default=30)
     p.add_argument("--game-timeout", type=bench._positive_seconds, default=900)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--stall-dump-s", type=float, default=180.0,
+                   help="when no game finishes for this many seconds, log all thread stacks and "
+                        "the search pool state (repeats every period; 0 disables)")
     p.add_argument("--search-workers", type=bench._positive_int, default=None,
                    help="one MCTS process pool of this size shared by all search players")
     p.add_argument("--parallel-pairs", type=bench._positive_int, default=1,
@@ -1168,7 +1216,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         fp_threads=args.fp_threads, seed=args.seed,
         search_workers=args.search_workers, parallel_pairs=args.parallel_pairs,
         teams=args.teams, team_seed=args.team_seed, port=args.port,
-        strict_compute=args.strict_compute,
+        strict_compute=args.strict_compute, stall_dump_s=args.stall_dump_s,
     )
     if args.teams != "random" and args.games_per_pair % 2:
         print(f"error: --teams {args.teams} needs an even --games-per-pair", file=sys.stderr)
