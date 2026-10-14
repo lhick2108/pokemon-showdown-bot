@@ -57,13 +57,13 @@ SPEC_KEYS = {
                "tendency": str, "tkappa": float, "tdelta": float,
                 "escalate": int, "escalate_gap": float, "escalate_factor": float,
                 "escalate_steps": int, "escalate_cap_ms": int, "prune_noop": int, "noop_switches": int,
-                "tera_margin": float},
+                "tera_margin": float, "ev2": str, "scale2": float},
     "search-net": {"evaluator": str, "scale": float, "time_ms": int, "worlds": int,
                    "selection": str, "gamma": float, "mode": str,
                "tendency": str, "tkappa": float, "tdelta": float,
                 "escalate": int, "escalate_gap": float, "escalate_factor": float,
                 "escalate_steps": int, "escalate_cap_ms": int, "prune_noop": int, "noop_switches": int,
-                "tera_margin": float},
+                "tera_margin": float, "ev2": str, "scale2": float},
 }
 
 
@@ -146,8 +146,8 @@ def parse_spec(text: str) -> BotSpec:
                 raise ValueError(f"{key} must be >= 1 in bot spec {raw!r}")
             if key in ("time_ms", "worlds") and parsed <= 0:
                 raise ValueError(f"{key} must be positive in bot spec {raw!r}")
-            if key == "scale" and not (math.isfinite(parsed) and parsed > 0):
-                raise ValueError(f"scale must be positive in bot spec {raw!r}")
+            if key in ("scale", "scale2") and not (math.isfinite(parsed) and parsed > 0):
+                raise ValueError(f"{key} must be positive in bot spec {raw!r}")
             if key == "selection" and parsed.lower() not in ("ucb1", "exp3", "rm"):
                 raise ValueError(f"selection must be ucb1, exp3 or rm in bot spec {raw!r}")
             if key == "gamma" and not (math.isfinite(parsed) and 0 < parsed <= 1):
@@ -159,6 +159,14 @@ def parse_spec(text: str) -> BotSpec:
             if key in ("tkappa", "tdelta") and not (math.isfinite(parsed) and parsed >= 0):
                 raise ValueError(f"{key} must be >= 0 in bot spec {raw!r}")
             params.append((key, parsed.lower() if key in ("selection", "mode", "tendency") else parsed))
+    keys = dict(params)
+    if "scale2" in keys and "ev2" not in keys:
+        raise ValueError(f"scale2 needs ev2=<path.pev> in bot spec {raw!r}")
+    if "ev2" in keys:
+        if "evaluator" not in keys and not os.environ.get("SHOWDOWN_SEARCH_EVALUATOR"):
+            raise ValueError(f"ev2 needs a primary evaluator=<path.pev> in bot spec {raw!r}")
+        if keys.get("worlds", 2) < 2:
+            raise ValueError(f"the ev2 ensemble needs worlds >= 2 in bot spec {raw!r}")
     if type_name == "search-net" and not any(k == "evaluator" for k, _ in params) \
             and not os.environ.get("SHOWDOWN_SEARCH_EVALUATOR"):
         raise ValueError(f"search-net spec {raw!r} needs evaluator=<path.pev>")
@@ -623,11 +631,32 @@ def _quality_kwargs(spec: BotSpec) -> dict:
     for key in ("escalate", "prune_noop"):
         if spec.param(key) is not None:
             out[key] = bool(spec.param(key))
+    if spec.param("ev2") is not None:  # evaluator ensemble over worlds
+        out["evaluator2"] = spec.param("ev2")
+        out["evaluator2_scale"] = spec.param("scale2", 1.0)
     if spec.param("noop_switches") is not None:
         out["noop_vs_switches"] = bool(spec.param("noop_switches"))
     for key in ("escalate_gap", "escalate_factor", "escalate_steps", "escalate_cap_ms", "tera_margin"):
         if spec.param(key) is not None:
             out[key] = spec.param(key)
+    return out
+
+
+def search_config_fields(spec: BotSpec) -> dict:
+    """Every SearchConfig field a search spec sets (spec keys -> field names; only those given).
+
+    Shared with scripts/selfplay.py so a pool opponent takes the same keys as a league bot.
+    """
+    out: dict = {}
+    for key, name in (("evaluator", "evaluator"), ("scale", "evaluator_scale"),
+                      ("time_ms", "search_time_ms"), ("worlds", "worlds"),
+                      ("selection", "selection"), ("gamma", "selection_gamma"),
+                      ("mode", "mode"), ("tkappa", "tendency_kappa"), ("tdelta", "tendency_delta")):
+        if spec.param(key) is not None:
+            out[name] = spec.param(key)
+    if spec.param("tendency") is not None:
+        out["tendency"] = spec.param("tendency") == "on"
+    out.update(_quality_kwargs(spec))
     return out
 
 
