@@ -96,13 +96,15 @@ class OppTuple(tuple):
     root options (soft belief, bead showdown-bot-1wu).  Equal to the plain tuple; the
     attribute survives pickling to the parent process."""
 
-    def __new__(cls, items=(), opp=None):
+    def __new__(cls, items=(), opp=None, nodes=None, search_value=None):
         obj = super().__new__(cls, items)
         obj.opp = opp
+        obj.nodes = nodes  # sampled interior nodes (bead rnm), see search_world(export_nodes=)
+        obj.search_value = search_value  # the search's absolute root value, set with ``nodes``
         return obj
 
     def __getnewargs__(self):
-        return (tuple(self), self.opp)
+        return (tuple(self), self.opp, self.nodes, self.search_value)
 
 
 def search_world(
@@ -125,6 +127,8 @@ def search_world(
     prior_fpu: float = 0.0,
     human_path: str | None = None,
     human_elo=None,
+    export_nodes: int = 0,
+    export_min_visits: int = 16,
 ) -> tuple:
     """Run MCTS on one serialised world.
 
@@ -144,6 +148,11 @@ def search_world(
     (side_two) root ``(choice, visits)`` options.
     With ``prior_path`` (a ``.ppol`` policy net) side one's selection becomes PUCT; see
     ``prior_kwargs`` for ``prior_opp``. Single-threaded only; the result shape is unchanged.
+    With ``export_nodes`` > 0 (single-threaded only) the result is an ``OppTuple`` whose
+    ``.nodes`` lists up to that many sampled interior search nodes as
+    ``(state, visits, value, static_value, depth)`` (values are absolute P(side one wins); see
+    ``poke_engine.MctsResult.nodes``) and whose ``.search_value`` is the root's absolute search
+    value; an engine without the export raises.
     Plain tuples keep the result cheap to pickle. A Rust panic surfaces in
     Python as ``pyo3_runtime.PanicException`` (a ``BaseException``), so it is
     converted to an ordinary ``RuntimeError`` here.
@@ -174,12 +183,17 @@ def search_world(
                 state, state_string, prior_path, prior_opp, c_puct, prior_eps, prior_fpu,
                 human_path, human_elo,
             ))
+        if export_nodes:
+            kwargs["export_nodes"] = int(export_nodes)
+            kwargs["export_min_visits"] = int(export_min_visits)
         result = monte_carlo_tree_search(state, search_time_ms, threads=threads, **kwargs)
         out = _format(result, selection, joint, opp_names)
+        opp = [(str(o.move_choice), int(o.visits)) for o in result.side_two] if opp_visits else None
+        if export_nodes:
+            nodes = [(str(s), int(v), float(val), float(st), int(d)) for s, v, val, st, d in result.nodes or ()]
+            return OppTuple(out, opp, nodes, float(result.root_search_value))
         if opp_visits:
-            return OppTuple(
-                out, [(str(o.move_choice), int(o.visits)) for o in result.side_two]
-            )
+            return OppTuple(out, opp)
         return out
     except Exception:
         raise

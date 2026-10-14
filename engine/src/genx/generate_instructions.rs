@@ -11343,6 +11343,38 @@ mod tests {
     }
 
     #[test]
+    fn test_mcts_exports_interior_nodes() {
+        use crate::mcts::{perform_mcts_export, ExportConfig};
+        use crate::selection::SelectionConfig;
+        let mut state = state_with_tackle();
+        let before = state.serialize();
+        let (s1, s2) = state.root_get_all_options();
+        let cfg = ExportConfig { max_nodes: 12, min_visits: 8 };
+        let result = perform_mcts_export(
+            &mut state, s1.clone(), s2.clone(),
+            std::time::Duration::from_millis(5), 20000, None,
+            &SelectionConfig::default(), false, Some(&cfg),
+        );
+        assert_eq!(before, state.serialize(), "the walk must leave the root state intact");
+        let nodes = result.nodes.expect("export requested");
+        assert!(!nodes.is_empty() && nodes.len() <= 12, "{} nodes", nodes.len());
+        for n in &nodes {
+            assert!(n.visits >= 8 && n.visits <= result.iteration_count);
+            assert!(n.depth >= 1);
+            assert!(n.value > 0.0 && n.value < 1.0, "value {}", n.value);
+            assert!(n.static_value > 0.0 && n.static_value < 1.0);
+            State::deserialize(&n.state); // parses back
+        }
+        assert!((0.0..=1.0).contains(&result.root_value));
+        // without a request nothing is exported and the search is unchanged
+        let plain = perform_mcts_export(
+            &mut state, s1, s2, std::time::Duration::from_millis(5), 2000, None,
+            &SelectionConfig::default(), false, None,
+        );
+        assert!(plain.nodes.is_none());
+    }
+
+    #[test]
     fn test_encore_without_last_used_move_does_not_panic_and_is_inactive() {
         for last_used in [LastUsedMove::None, LastUsedMove::Switch(PokemonIndex::P1)] {
             let mut state = state_with_tackle();

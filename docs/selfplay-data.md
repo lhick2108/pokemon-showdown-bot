@@ -57,6 +57,11 @@ opponent team included), `total_visits`, `avg_score` (root total score / total
 visits, in the engine's [0,1] value scale from side one's view), and `moves`
 (`choice`, `visits`, `score` for each of our options).
 
+Optional world fields, written only by searches run with `export_nodes` > 0 (`selfplay.py
+--export-nodes K`, engine 0.0.48+sdb.9, bead showdown-bot-rnm; see "Interior nodes" below):
+`search_value` (the search's *absolute* P(side one wins) at the root; unlike `avg_score` it needs
+no root evaluation to be added back) and `nodes`.
+
 States are stored as strings, not features, so features can be regenerated with
 `poke_engine.state_features(State.from_string(s), side)` after any
 `FEATURE_VERSION` change. The string format itself is tied to the engine build;
@@ -65,6 +70,42 @@ the loader counts strings it cannot parse (`LoadStats.bad_states`).
 ### `result`
 `result`: `"win"`, `"loss"` or `"tie"` from the **recording player's** view
 (= side one's), and `turns`.
+
+## Interior nodes (`nodes`, bead showdown-bot-rnm)
+
+Root decisions are one training position per search; the tree below the root has searched
+millions of positions much more deeply. With `--export-nodes K` every searched world also
+records up to K interior nodes of its MCTS tree: `[state, visits, value, static_value, depth]`.
+
+* Sampling: after the search, the engine walks the tree and draws K nodes **without replacement
+  with probability proportional to visits** (Efraimidis-Spirakis weighted reservoir), among
+  non-terminal nodes with at least `--export-min-visits` (default 16) visits. The root is not a
+  node. One entry per distinct position (a chain of no-op turns or a transposition keeps its
+  best-visited copy). Cost: one tree walk plus K state serialisations, negligible next to the
+  search. Off by default; single-threaded searches only (`--threads 1`).
+* `state`: the position after `depth` joint turns of the tree, i.e. the root world with the
+  chosen joint action (and one chance outcome, damage roll / crit / secondary effect) applied
+  `depth` times. Side one is still the root's side one. The hidden opponent set is the root
+  world's; training on it is as valid as on the root world.
+* `value`: the node's mean backed-up leaf score over its `visits`, converted to an absolute
+  P(side one wins). Scores in the tree are `sigmoid(s * (leaf - root))`, relative to the root's
+  evaluation; the engine inverts that with the root's own value (stock evaluation x 0.0125, or the
+  learned logit with its leaf scale), so `value` is anchored to the evaluator that ran the search
+  and is on the same scale as the root's `search_value`. The mean is under the search's own
+  exploration policy (UCB), so it estimates the position's value under good play by both sides
+  from there, not the best-response value.
+* `static_value`: the evaluator's own absolute value at the position (no search). `value -
+  static_value` is what search added; a node whose `visits` are few is mostly its own leaf
+  evaluation (a node's first visit *is* its evaluation), which is why training down-weights low
+  visit counts and drops nodes below a threshold.
+* `depth`: joint turns below the root (1 = a child of the root's joint-action matrix).
+
+Load them with `dataset.iter_samples(..., nodes="on" | "only")` (kind `"node"`, with
+`node_visits`, `node_depth`, `node_static`) and train with `train.py --nodes on|only` (see
+the module docstring: weight = `node_weight * min(1, visits / node_visit_ref) *
+node_depth_discount ** (depth - 1)`). Disk: about 3 KB of State string per node before gzip
+(consecutive nodes share most of it); budget roughly 1.5-2x the size of a recording without
+nodes at K = 8 per world.
 
 ## Ground-truth ("truth") states
 

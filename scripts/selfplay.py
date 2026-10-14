@@ -158,6 +158,12 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--damage-inference", choices=("on", "off"), default="on",
                    help="damage-roll part of the inference (needs --inference on)")
     p.add_argument("--no-truth", action="store_true", help="do not record exact-state truth")
+    p.add_argument("--export-nodes", type=int, default=0,
+                   help="bead rnm: also record up to K sampled interior MCTS nodes per searched world "
+                        "(visit-weighted; state, visits, search value) as extra value targets "
+                        "(needs --threads 1 and an engine with export_nodes, 0.0.48+sdb.9; 0 = off)")
+    p.add_argument("--export-min-visits", type=int, default=16,
+                   help="--export-nodes: only nodes with at least this many visits are eligible")
     p.add_argument("--connect-timeout", type=bench._positive_seconds, default=30)
     p.add_argument("--game-timeout", type=bench._positive_seconds, default=900)
     return p
@@ -188,6 +194,8 @@ async def _selfplay_pair(
         damage_inference=args.damage_inference == "on",
         full_frac=args.full_frac,
         fast_time_ms=args.fast_time_ms,
+        export_nodes=args.export_nodes,
+        export_min_visits=args.export_min_visits,
         label="main",
     )
     entries = parse_pool(args.pool) if args.pool else [PoolEntry("main", args.evaluator, args.leaf_scale)]
@@ -256,6 +264,9 @@ async def _run_foulplay(args, run_dir: Path) -> None:
 
 def main(argv=None) -> int:
     args = _parser().parse_args(argv)
+    if args.export_nodes < 0 or args.export_min_visits < 1 or (args.export_nodes and args.threads > 1):
+        print("--export-nodes needs K >= 0, --export-min-visits >= 1 and --threads 1", file=sys.stderr)
+        return 2
     if not 0.0 <= args.full_frac <= 1.0:
         print("--full-frac must be in [0, 1]", file=sys.stderr)
         return 2

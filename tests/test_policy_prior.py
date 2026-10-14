@@ -254,6 +254,26 @@ def test_prior_reaches_worker_only_when_enabled(data, ppol):
     assert p._prior_kwargs()["c_puct"] == 0.8 and p._prior_kwargs()["prior_path"] == str(ppol.resolve())
 
 
+def test_node_export_and_prior_in_one_search(ppol):
+    st = make_state()
+    net, _ = _random_net()
+    both = pe.monte_carlo_tree_search(
+        st, 50, iterations=4000, prior=net, prior_opp=net, c_puct=1.0, export_nodes=20, export_min_visits=8
+    )
+    assert both.nodes and len(both.nodes) <= 20
+    assert all(len(n) == 5 and n[1] >= 8 for n in both.nodes)
+    assert math.isfinite(both.root_search_value) and both.depth_max >= 1
+    assert both.total_visits == 4000
+    only_export = pe.monte_carlo_tree_search(st, 50, iterations=2000, export_nodes=5, export_min_visits=8)
+    assert only_export.nodes and only_export.depth_max >= 1
+    only_prior = pe.monte_carlo_tree_search(st, 50, iterations=1000, prior=net)
+    assert only_prior.nodes is None
+    out = _worker.search_world(
+        str(st.to_string()), 20, 1, prior_path=str(ppol), export_nodes=10, export_min_visits=4
+    )
+    assert out.nodes and len(out) == 2
+
+
 # -- league spec keys -----------------------------------------------------------------------
 
 

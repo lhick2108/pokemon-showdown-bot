@@ -273,3 +273,52 @@ def test_policy_dir_is_not_a_game_file(tmp_path, converted):
         handle.write('{"action": "x"}\n')
     files = list(recorder.iter_game_files(tmp_path))
     assert len(files) == 2 and all("policy" not in f.parts for f in files)
+
+
+# --- first-person (hindsight-free) mode ---------------------------------------------------
+
+
+def _fp_states(events, role, seed):
+    """States of ``role`` over ``events`` with a fixed own team and a fresh, identically seeded
+    first-person sampler (only the events can differ between calls)."""
+    import random
+    from collections import Counter
+
+    full = hr.sanitize_log(LOG).events
+    conv = hr.Converter()
+    other = "p2" if role == "p1" else "p1"
+    own = hr.hindsight_team(full, other, role, conv.data, conv.sampler, random.Random(0), conv.model)
+    fp = hr.FirstPerson(hr.OpponentModel(conv.data, damage=False), conv.sampler, random.Random(seed))
+    return hr.states_for_role(events, role, own, None, hr.extract_actions(full), Counter(), fp)
+
+
+def test_first_person_states_do_not_leak_later_events():
+    """The state at turn k is a function of the events up to |turn|k only: cutting the log there
+    (dropping every later reveal) gives the identical state for the same sampler seed."""
+    events = hr.sanitize_log(LOG).events
+    turn_idx = {int(e[2]): i for i, e in enumerate(events) if e[1] == "turn"}
+    for role in ("p1", "p2"):
+        full = {ts.turn: ts.state for ts in _fp_states(events, role, seed=5)}
+        assert sorted(full) == list(range(1, 8))
+        for k in (1, 3, 5, 6):
+            # the sampler's random stream only matches up to the cut, so compare the last state
+            cut = _fp_states(events[: turn_idx[k] + 1], role, seed=5)
+            assert cut[-1].turn == k
+            assert cut[-1].state == full[k], f"{role} turn {k} depends on later events"
+
+
+def test_first_person_differs_from_hindsight_and_hides_unrevealed():
+    conv = hr.Converter(first_person=True)
+    out = conv.convert(LOG, "test-battle-fp", seed=1)
+    hind = hr.Converter().convert(LOG, "test-battle-fp", seed=1)
+    assert [t.turn for t in out.states["p1"]] == [t.turn for t in hind.states["p1"]]
+    # same actions and legal moves (own side), different picture of the opponent
+    assert [t.chosen for t in out.states["p1"]] == [t.chosen for t in hind.states["p1"]]
+    assert [t.legal for t in out.states["p1"]] == [t.legal for t in hind.states["p1"]]
+    # turn 1: only Mightyena has been seen, so p1's picture of the bench cannot match the
+    # whole-game team that includes Farigiraf's revealed set
+    p1_first = State.from_string(out.states["p1"][0].state)
+    assert _active(p1_first, "side_two")[0].id.lower() == "mightyena"
+    assert out.states["p1"][0].state != hind.states["p1"][0].state
+    # both seats now carry their own picture of the opponent
+    assert out.states["p1"][0].state != out.states["p2"][0].state

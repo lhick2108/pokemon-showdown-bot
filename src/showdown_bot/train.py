@@ -56,6 +56,20 @@ Value target (``--value-target``)
     decision's mean over worlds (default) or each world's own score. Metrics are
     reported against the training target and against the pure outcome z.
 
+Interior-node targets (``--nodes on|only``, bead showdown-bot-rnm)
+    Recordings made with ``scripts/selfplay.py --export-nodes K`` carry, per searched world, up
+    to K sampled interior MCTS nodes (state, visits, absolute search value; see
+    docs/selfplay-data.md). ``--nodes on`` adds one training sample per node next to the root
+    samples, ``only`` trains on the nodes alone; their target is the node's search value (so it
+    needs ``--value-target search|blend`` and ``--q-kind absolute``), blended with the outcome
+    exactly like a root q. A node's loss weight is ``--node-weight`` times
+    ``min(1, visits / --node-visit-ref)`` (a node with few visits is mostly its own leaf
+    evaluation, i.e. what the net already believes: down-weighted, and nodes below
+    ``--node-min-visits`` are dropped) times ``--node-depth-discount ** (depth - 1)``. Node
+    samples belong to their battle for the train/val split. ``td``/``nstep`` do not combine
+    with nodes. Root samples with exported values use the exact absolute root value of the
+    search instead of the stock-eval reconstruction.
+
 Bootstrapped targets (``--value-target td|nstep``)
     Look ahead within the same recording: ``td`` is the lambda-return over later
     decisions' absolute q ending at z (``--td-lambda``; 1 = z, 0 = next decision's q),
@@ -249,6 +263,16 @@ def make_targets(
     return target.astype(np.float32), int(missing.sum())
 
 
+def node_multiplier(sample, node_weight: float = 1.0, visit_ref: float = 64.0,
+                    depth_discount: float = 1.0) -> float:
+    """Loss-weight multiplier of one sample: 1 for root (world / truth) samples; for an interior
+    node ``node_weight * min(1, visits / visit_ref) * depth_discount ** (depth - 1)``."""
+    if sample.kind != dataset.KIND_NODE:
+        return 1.0
+    reach = min(1.0, sample.node_visits / visit_ref) if visit_ref > 0 else 1.0
+    return float(node_weight * reach * depth_discount ** max(0, sample.node_depth - 1))
+
+
 LOAD_CHUNK_FILES = 200  # game files per load job (the unit of spilling and of parallelism)
 # Only about 1 in STATE_KEEP_EVERY samples keeps its State string (``Data.states``): they are
 # ~3 KB each (more than the feature row itself) and only used to pick export-check states.
@@ -270,11 +294,12 @@ def _load_chunk(job: tuple) -> dict:
     (index, files, max_per_game, kw, spill_dir) = job
     stats = dataset.LoadStats()
     states, q_kind = kw["states"], kw["q_kind"]
-    feats, ys, qs, evals, dqs, didx = [], [], [], [], [], []
+    feats, ys, qs, evals, dqs, didx, wm, nd = [], [], [], [], [], [], [], []
     tags, strings, gids = [], [], []
     seen = set()
     for s in dataset.iter_samples(
         files[0], sides=(1,), max_per_game=max_per_game, seed=kw["seed"],
+        nodes=kw["nodes"], node_min_visits=kw["node_min_visits"], nodes_per_world=kw["nodes_per_world"],
         worlds="fallback" if states == "prefer-truth" else states in ("both", "worlds"),
         truth=states in ("both", "truth", "prefer-truth"), stats=stats, q_source=kw["q_source"],
         q_eval_scale=kw["q_eval_scale"], feature_version=kw["feature_version"], files=files,
@@ -291,6 +316,8 @@ def _load_chunk(job: tuple) -> dict:
         seen.add((s.game_id, s.decision_idx))
         dq = s.decision_q_abs if q_kind == "absolute" else s.decision_q
         dqs.append(np.nan if dq is None else dq)
+        nd.append(s.kind == dataset.KIND_NODE)
+        wm.append(node_multiplier(s, kw["node_weight"], kw["node_visit_ref"], kw["node_depth_discount"]))
     x_path = None
     if feats:
         x_path = os.path.join(spill_dir, f"chunk-{index:07d}.npy")
@@ -300,7 +327,8 @@ def _load_chunk(job: tuple) -> dict:
         "x_path": x_path, "rows": len(ys),
         "ys": np.asarray(ys, dtype=np.float32), "qs": np.asarray(qs, dtype=np.float32),
         "evals": np.asarray(evals, dtype=np.float32), "dqs": np.asarray(dqs, dtype=np.float64),
-        "didx": np.asarray(didx, dtype=np.int64),
+        "didx": np.asarray(didx, dtype=np.int64), "wm": np.asarray(wm, dtype=np.float64),
+        "nd": np.asarray(nd, dtype=bool),
         "tags": tags, "strings": strings, "gids": gids, "decisions": len(seen),
         "stats": {"games": stats.games, "skipped_games": stats.skipped_games,
                   "bad_states": stats.bad_states, "results": dict(stats.results)},
@@ -313,7 +341,7 @@ def _load_source(path: Path, k: int, workers: int, kw: dict, spill_dir: str, job
     files = list(recorder.iter_game_files(path))
     jobs = [(job0 + n, files[i:i + chunk], k, kw, spill_dir)
             for n, i in enumerate(range(0, len(files), chunk))]
-    out: dict = {n: [] for n in ("ys", "qs", "evals", "dqs", "didx", "tags", "strings", "gids")}
+    out: dict = {n: [] for n in ("ys", "qs", "evals", "dqs", "didx", "wm", "nd", "tags", "strings", "gids")}
     out["x_parts"] = []  # (npy path, rows) in order
     out["decisions"] = 0
     out["jobs"] = len(jobs)
@@ -322,7 +350,7 @@ def _load_source(path: Path, k: int, workers: int, kw: dict, spill_dir: str, job
     def absorb(r: dict) -> None:
         if r["x_path"] is not None:
             out["x_parts"].append((r["x_path"], r["rows"]))
-        for n in ("ys", "qs", "evals", "dqs", "didx"):
+        for n in ("ys", "qs", "evals", "dqs", "didx", "wm", "nd"):
             out[n].append(r[n])
         for n in ("tags", "strings", "gids"):
             out[n] += r[n]
@@ -364,6 +392,12 @@ def load_data(
     max_per_game: int = 0,
     seed: int = 0,
     workers: int = 0,
+    nodes: str = "off",
+    node_min_visits: int = 16,
+    node_weight: float = 1.0,
+    node_visit_ref: float = 64.0,
+    node_depth_discount: float = 1.0,
+    nodes_per_world: int = 0,
 ) -> Data:
     """Load the samples of the given run directories (``Source`` / path / spec) into memory.
 
@@ -388,13 +422,21 @@ def load_data(
         workers = max(1, (os.cpu_count() or 1) - 2)
     np_dtype = np.dtype(x_dtype)
     tags, strings, gids = [], [], []
-    cols: dict[str, list] = {n: [] for n in ("ys", "qs", "evals", "dqs", "didx")}
+    cols: dict[str, list] = {n: [] for n in ("ys", "qs", "evals", "dqs", "didx", "wm", "nd")}
+    if nodes not in dataset.NODE_MODES:
+        raise ValueError(f"nodes must be one of {dataset.NODE_MODES}")
+    if nodes != "off" and (value_target not in ("search", "blend") or q_kind != "absolute"):
+        raise ValueError("interior nodes are search-value targets: use --value-target search|blend "
+                         "with --q-kind absolute")
     load = dataset.LoadStats()
     sources = [parse_source(p) for p in paths]
     src_records, src_decisions, src_rows = [], [], []
     x_parts: list[tuple[str, int]] = []
     kw = dict(states=states, q_source=q_source, q_kind=q_kind, q_eval_scale=q_eval_scale,
-              feature_version=feature_version, x_dtype=x_dtype, seed=seed, keep_every=STATE_KEEP_EVERY)
+              feature_version=feature_version, x_dtype=x_dtype, seed=seed, keep_every=STATE_KEEP_EVERY,
+              nodes=nodes, node_min_visits=node_min_visits, node_weight=node_weight,
+              node_visit_ref=node_visit_ref, node_depth_discount=node_depth_discount,
+              nodes_per_world=nodes_per_world)
     with tempfile.TemporaryDirectory(prefix="pev-load-") as spill:
         job0 = 0
         for source in sources:
@@ -418,8 +460,8 @@ def load_data(
             raise SystemExit("no samples found in " + ", ".join(map(str, paths)))
         n_rows = sum(rows for _, rows in x_parts)
         n_in = np.load(x_parts[0][0], mmap_mode="r").shape[1]
-        y, q, evals, dqs, didx = (
-            np.concatenate(cols[n]) for n in ("ys", "qs", "evals", "dqs", "didx"))
+        y, q, evals, dqs, didx, wmult, is_node = (
+            np.concatenate(cols[n]) for n in ("ys", "qs", "evals", "dqs", "didx", "wm", "nd"))
         del cols
         extra = 1 if residual and np_dtype == np.float32 else 0
         x = np.empty((n_rows, n_in + extra), dtype=np_dtype)
@@ -457,7 +499,12 @@ def load_data(
             m = src == si
             print(f"  source {source.path}: {int(np.isnan(q[m]).sum())} of {int(m.sum())} "
                   f"samples fell back to the outcome")
-    mult = np.asarray([s_.weight for s_ in sources], dtype=np.float64)[src]
+    mult = np.asarray([s_.weight for s_ in sources], dtype=np.float64)[src] * wmult
+    if nodes != "off":
+        print(f"interior nodes ({nodes}): {int(is_node.sum())} node samples of {len(y)} "
+              f"(min visits {node_min_visits}, weight {node_weight:g}, visit ref {node_visit_ref:g}, "
+              f"depth discount {node_depth_discount:g}); mean node multiplier "
+              f"{float(wmult[is_node].mean()) if is_node.any() else 0.0:.3f}")
     return Data(
         x, y, sample_weights(tags, weighting, mult), tags, strings, q,
         None if value_target == "outcome" else target,
@@ -953,6 +1000,22 @@ def _parser() -> argparse.ArgumentParser:
                    help="coefficient of the stock eval in the search score (default 0.0125)")
     p.add_argument("--q-source", choices=dataset.Q_SOURCES, default="decision",
                    help="q for world samples: decision mean (default) or the world's own score")
+    p.add_argument("--nodes", choices=dataset.NODE_MODES, default="off",
+                   help="bead rnm: train on the interior search nodes recorded with "
+                        "selfplay --export-nodes: off (default), on (next to the root samples), "
+                        "only; needs --value-target search|blend")
+    p.add_argument("--node-min-visits", type=int, default=16,
+                   help="--nodes: drop exported nodes with fewer visits (default 16)")
+    p.add_argument("--nodes-per-world", type=int, default=0,
+                   help="--nodes: keep at most this many of a world's exported nodes (random "
+                        "subset, reproducible; 0 = all). Memory: each node is a full feature row")
+    p.add_argument("--node-weight", type=float, default=1.0,
+                   help="--nodes: loss weight of a fully visited node relative to a root sample")
+    p.add_argument("--node-visit-ref", type=float, default=64.0,
+                   help="--nodes: visits at which a node reaches full weight; fewer visits scale "
+                        "the weight linearly (leaf-dominated nodes count less)")
+    p.add_argument("--node-depth-discount", type=float, default=1.0,
+                   help="--nodes: multiply the weight by this per joint turn below depth 1")
     p.add_argument("--residual", action="store_true",
                    help="learn a correction to the stock evaluation: z = a*0.0125*evaluate + net(x)")
     p.add_argument("--stock-coef-init", type=float, default=None,
@@ -1006,6 +1069,16 @@ def main(argv=None) -> int:
     if not 0.0 <= args.td_lambda <= 1.0 or not 0.0 <= args.td_mu <= 1.0 or args.td_n < 1:
         print("--td-lambda/--td-mu must be in [0, 1] and --td-n >= 1", file=sys.stderr)
         return 2
+    if args.nodes != "off" and (args.value_target not in ("search", "blend") or args.q_kind != "absolute"):
+        print("--nodes needs --value-target search|blend and --q-kind absolute", file=sys.stderr)
+        return 2
+    if args.nodes_per_world < 0:
+        print("--nodes-per-world must be >= 0", file=sys.stderr)
+        return 2
+    if args.node_min_visits < 1 or args.node_weight <= 0 or args.node_visit_ref < 0             or not 0.0 < args.node_depth_discount <= 1.0:
+        print("--node-min-visits >= 1, --node-weight > 0, --node-visit-ref >= 0, "
+              "--node-depth-discount in (0, 1]", file=sys.stderr)
+        return 2
     mu = args.td_mu if args.td_include_self else 0.0
     target_desc = args.value_target + (
         f" (lambda={args.blend_lambda}, q-kind={args.q_kind}, q-source={args.q_source}, "
@@ -1029,6 +1102,9 @@ def main(argv=None) -> int:
         td_lambda=args.td_lambda, td_n=args.td_n, td_mu=mu,
         feature_version=feature_version, x_dtype=x_dtype,
         max_per_game=args.max_per_game, seed=args.seed, workers=args.load_workers,
+        nodes=args.nodes, node_min_visits=args.node_min_visits, node_weight=args.node_weight,
+        node_visit_ref=args.node_visit_ref, node_depth_discount=args.node_depth_discount,
+        nodes_per_world=args.nodes_per_world,
     )
     extra_val: list[tuple[str, Data]] = []
     for vsrc in args.val_data:

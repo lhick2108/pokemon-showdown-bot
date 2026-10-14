@@ -260,6 +260,11 @@ class SearchConfig:
     # is recorded; otherwise a cheap fast_time_ms search that is NOT recorded. 1.0 = off.
     full_frac: float = 1.0
     fast_time_ms: int = 50
+    # Interior-node value targets (bead rnm): with export_nodes > 0 every searched world also
+    # exports up to that many sampled interior MCTS nodes (visit-weighted, each with at least
+    # export_min_visits visits) into the recording. Needs threads == 1 and a recorder; 0 = off.
+    export_nodes: int = 0
+    export_min_visits: int = 16
     # Endgame mode: exact expectiminimax instead of MCTS when few Pokemon are alive (off by default)
     endgame: str = endgame_module.OFF  # off | safest | nash
     endgame_max_alive: int = 5  # trigger: our alive + their alive (unseen count as alive) <= this
@@ -863,6 +868,11 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
                 raise ValueError(f"exploit_gain must be >= 0, got {cfg.exploit_gain}")
         if self.config.tendency and self.config.threads > 1:
             raise ValueError("tendency needs threads == 1 (it solves the root joint matrix)")
+        if self.config.export_nodes < 0 or self.config.export_min_visits < 1:
+            raise ValueError("export_nodes must be >= 0 and export_min_visits >= 1")
+        if self.config.export_nodes and self.config.threads > 1:
+            raise ValueError("export_nodes needs threads == 1 (the shared-tree search cannot export)")
+        self._export_now = False
         if self.config.mode == NASH and self.config.threads > 1:
             raise ValueError("mode nash needs threads == 1 (the shared-tree search has no joint matrix)")
         if not (math.isfinite(self.config.nash_pseudocount) and self.config.nash_pseudocount >= 0):
@@ -1035,6 +1045,7 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             truth_state, truth_status = self._truth_state(battle)
             opp_facts = _opp_facts(battle, trackers)
         world_slots, state_strings, built = self._sample_worlds(battle, trackers, n_worlds)
+        self._export_now = recording  # interior-node export only for recorded (full) searches
         results = await self._run_worlds(state_strings, time_ms)
         result_worlds = list(self._result_worlds)
         self.stats.searched += 1
@@ -1667,14 +1678,16 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
     ) -> list[WorldResult]:
         loop = asyncio.get_running_loop()
         self._paired = []
+        export = self.config.export_nodes if self._export_now and self._recorder is not None else 0
         search_fn = functools.partial(
             _worker.search_world,
             opp_names=bool(self.config.tendency or self.config.opp_model),
             opp_visits=bool(self.config.belief_reweight),
+            export_nodes=export,
+            export_min_visits=self.config.export_min_visits,
             **self._prior_kwargs(),
         ) if (self.config.tendency or self.config.belief_reweight or self.config.opp_model
-              or self.config.prior is not None) \
-            else _worker.search_world
+              or export or self.config.prior is not None) else _worker.search_world
         futures = [
             loop.run_in_executor(
                 executor, search_fn, state, time_ms, self.config.threads,

@@ -73,3 +73,30 @@ sequential Elo column (K=16, game order) is secondary and order dependent.
 After every matchup and at the end the league logs any player websocket still open,
 Foul Play process still running, or stray asyncio task. Any finding is written to
 `results.json` and the run exits with code 3.
+
+## Fixed gauntlet (`scripts/gauntlet.py`)
+
+Head-to-head against one bot is intransitive, so candidates are also judged against a fixed
+opponent set. Run from the checkout that holds `models/` (specs use relative paths):
+
+```
+python scripts/gauntlet.py --candidate "search-net:evaluator=models/x.pev:scale=1.5:mode=argmax:time_ms=1000:worlds=4" \
+    --games 100 --out data/gauntlet/x.jsonl --league-args "--search-workers 8 --concurrency 2"
+python scripts/gauntlet.py --out data/gauntlet/x.jsonl --report     # summary only
+```
+
+Default opponents: `gen2` (`search-net` with `models/gen2-res-searchabs-mlp16.pev`, scale 1.5, argmax,
+1000 ms, 4 worlds), `search` (stock, argmax, 1000 ms, 4 worlds), `human`
+(`human:model=models/human-policy-heldout.npz`, an opponent model independent of the exploit
+model) and, with `--foulplay`, `foulplay` (needs `scripts/setup_foulplay.ps1` and the server on port
+8000; `--league-args "--fp-search-time-ms 1000"`). Override the set with `--opponents-file f.json`
+(`{"label": "spec", ...}`); `--only a,b` plays a subset.
+
+Each opponent is played in chunks (`--chunk`, default 10 games, seats alternate) by a fresh
+`python -m showdown_bot.league` subprocess in `<out stem>/<opp>-<chunk>/`, so the league's
+stall handling applies per chunk and a hung chunk is killed after `--chunk-timeout` (default
+3600 s) with its finished games kept (an opponent is abandoned after `--max-failures` chunks that
+finish nothing). Every game is appended to the jsonl as it is read back; rerunning with the same
+`--out` and candidate resumes and plays only the missing games. Output: score per opponent
+(win 1, tie 0.5) with a Wilson 95% CI, and the mean of the per-opponent scores with a bootstrap
+95% CI (resampling games within each opponent).

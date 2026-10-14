@@ -979,6 +979,28 @@ impl<'a> LeafEval<'a> {
         }
     }
 
+    /// Absolute logit of P(side one wins) for a raw `value()`: the stock evaluation is scaled
+    /// by 0.0125 (as in `score`), a learned logit is already one.
+    #[inline]
+    pub fn abs_logit_of_raw(&self, raw: f32) -> f32 {
+        match self.learned {
+            None => 0.0125 * raw,
+            Some(_) => raw,
+        }
+    }
+
+    /// Inverts `score` for a mean MCTS score `mean` (relative to the root value `root_raw`):
+    /// the absolute logit of P(side one wins) the search assigns to the averaged positions.
+    pub fn absolute_logit(&self, root_raw: f32, mean: f32) -> f32 {
+        let p = mean.clamp(1e-4, 1.0 - 1e-4);
+        let rel = (p / (1.0 - p)).ln();
+        match self.learned {
+            None => 0.0125 * root_raw + rel,
+            Some(ev) if ev.relative_to_root => root_raw + rel / ev.leaf_scale,
+            Some(ev) => rel / ev.leaf_scale,
+        }
+    }
+
     /// Maps (leaf value, root value) to an MCTS score in [0, 1].
     #[inline]
     pub fn score(&self, leaf: f32, root: f32) -> f32 {

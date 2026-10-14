@@ -495,6 +495,9 @@ pub fn perform_mcts_shared_tree_with(
     };
     MctsResult {
         joint: None,
+        nodes: None,
+        root_value: f32::NAN, // single-threaded search only
+        root_search_value: f32::NAN,
         s1: side(&options.s1),
         s2: side(&options.s2),
         iteration_count: root.times_visited.load(Ordering::Acquire),
