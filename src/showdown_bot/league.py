@@ -34,7 +34,7 @@ from poke_env import to_id_str
 from poke_env.player import Player
 from poke_env.ps_client import AccountConfiguration, LocalhostServerConfiguration
 
-from showdown_bot import bench
+from showdown_bot import bench, compute
 from showdown_bot import teams as teams_module
 from showdown_bot.bench import FOULPLAY_NAME
 
@@ -518,6 +518,22 @@ def format_markdown(res: dict) -> str:
                     cells.append(f"{h['mean']:.0%} [{h['ci_low']:.0%}, {h['ci_high']:.0%}] "
                                  f"({h['pairs']} pairs)")
             lines.append(f"| **{a}** | " + " | ".join(cells) + " |")
+    comp = res.get("compute")
+    if comp:
+        pre = comp.get("preflight", {})
+        lines += ["", "## Compute", ""]
+        if pre:
+            lines.append(pre["line"])
+        lines += [f"- {w}" for w in comp.get("preflight_warnings", [])]
+        if comp.get("bots"):
+            lines += ["", "Measured MCTS iterations per second of per-world budget "
+                      "(low or uneven values mean starved searches).", "",
+                      "| Bot | Iter/s | Iterations | Decisions | Escalations | Fallbacks | World errors |",
+                      "|---|---|---|---|---|---|---|"]
+            for label, r in comp["bots"].items():
+                lines.append(
+                    f"| {label} | {r['iterations_per_s']:,.0f} | {r['iterations']:,} | "
+                    f"{r['decisions']} | {r['escalations']} | {r['fallbacks']} | {r['world_errors']} |")
     if res.get("leaks"):
         lines += ["", "## Leak report", "", *[f"- {x}" for x in res["leaks"]]]
     return "\n".join(lines) + "\n"
@@ -557,7 +573,9 @@ class LeagueConfig:
     teams: str = "random"  # random | swap | mirror (showdown_bot.teams)
     team_seed: int = 0
     port: int = 8000
+    strict_compute: bool = False  # refuse to start when search_workers > cores - 2
     specs: dict = field(default_factory=dict)  # label -> BotSpec
+    compute: dict = field(default_factory=dict)  # filled by run_league: preflight + throughput
 
 
 class Tracker:
@@ -566,6 +584,26 @@ class Tracker:
     def __init__(self) -> None:
         self.players: list[Player] = []
         self.processes: list = []
+        self.by_label: dict[str, list[Player]] = {}  # bot label -> its players (throughput)
+        self.live: dict[tuple[str, str], tuple[Player, Player]] = {}  # running matchups
+        self.finished: dict[tuple[str, str], list[Game]] = {}  # completed matchups
+
+    def add(self, label: str, player: Player) -> None:
+        self.players.append(player)
+        self.by_label.setdefault(label, []).append(player)
+
+    def tally(self) -> list[tuple[str, str, int, int, int]]:
+        """``(a, b, a wins, b wins, ties)`` per matchup so far (running or complete)."""
+        rows = []
+        for (a, b), games in self.finished.items():
+            rows.append((a, b, sum(g.winner == a for g in games),
+                         sum(g.winner == b for g in games), sum(g.winner == TIE for g in games)))
+        for (a, b), (pa, pb) in self.live.items():
+            if (a, b) in self.finished:
+                continue
+            ties = pa.n_tied_battles
+            rows.append((a, b, pa.n_won_battles, pb.n_won_battles, ties))
+        return rows
 
     def open_connections(self) -> list[str]:
         bad = []
@@ -702,10 +740,11 @@ async def play_matchup(a: str, b: str, cfg: LeagueConfig, tracker: Tracker, reco
     try:
         pa = _make_player(cfg.specs[a], cfg, recorder, cfg.concurrency, 2 * pair_index)
         players.append(pa)
-        tracker.players.append(pa)
+        tracker.add(a, pa)
         pb = _make_player(cfg.specs[b], cfg, recorder, cfg.concurrency, 2 * pair_index + 1)
         players.append(pb)
-        tracker.players.append(pb)
+        tracker.add(b, pb)
+        tracker.live[(a, b)] = (pa, pb)
         await bench._wait_for_player_logins(players, cfg.connect_timeout)
         by_name = {a: pa, b: pb}
         seen: set = set()  # shared: both players hold every battle of the pair
@@ -757,7 +796,7 @@ async def _play_foulplay_matchup(a, b, cfg, tracker, recorder, games_path, pair_
     games: list[Game] = []
     try:
         bot = _make_player(cfg.specs[bot_name], cfg, recorder, 1, 2 * pair_index)
-        tracker.players.append(bot)
+        tracker.add(bot_name, bot)
         await bench._wait_for_player_logins([bot], cfg.connect_timeout)
         seen: set = set()
         for game in range(1, n + 1):
@@ -826,6 +865,85 @@ def load_report(pairs: Sequence[tuple[BotSpec, BotSpec]], cfg: LeagueConfig,
     return line, warning
 
 
+def league_preflight(specs: Sequence[BotSpec], cfg: LeagueConfig,
+                     cpu_count: int | None = None) -> tuple[dict, list[str], bool]:
+    """Compute preflight: pool workers vs cores and peak concurrent world jobs vs workers.
+
+    Peak demand = the busiest ``parallel_pairs`` matchups, each search player of a
+    matchup searching ``worlds`` worlds for each of its ``concurrency`` games at once.
+    Returns ``(report dict, warnings, refuse)``.
+    """
+    from showdown_bot.players.search import SearchConfig
+
+    def worlds(spec: BotSpec) -> int:
+        return spec.param("worlds") or SearchConfig().plan(True)[0]
+
+    by = {s.label: s for s in specs}
+    per_pair = sorted(
+        (sum(worlds(x) * cfg.concurrency for x in (by[a], by[b]) if x.type in SEARCH_BOTS)
+         for a, b in roundrobin_pairs(list(by))), reverse=True)
+    demand = sum(per_pair[: cfg.parallel_pairs])
+    workers = cfg.search_workers or SearchConfig().parallelism  # per-player default pool
+    info, warnings, refuse = compute.preflight(
+        workers, demand, cpu_count, strict=cfg.strict_compute and demand > 0)
+    if not cfg.search_workers and demand:
+        warnings.append("WARNING: no --search-workers: all search players share a default "
+                        f"pool of {workers} worker(s); set --search-workers")
+    return {"workers": workers, "peak_world_jobs": demand,
+            "cores": cpu_count if cpu_count is not None else os.cpu_count(),
+            "line": info[0]}, warnings, refuse
+
+
+def compute_report(tracker: Tracker) -> dict:
+    """Measured MCTS throughput per search bot, summed over all its players."""
+    out = {}
+    for label, players in tracker.by_label.items():
+        st = [p.stats for p in players if hasattr(getattr(p, "stats", None), "iterations")]
+        if not st:
+            continue
+        iters = sum(x.iterations for x in st)
+        ms = sum(x.search_ms for x in st)
+        out[label] = {
+            "iterations": iters, "search_ms": ms,
+            "iterations_per_s": iters / (ms / 1000) if ms else 0.0,
+            "decisions": sum(x.searched for x in st),
+            "escalations": sum(x.escalations for x in st),
+            "fallbacks": sum(x.fallbacks for x in st),
+            "world_errors": sum(x.world_errors for x in st),
+        }
+    return out
+
+
+def emit_progress(tracker: Tracker, printer: compute.ProgressPrinter) -> None:
+    """Print one flushed progress line if the finished-game count changed."""
+    rows = tracker.tally()
+    done = sum(w1 + w2 + t for _, _, w1, w2, t in rows)
+    busy = [r for r in rows if (r[0], r[1]) not in tracker.finished]
+    pick = busy or rows
+    if not pick:
+        printer.changed = False
+        return
+    a, b, w1, w2, t = pick[0]
+    others = "; ".join(f"{x} {p}-{q} {y}" for x, y, p, q, _ in pick[1:4])
+    printer.update(done, f"{a} v {b}", w1, w2, t, others or None)
+
+
+async def _progress(tracker: Tracker, total: int, interval: float = 3.0,
+                    heartbeat: float = 120.0) -> None:
+    """Print a progress line whenever a game finishes (and every ``heartbeat`` s)."""
+    printer = compute.ProgressPrinter(total)
+    quiet_since = time.monotonic()
+    while True:
+        await asyncio.sleep(interval)
+        emit_progress(tracker, printer)
+        if printer.changed:
+            quiet_since = time.monotonic()
+        elif time.monotonic() - quiet_since > heartbeat:
+            printer.last = -1  # still running, no game finished: say so
+            emit_progress(tracker, printer)
+            quiet_since = time.monotonic()
+
+
 async def run_league(specs: Sequence[BotSpec], cfg: LeagueConfig) -> tuple[list[Game], list[str]]:
     if cfg.teams != "random":
         if cfg.games_per_pair % 2:
@@ -850,12 +968,20 @@ async def run_league(specs: Sequence[BotSpec], cfg: LeagueConfig) -> tuple[list[
     logger.info(line)
     if warning:
         logger.warning(warning)
+    pre, pre_warnings, refuse = league_preflight(specs, cfg)
+    logger.info(pre["line"])
+    for w in pre_warnings:
+        logger.warning(w)
+    if refuse:
+        raise ValueError(pre_warnings[-1])
+    cfg.compute = {"preflight": pre, "preflight_warnings": pre_warnings}
 
     def make_job(idx, a, b):
         async def job():
             start = time.perf_counter()
             logger.info("matchup %s vs %s (%d games)", a, b, cfg.games_per_pair)
             got = await play_matchup(a, b, cfg, tracker, recorder, games_path, idx)
+            tracker.finished[(a, b)] = got
             logger.info("  %s %d - %d %s (%d games, %.0fs)", a, sum(g.winner == a for g in got),
                         sum(g.winner == b for g in got), b, len(got), time.perf_counter() - start)
             leaks = tracker.open_connections()
@@ -864,8 +990,21 @@ async def run_league(specs: Sequence[BotSpec], cfg: LeagueConfig) -> tuple[list[
             return got
         return job
 
-    results = await run_limited(
-        [make_job(i, a, b) for i, (a, b) in enumerate(pairs)], cfg.parallel_pairs)
+    total = len(pairs) * cfg.games_per_pair
+    ticker = asyncio.ensure_future(_progress(tracker, total))
+    try:
+        results = await run_limited(
+            [make_job(i, a, b) for i, (a, b) in enumerate(pairs)], cfg.parallel_pairs)
+    finally:
+        ticker.cancel()
+        await asyncio.gather(ticker, return_exceptions=True)
+        emit_progress(tracker, compute.ProgressPrinter(total))
+    cfg.compute["bots"] = compute_report(tracker)
+    for label, r in cfg.compute["bots"].items():
+        logger.info("%s", compute.iterations_line(
+            label, r["iterations"], r["search_ms"], decisions=r["decisions"],
+            escalations=r["escalations"], fallbacks=r["fallbacks"],
+            world_errors=r["world_errors"]))
     all_games = [g for got in results for g in got]
     await asyncio.sleep(0.2)
     leaks = tracker.open_connections()
@@ -928,6 +1067,9 @@ def _parser() -> argparse.ArgumentParser:
                    help="one MCTS process pool of this size shared by all search players")
     p.add_argument("--parallel-pairs", type=bench._positive_int, default=1,
                    help="matchups played concurrently")
+    p.add_argument("--strict-compute", action="store_true",
+                   help="refuse to start when --search-workers > cores - 2 (room for the main "
+                        "process and the node server); otherwise only warn")
     p.add_argument("--bootstrap", type=int, default=1000)
     p.add_argument("--anchor", default=None, help="bot whose rating is 0 (default: mean 0)")
     return p
@@ -962,6 +1104,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         fp_threads=args.fp_threads, seed=args.seed,
         search_workers=args.search_workers, parallel_pairs=args.parallel_pairs,
         teams=args.teams, team_seed=args.team_seed, port=args.port,
+        strict_compute=args.strict_compute,
     )
     if args.teams != "random" and args.games_per_pair % 2:
         print(f"error: --teams {args.teams} needs an even --games-per-pair", file=sys.stderr)
@@ -978,7 +1121,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     res = write_results(
         cfg.out, games, [s.label for s in specs], n_boot=args.bootstrap, seed=args.seed,
         anchor=anchor,
-        extra={"leaks": leaks, "games_per_pair": cfg.games_per_pair,
+        extra={"leaks": leaks, "games_per_pair": cfg.games_per_pair, "compute": cfg.compute,
                "specs": {s.label: s.text for s in specs}},
     )
     print(format_markdown(res))

@@ -337,3 +337,29 @@ def test_float16_data_keeps_the_stock_eval_separate(state_strings):
     model = train.build_model("mlp", pe.feature_length(2), 4, (a0, b0), freeze_a=True)
     res = train.fit(model, data, data, device=torch.device("cpu"), epochs=2, log=lambda *_: None)
     assert res.history[0][2] < 1.5
+
+
+def test_stock_logistic_baseline_is_train_fit_val_scored_apples_to_apples():
+    rng = np.random.default_rng(3)
+
+    def make(n, tag):
+        e = rng.normal(0, 150, n).astype(np.float32)
+        y = (rng.random(n) < 1 / (1 + np.exp(-0.6 * 0.0125 * e))).astype(np.float32)
+        w = rng.uniform(0.5, 1.5, n).astype(np.float32)
+        w /= w.mean()
+        x = np.zeros((n, 2), dtype=np.float32)
+        return train.Data(x, y, w, [f"{tag}{i}" for i in range(n)], [None] * n, stock_eval=e,
+                          residual=True, e_sep=e)
+
+    tr, va = make(4000, "t"), make(1500, "v")
+    bce, a, b = train.stock_eval_logistic_bce(tr, va)
+    a0, b0 = train.fit_stock_logistic(tr.e, tr.y, tr.w)  # the residual-mode "stock-only" fit
+    assert (a, b) == pytest.approx((a0, b0), abs=1e-6)
+    logits = torch.from_numpy((0.0125 * a0 * va.e + b0).astype(np.float32))
+    expect = train.weighted_bce(logits, torch.from_numpy(va.y), torch.from_numpy(va.w))
+    assert bce == pytest.approx(expect, abs=1e-5)  # val weights, train fit
+    # it is a train fit: refitting on val is at least as good in-sample
+    av, bv = train.fit_stock_logistic(va.e, va.y, va.w)
+    own = torch.from_numpy((0.0125 * av * va.e + bv).astype(np.float32))
+    assert train.weighted_bce(own, torch.from_numpy(va.y), torch.from_numpy(va.w)) <= bce + 1e-6
+    assert a == pytest.approx(0.6, abs=0.15)

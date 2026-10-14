@@ -799,9 +799,7 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             built = built or world
             self.stats.unknown_ids += len(world.unknown_ids)
             state_strings.append(world.to_string())
-        decision_started = time.perf_counter()
         results = await self._run_worlds(state_strings, time_ms)
-        run_wall = time.perf_counter() - decision_started
         self.stats.searched += 1
         if not results:
             raise RuntimeError("every world failed")
@@ -812,6 +810,9 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             noop = dq.noop_choices(state_strings, choices, cfg.noop_vs_switches)
         final_ms = time_ms
         escalated = 0
+        pool_size = getattr(self._executor, "_max_workers", None) or cfg.parallelism
+        waves = max(1, -(-len(state_strings) // max(1, pool_size)))
+        spent_s = waves * time_ms / 1000.0  # compute time used so far (queue-free)
         policy, nash_records, mode = self._policy_of(results, battle, query)
         adjusted, changes = dq.adjust_policy(
             policy, results, noop=noop, tera_margin=cfg.tera_margin
@@ -821,17 +822,19 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
                 if not dq.flat_root(adjusted, results, cfg.escalate_gap):
                     break
                 target = time_ms * (1.0 + (cfg.escalate_factor - 1.0) * step / cfg.escalate_steps)
-                # wall time scales ~linearly with the per-world budget
-                elapsed = time.perf_counter() - decision_started
-                affordable = final_ms * (cfg.escalate_cap_ms / 1000.0 - elapsed) / max(run_wall, 1e-3)
+                # Budget from per-world compute time, never from wall time: wall time
+                # includes process-pool queueing, which under load (many games in
+                # flight) made escalation silently stop firing. A run of ``ms`` per
+                # world costs ``waves * ms`` of compute; spend what the cap leaves.
+                left_s = cfg.escalate_cap_ms / 1000.0 - spent_s
+                affordable = left_s * 1000.0 / waves
                 new_ms = int(min(target, affordable))
                 if new_ms < final_ms * 1.25:
                     break
-                started_run = time.perf_counter()
                 more = await self._run_worlds(state_strings, new_ms)
                 if not more:
                     break
-                run_wall = time.perf_counter() - started_run
+                spent_s += waves * new_ms / 1000.0
                 results, final_ms = more, new_ms
                 escalated += 1
                 policy, nash_records, mode = self._policy_of(results, battle, query)

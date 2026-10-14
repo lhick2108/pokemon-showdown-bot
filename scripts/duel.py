@@ -30,7 +30,7 @@ from pathlib import Path
 
 from poke_env.ps_client import AccountConfiguration, LocalhostServerConfiguration
 
-from showdown_bot import bench
+from showdown_bot import bench, compute
 from showdown_bot import teams as teams_module
 from showdown_bot.players.search import (
     MODES, SELECTIONS, SearchConfig, SearchNetPlayer, SearchPlayer, get_pool,
@@ -119,6 +119,9 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--threads", type=bench._positive_int, default=1)
     p.add_argument("--workers", type=bench._positive_int, default=os.cpu_count() or 4,
                    help="shared MCTS process pool size")
+    p.add_argument("--strict-compute", action="store_true",
+                   help="refuse to start when --workers > cores - 2 (room for the main process "
+                        "and the node server); otherwise only warn")
     p.add_argument("--port", type=int, default=8000, help="local Showdown server port")
     p.add_argument("--connect-timeout", type=bench._positive_seconds, default=30)
     p.add_argument("--game-timeout", type=bench._positive_seconds, default=900)
@@ -146,7 +149,7 @@ def _quality(args, side: str) -> dict:
     }
 
 
-async def _duel_pair(args, share: int, pool, plans=None):
+async def _duel_pair(args, share: int, pool, plans=None, live=None):
     """One parallel net-vs-stock pair. Returns (net, stock, results), ``results`` being
     ``[(team pair, net score)]`` for the games of ``plans`` (empty with --teams random)."""
     options = {
@@ -200,6 +203,8 @@ async def _duel_pair(args, share: int, pool, plans=None):
         executor=pool, **options,
     )
     results: list[tuple[int, float]] = []
+    if live is not None:
+        live.append((net, stock, results))
     try:
         await bench._wait_for_player_logins([net, stock], args.connect_timeout)
         if plans is None:
@@ -220,6 +225,31 @@ async def _duel_pair(args, share: int, pool, plans=None):
     return net, stock, results
 
 
+def _tally(live) -> tuple[int, int, int, int]:
+    """(finished, net wins, stock wins, ties) over every pair so far."""
+    done = sum(net.n_finished_battles for net, _, _ in live)
+    wins = sum(net.n_won_battles for net, _, _ in live)
+    ties = sum(net.n_tied_battles for net, _, _ in live)
+    return done, wins, done - wins - ties, ties
+
+
+async def _progress(args, live, interval: float = 2.0, heartbeat: float = 120.0):
+    """Print a flushed progress line whenever a game finishes (and every ``heartbeat`` s)."""
+    printer = compute.ProgressPrinter(args.games)
+    quiet_since = time.monotonic()
+    while True:
+        await asyncio.sleep(interval)
+        done, wins, losses, ties = _tally(live)
+        rows = [r for _, _, res in live for r in res]
+        paired = compute.paired_text(rows) if args.teams != "random" else None
+        if printer.update(done, "net", wins, losses, ties, paired):
+            quiet_since = time.monotonic()
+        elif time.monotonic() - quiet_since > heartbeat:
+            printer.last = -1  # still running, no game finished: say so
+            printer.update(done, "net", wins, losses, ties, paired)
+            quiet_since = time.monotonic()
+
+
 async def _run(args):
     pool = get_pool(args.workers)
     if args.teams == "random":
@@ -230,8 +260,10 @@ async def _run(args):
         plans = teams_module.plan_games(args.teams, args.games, args.team_seed)
         starts = [sum(shares[:i]) for i in range(len(shares))]
         share_plans = [teams_module.slice_plans(plans, s, st) for s, st in zip(shares, starts)]
-    tasks = [asyncio.ensure_future(_duel_pair(args, s, pool, sp))
+    live: list = []
+    tasks = [asyncio.ensure_future(_duel_pair(args, s, pool, sp, live))
              for s, sp in zip(shares, share_plans)]
+    ticker = asyncio.ensure_future(_progress(args, live))
     try:
         return await asyncio.gather(*tasks)
     except BaseException:
@@ -239,6 +271,22 @@ async def _run(args):
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         raise
+    finally:
+        ticker.cancel()
+        await asyncio.gather(ticker, return_exceptions=True)
+        done, wins, losses, ties = _tally(live)
+        compute.ProgressPrinter(args.games).update(done, "net", wins, losses, ties)
+
+
+def _preflight(args) -> bool:
+    """Print the compute preflight; False when --strict-compute refuses to start."""
+    worlds = args.worlds or SearchConfig(parallelism=args.parallelism).plan(True)[0]
+    demand = args.pairs * 2 * worlds  # both players of every pair search at once
+    info, warnings, refuse = compute.preflight(args.workers, demand, strict=args.strict_compute)
+    print(f"{info[0]} ({args.pairs} pairs x 2 players x {worlds} worlds)", flush=True)
+    for w in warnings:
+        print(w, file=sys.stderr, flush=True)
+    return not refuse
 
 
 def main(argv=None) -> int:
@@ -275,6 +323,8 @@ def main(argv=None) -> int:
         except ValueError as exc:
             print(str(exc), file=sys.stderr)
             return 2
+    if not _preflight(args):
+        return 2
     start = time.perf_counter()
     try:
         pairs = asyncio.run(_run(args))
@@ -323,9 +373,7 @@ def main(argv=None) -> int:
         print(f"{label}: decisions={sum(x.searched for x in st)} escalations={sum(x.escalations for x in st)} "
               f"noop_pruned={sum(x.noop_pruned for x in st)} tera_folded={sum(x.tera_folded for x in st)}")
         werr = sum(p[idx].stats.world_errors for p in pairs)
-        print(f"{label}: {iters / (ms / 1000) if ms else 0:,.0f} iterations per second of "
-              f"per-world budget ({iters:,} iterations over {ms / 1000:.0f} s); "
-              f"fallbacks={fb} world_errors={werr}")
+        print(compute.iterations_line(label, iters, ms, fallbacks=fb, world_errors=werr))
     print(f"wall time: {elapsed:.0f} s")
     return 0 if n else 1
 

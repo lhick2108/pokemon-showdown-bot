@@ -250,3 +250,29 @@ def test_opponent_replies_include_switches_only_in_strict_mode(player):
     loose = dq._opponent_replies(state, switches=False)
     assert len(strict) > len(loose) >= 2 and "none" in loose
     assert set(loose) < set(strict)
+
+
+def test_escalation_ignores_pool_queueing_delay(data, monkeypatch):
+    """Queue wait inflates wall time, not compute; it must not suppress escalation."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    calls = []
+    pool = ThreadPoolExecutor(max_workers=2)
+    p = SearchPlayer(
+        battle_format="gen9randombattle", start_listening=False, log_level=50, data=data,
+        config=SearchConfig(search_time_ms=40, worlds=2, escalate=True, escalate_gap=2.0,
+                            escalate_factor=3.0, escalate_cap_ms=1000),
+        executor=pool, seed=1,
+    )
+    real = p._run_worlds
+
+    async def queued(states, time_ms):
+        calls.append(time_ms)
+        if len(calls) == 1:
+            await asyncio.sleep(0.9)  # simulated wait behind other games' jobs
+        return await real(states, time_ms)
+
+    monkeypatch.setattr(p, "_run_worlds", queued)
+    asyncio.run(p.choose_move(_battle()))
+    assert calls == [40, 120] and p.stats.escalations == 1
+    pool.shutdown(wait=False, cancel_futures=True)
