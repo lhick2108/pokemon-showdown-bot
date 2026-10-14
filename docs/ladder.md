@@ -89,3 +89,38 @@ The bot stays logged in on the public server and plays whoever challenges it, in
 - Local check (needs the local server): `python scripts/challenge_dryrun.py` starts the
   bot with `--dry-run`, challenges it in gen8randombattle (rejected) then
   gen9randombattle (accepted and played).
+
+## Interleaved A/B testing (one account)
+
+Compare two search configurations on the same ladder account, same hours, same
+opponent pool. Repeat `--arm NAME=EVALUATOR.pev[:key=value...]` (league spec syntax: the
+usual `scale=`, `time_ms=`, `worlds=` ... keys; the long form
+`NAME=search-net:evaluator=X.pev:scale=2` also works). `--arm` replaces `--bot`.
+
+```bash
+python scripts/ladder.py --games 200 --ab-seed 1 \
+  --arm gen2=models/gen2-res-searchabs-mlp16.pev:scale=1.5 \
+  --arm v2s=models/v2-search-h64.pev:scale=2.0
+python scripts/ab_report.py data/ladder/ab.jsonl
+```
+
+How it works: there is still ONE player and ONE connection (no second login). Before each
+`ladder(1)` search the arm of the next battle is drawn from shuffled blocks holding each arm
+twice (balanced to within 2 games, seeded by `--ab-seed`). The battle is bound to that arm at its
+first decision, and the player swaps its `SearchConfig` (evaluator, scale, ...) to the
+battle's arm on every decision, so a battle never mixes arms. Requires `--max-concurrent 1`
+(the default) and ladder mode. `--dry-run` works for a local rehearsal.
+
+Records: one JSON line per battle appended to `--ab-log` (default `data/ladder/ab.jsonl`, kept
+across runs so it accumulates): battle tag, arm, evaluator path, scale, spec, our rating
+before/after, opponent name and rating, result, turns, timestamp. `games.jsonl` gets an
+`arm` field and the per-decision `records/` store the arm's config; `summary.txt` lists
+games and wins per arm.
+
+`scripts/ab_report.py` prints per arm games / wins / win rate with a Wilson 95% CI / mean
+opponent rating; the arm difference with a 95% CI; a logistic regression
+`win ~ arm + (opp_rating - our_rating)/400` (IRLS, numpy) giving the arm effect in
+win-probability points at equal ratings; and the games per arm needed to resolve the
+observed difference (~50% power and 80% power). Ties are excluded; games missing a
+rating are left out of the regression only. Ladder noise is large: resolving a 5-point
+difference needs on the order of 1500+ games per arm.

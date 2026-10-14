@@ -27,7 +27,7 @@ from poke_env.ps_client import (
     AccountConfiguration, LocalhostServerConfiguration, ShowdownServerConfiguration,
 )
 
-from showdown_bot import bench, ladder, league
+from showdown_bot import bench, ladder, ladder_ab, league
 
 REPO = Path(__file__).resolve().parent.parent
 logger = logging.getLogger("ladder")
@@ -38,6 +38,14 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--games", type=bench._positive_int, required=True,
                    help="ladder games to play, then stop")
     p.add_argument("--bot", default="search", help="league spec syntax (default: search)")
+    p.add_argument("--arm", action="append", default=[], metavar="NAME=EVAL.pev[:scale=K...]",
+                   help="interleaved A/B test (repeat, >= 2): each NEW battle is assigned one arm "
+                        "at random; same one-account connection. Spec = league syntax, e.g. "
+                        "gen2=models/a.pev:scale=1.5 or v2=search-net:evaluator=b.pev:scale=2. "
+                        "Replaces --bot; needs --max-concurrent 1")
+    p.add_argument("--ab-seed", type=int, default=0, help="seed of the arm assignment (default 0)")
+    p.add_argument("--ab-log", type=Path, default=None,
+                   help="append one JSON line per battle (default data/ladder/ab.jsonl)")
     p.add_argument("--dry-run", action="store_true",
                    help="ladder on the LOCAL server 127.0.0.1:8000 with throwaway accounts")
     p.add_argument("--accept-challenges", action="store_true",
@@ -66,7 +74,10 @@ class Run:
         self.args, self.out, self.creds = args, out, creds
         self.games: list[ladder.LadderGame] = []
         self.players: list = []
-        self.spec = league.parse_spec(args.bot)
+        self.arms = ladder_ab.parse_arms(args.arm) if args.arm else None
+        self.controller = ladder_ab.ArmController(self.arms, args.ab_seed) if self.arms else None
+        self.ab_log = args.ab_log or REPO / "data" / "ladder" / "ab.jsonl"
+        self.spec = self.arms[0].spec if self.arms else league.parse_spec(args.bot)
         self.policy = None
         self.challenge_events: list[dict] = []
         if args.accept_challenges:
@@ -84,6 +95,10 @@ class Run:
 
     def on_finish(self, player, battle) -> None:
         game = ladder.game_from_battle(battle, player.username)
+        arm = self.controller.get(battle.battle_tag) if self.controller else None
+        if self.controller:
+            game.arm = arm.name if arm else None
+            ladder_ab.append_record(self.ab_log, ladder_ab.ab_record(game, arm, player.username))
         log = self.out / "logs" / f"{ladder.safe_filename(battle.battle_tag)}.log"
         log.parent.mkdir(parents=True, exist_ok=True)
         reqs = getattr(player, "battle_requests", {}).get(battle.battle_tag, [])
@@ -96,7 +111,8 @@ class Run:
         self.games.append(game)
         rating = (f"{game.rating_before}->{game.rating_after}"
                   if game.rating_after is not None else "n/a")
-        print(f"[{len(self.games)}/{self.args.games}] {game.battle_tag} vs {game.opponent}: "
+        tag = f" [{game.arm}]" if game.arm else ""
+        print(f"[{len(self.games)}/{self.args.games}]{tag} {game.battle_tag} vs {game.opponent}: "
               f"{game.result} in {game.turns} turns, rating {rating}", flush=True)
 
     def recorder(self):
@@ -107,6 +123,8 @@ class Run:
         return self._recorder
 
     def wrap(self, cls):
+        if self.controller is not None:
+            cls = ladder_ab.with_arm_switch(cls, self.controller)
         cls = ladder.with_ladder_hooks(
             cls, move_cap_s=self.args.move_cap, on_finish=self.on_finish,
             save_server_replay=self.args.save_replays,
@@ -220,11 +238,16 @@ class Run:
             await bench._wait_for_player_logins([player], args.connect_timeout)
             print(f"Logged in as {player.username} on "
                   f"{'LOCAL dry-run server' if args.dry_run else 'public server'}; "
-                  f"bot {self.spec.label}; move cap {args.move_cap:g}s", flush=True)
+                  f"bot {self.spec.label if not self.arms else 'A/B ' + ' vs '.join(self.controller.arms)}"
+                  f"; move cap {args.move_cap:g}s", flush=True)
             reconnects = 0
             while len(self.games) < args.games:
                 remaining = args.games - len(self.games)
                 chunk = 1 if args.max_concurrent == 1 else remaining
+                if self.controller is not None:
+                    # arm of the next battle, fixed before the search starts
+                    # (kept across a reconnect until a battle actually uses it)
+                    self.controller.prepare_next()
                 task = asyncio.create_task(player.ladder(chunk))
                 deadline = time.monotonic() + args.game_timeout * chunk
                 reason = None
@@ -276,6 +299,12 @@ class Run:
             text = text.replace("Ladder games", "Challenge games", 1)
             text += (f"\nChallenges accepted {self.policy.counts['accepted']}, "
                      f"rejected {self.policy.counts['rejected']}")
+        if self.arms:
+            for a in self.arms:
+                g = [x for x in self.games if x.arm == a.name]
+                w = sum(x.result == "win" for x in g)
+                text += f"\nArm {a.name}: {len(g)} games, {w} wins ({a.spec.text})"
+            text += f"\nA/B log: {self.ab_log} (analyse with scripts/ab_report.py)"
         text += f"\nDecisions over the time cap: {caps}"
         stats = [p for p in self.players if hasattr(p, "stats")]
         if stats:
@@ -299,7 +328,12 @@ def main(argv=None) -> int:
             print("note: the account name should say it is a bot (politeness rule, docs/ladder.md)",
                   file=sys.stderr)
     try:
-        league.parse_spec(args.bot)
+        if args.arm:
+            if args.accept_challenges or args.max_concurrent != 1:
+                raise ValueError("--arm needs ladder mode with --max-concurrent 1")
+            ladder_ab.parse_arms(args.arm)
+        else:
+            league.parse_spec(args.bot)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
