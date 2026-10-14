@@ -26,6 +26,25 @@ Weighting (``--weighting``)
     within the train and val sets. Early stopping uses the weighted val BCE;
     the report also gives unweighted numbers.
 
+Sources, subsampling and source weights (``--data``, ``--val-data``)
+    Each ``--data`` is ``PATH[@K][:wW]``: ``@K`` keeps at most K decisions per game
+    record from that source (overrides the global ``--max-per-game``, default 0 = all;
+    ``@0`` = all), ``:wW`` multiplies the weights of that source's samples by W (after
+    the ``--weighting`` weights, before normalisation to mean 1), e.g.
+    ``--data data/human/pc1/train@3:w0.5 --data data/selfplay/gen4@4``. The K decisions
+    are drawn uniformly without replacement among a record's decisions that have a state
+    under ``--states``, seeded by ``--seed`` and the record's file name (reproducible),
+    BEFORE feature extraction, so memory and load time shrink proportionally (many
+    positions per game make the value net memorise outcomes; fewer per game from more
+    games generalise better). ``td``/``nstep`` targets look ahead only among the kept
+    decisions, so avoid subsampling with them. Per-source counts (records, decisions
+    kept, samples) are printed at load time, and with a non-outcome ``--value-target``
+    also how many samples per source had no search value and fell back to the outcome
+    (e.g. human records). ``--val-data DIR`` (repeatable, same syntax) adds extra
+    held-out sets, never trained on: each epoch's log line and the final report give the
+    BCE against the outcome. They do not affect early stopping unless
+    ``--early-stop-on val-data`` (then the first ``--val-data`` set decides).
+
 Value target (``--value-target``)
     ``outcome`` (default): the game outcome z. ``search``: q, the MCTS root
     average score recorded per decision (``dataset.Sample.search_value``).
@@ -69,6 +88,7 @@ from __future__ import annotations
 import argparse
 import math
 import random
+import re
 import sys
 import time
 from collections import defaultdict
@@ -90,6 +110,32 @@ N_BUCKETS = 10
 # ---------------------------------------------------------------------------
 # Data
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Source:
+    """One ``--data`` / ``--val-data`` entry: a directory plus its subsample / weight options."""
+
+    path: Path
+    max_per_game: int | None = None  # None = use the global default
+    weight: float = 1.0
+
+
+_SOURCE_RE = re.compile(r"^(.*?)(?:@(\d+))?(?::w(\d+(?:\.\d*)?|\.\d+))?$", re.DOTALL)
+
+
+def parse_source(spec: str | Path | Source) -> Source:
+    """Parse ``PATH[@K][:wW]`` (``@K`` decisions per record, ``:wW`` weight multiplier)."""
+    if isinstance(spec, Source):
+        return spec
+    m = _SOURCE_RE.match(str(spec))
+    path, k, w = m.groups()  # the regex always matches
+    if not path:
+        raise argparse.ArgumentTypeError(f"empty path in data spec {str(spec)!r}")
+    weight = 1.0 if w is None else float(w)
+    if weight <= 0:
+        raise argparse.ArgumentTypeError(f"source weight must be > 0 in {str(spec)!r}")
+    return Source(Path(path), None if k is None else int(k), weight)
 
 
 @dataclass
@@ -139,16 +185,27 @@ class Data:
         )
 
 
-def sample_weights(tags: list[str], weighting: str) -> np.ndarray:
-    """Per-sample weights (mean 1) that stop long battles dominating; see module doc."""
+def sample_weights(
+    tags: list[str], weighting: str, multiplier: np.ndarray | None = None
+) -> np.ndarray:
+    """Per-sample weights (mean 1) that stop long battles dominating; see module doc.
+
+    ``multiplier`` (per-sample, e.g. the per-source weight) is applied on top of the
+    ``weighting`` weights before the normalisation to mean 1.
+    """
     n = len(tags)
-    if weighting == "none" or n == 0:
-        return np.ones(n, dtype=np.float32)
-    counts: dict[str, int] = defaultdict(int)
-    for tag in tags:
-        counts[tag] += 1
-    power = 0.5 if weighting == "sqrt" else 1.0
-    w = np.array([counts[t] ** -power for t in tags], dtype=np.float64)
+    if n == 0:
+        return np.ones(0, dtype=np.float32)
+    if weighting == "none":
+        w = np.ones(n, dtype=np.float64)
+    else:
+        counts: dict[str, int] = defaultdict(int)
+        for tag in tags:
+            counts[tag] += 1
+        power = 0.5 if weighting == "sqrt" else 1.0
+        w = np.array([counts[t] ** -power for t in tags], dtype=np.float64)
+    if multiplier is not None:
+        w = w * np.asarray(multiplier, dtype=np.float64)
     return (w / w.mean()).astype(np.float32)
 
 
@@ -172,7 +229,7 @@ def make_targets(
 
 
 def load_data(
-    paths: list[Path],
+    paths: list[Path | str | Source],
     states: str = "both",
     weighting: str = "sqrt",
     value_target: str = "outcome",
@@ -186,8 +243,14 @@ def load_data(
     td_mu: float = 0.0,
     feature_version: int = 1,
     x_dtype: str = "float32",
+    max_per_game: int = 0,
+    seed: int = 0,
 ) -> Data:
-    """Load every sample of the given run directories into memory.
+    """Load the samples of the given run directories (``Source`` / path / spec) into memory.
+
+    ``max_per_game`` is the default cap on decisions per game record (0 = all); a
+    ``Source.max_per_game`` overrides it, and ``Source.weight`` multiplies the sample
+    weights. Prints per-source counts.
 
     ``residual`` appends the raw stock ``evaluate(state)`` as the last column of ``x``
     (with ``x_dtype="float16"`` it is kept in a separate float32 array instead).
@@ -198,9 +261,15 @@ def load_data(
     feats, ys, qs, evals, tags, strings = [], [], [], [], [], []
     gids, didx, dqs = [], [], []
     load = dataset.LoadStats()
-    for path in paths:
+    sources = [parse_source(p) for p in paths]
+    src_ids: list[int] = []
+    src_records, src_decisions = [], []
+    for si, source in enumerate(sources):
+        path = source.path
+        k = max_per_game if source.max_per_game is None else source.max_per_game
+        games_before, seen = load.games, set()
         for s in dataset.iter_samples(
-            path, sides=(1,),
+            path, sides=(1,), max_per_game=k, seed=seed,
             worlds="fallback" if states == "prefer-truth" else states in ("both", "worlds"),
             truth=states in ("both", "truth", "prefer-truth"), stats=load, q_source=q_source,
             q_eval_scale=q_eval_scale, feature_version=feature_version,
@@ -211,11 +280,15 @@ def load_data(
             qs.append(np.nan if q is None else q)
             evals.append(s.stock_eval)
             tags.append(s.battle_tag)
+            src_ids.append(si)
+            seen.add((s.game_id, s.decision_idx))
             strings.append(s.state)
             gids.append(s.game_id)
             didx.append(s.decision_idx)
             dq = s.decision_q_abs if q_kind == "absolute" else s.decision_q
             dqs.append(np.nan if dq is None else dq)
+        src_records.append(load.games - games_before)
+        src_decisions.append(len(seen))
     if load.bad_states:
         print(f"warning: {load.bad_states} unparsable states skipped", file=sys.stderr)
     if not feats:
@@ -229,6 +302,12 @@ def load_data(
         e_sep = np.asarray(evals, dtype=np.float32)
     y = np.asarray(ys, dtype=np.float32)
     q = np.asarray(qs, dtype=np.float32)
+    src = np.asarray(src_ids, dtype=np.int64)
+    for si, source in enumerate(sources):
+        k = max_per_game if source.max_per_game is None else source.max_per_game
+        print(f"source {source.path}: max-per-game {k or 'all'}, weight x{source.weight:g}: "
+              f"{src_records[si]} records, {src_decisions[si]} decisions kept, "
+              f"{int((src == si).sum())} samples")
     if value_target in ("td", "nstep"):
         target, st = dataset.bootstrapped_targets(
             gids, didx, dqs, y, value_target, td_lambda, td_n, td_mu)
@@ -241,8 +320,13 @@ def load_data(
     elif value_target != "outcome":
         print(f"value target {value_target}: {n_fallback} of {len(y)} samples have no search "
               f"value and fall back to the outcome")
+        for si, source in enumerate(sources):
+            m = src == si
+            print(f"  source {source.path}: {int(np.isnan(q[m]).sum())} of {int(m.sum())} "
+                  f"samples fell back to the outcome")
+    mult = np.asarray([s_.weight for s_ in sources], dtype=np.float64)[src]
     return Data(
-        x, y, sample_weights(tags, weighting), tags, strings, q,
+        x, y, sample_weights(tags, weighting, mult), tags, strings, q,
         None if value_target == "outcome" else target,
         np.asarray(evals, dtype=np.float32), residual, e_sep, feature_version,
     )
@@ -406,6 +490,8 @@ class FitResult:
     best_epoch: int
     epochs_run: int
     history: list[tuple[int, float, float]]  # (epoch, train weighted BCE, val weighted BCE)
+    # per epoch: weighted BCE vs the outcome on each extra ``--val-data`` set (same order)
+    extra_history: list[list[float]] | None = None
 
 
 def select_device(requested: str = "auto") -> torch.device:
@@ -428,14 +514,30 @@ def fit(
     seed: int = 0,
     log=print,
     augmenter: augment.Augmenter | None = None,
+    extra_val: list[tuple[str, Data]] | None = None,
+    early_stop_on: str = "val",
 ) -> FitResult:
-    """AdamW on weighted BCE; early stopping on weighted val BCE (best weights restored)."""
+    """AdamW on weighted BCE; early stopping on weighted val BCE (best weights restored).
+
+    ``extra_val`` are named held-out sets reported each epoch (weighted BCE vs the
+    outcome); they only drive early stopping with ``early_stop_on="val-data"`` (the first
+    one), otherwise they are just logged.
+    """
+    extra_val = extra_val or []
+    if early_stop_on == "val-data" and not extra_val:
+        raise ValueError("early_stop_on='val-data' needs extra_val")
     torch.manual_seed(seed)
     model.to(device)
     xt, yt, wt = (torch.from_numpy(a).to(device) for a in (train.x, train.y_fit, train.w))
     xv, yv, wv = (torch.from_numpy(a).to(device) for a in (val.x, val.y_fit, val.w))
     et = None if train.e_sep is None else torch.from_numpy(train.e_sep).to(device)
     ev = None if val.e_sep is None else torch.from_numpy(val.e_sep).to(device)
+    extra_t = [
+        (name, *(torch.from_numpy(a).to(device) for a in (d.x, d.y, d.w)),
+         None if d.e_sep is None else torch.from_numpy(d.e_sep).to(device))
+        for name, d in extra_val
+    ]
+    extra_history: list[list[float]] = []
     decayed = [p for n_, p in model.named_parameters() if p.requires_grad and n_ != "a"]
     groups = [{"params": decayed}]
     if isinstance(model, ResidualNet) and model.a.requires_grad:
@@ -463,9 +565,13 @@ def fit(
         tr = weighted_bce(logits_of(model, xt, et), yt, wt)
         va = weighted_bce(logits_of(model, xv, ev), yv, wv)
         history.append((epoch, tr, va))
-        log(f"epoch {epoch:3d}  train {tr:.4f}  val {va:.4f}")
-        if va < best_loss - 1e-5:
-            best_loss, best_epoch, stale = va, epoch, 0
+        ex = [weighted_bce(logits_of(model, x_, e_), y_, w_) for _, x_, y_, w_, e_ in extra_t]
+        extra_history.append(ex)
+        log(f"epoch {epoch:3d}  train {tr:.4f}  val {va:.4f}" + "".join(
+            f"  val-data[{name}] {v:.4f}" for (name, *_), v in zip(extra_t, ex)))
+        stop_metric = ex[0] if early_stop_on == "val-data" else va
+        if stop_metric < best_loss - 1e-5:
+            best_loss, best_epoch, stale = stop_metric, epoch, 0
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
         else:
             stale += 1
@@ -473,7 +579,18 @@ def fit(
                 break
     if best_state is not None:
         model.load_state_dict(best_state)
-    return FitResult(model, best_epoch, len(history), history)
+    return FitResult(model, best_epoch, len(history), history, extra_history)
+
+
+def evaluate_extra(model: nn.Module, data: Data, device: torch.device) -> dict[str, float]:
+    """BCE against the outcome z on an extra held-out set (weighted, unweighted, accuracy)."""
+    model.to(device)
+    x, y, w = (torch.from_numpy(a).to(device) for a in (data.x, data.y, data.w))
+    e = None if data.e_sep is None else torch.from_numpy(data.e_sep).to(device)
+    logits = logits_of(model, x, e)
+    acc, n_dec = decisive_accuracy(logits.cpu().numpy(), data.y)
+    return {"n": len(data), "bce_w": weighted_bce(logits, y, w), "bce": weighted_bce(logits, y),
+            "acc": acc, "n_decisive": n_dec}
 
 
 # ---------------------------------------------------------------------------
@@ -644,8 +761,21 @@ def report(model: nn.Module, train: Data, val: Data, device: torch.device) -> di
 
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
-    p.add_argument("--data", type=Path, action="append", required=True,
-                   help="self-play run directory (repeatable)")
+    p.add_argument("--data", type=parse_source, action="append", required=True,
+                   metavar="PATH[@K][:wW]",
+                   help="run directory (repeatable); optional @K = at most K decisions per game "
+                        "record from it, :wW = weight multiplier, e.g. data/human/pc1/train@3:w0.5")
+    p.add_argument("--max-per-game", type=int, default=0, metavar="K",
+                   help="default decisions kept per game record, uniformly at random (seeded by "
+                        "--seed and the record), before feature extraction; 0 = all (default); "
+                        "a per-source @K overrides it")
+    p.add_argument("--val-data", type=parse_source, action="append", default=[],
+                   metavar="PATH[@K][:wW]",
+                   help="extra held-out set (repeatable), never trained on: BCE vs the outcome "
+                        "reported each epoch and at the end")
+    p.add_argument("--early-stop-on", choices=("val", "val-data"), default="val",
+                   help="metric for early stopping / best epoch: the battle-split val set "
+                        "(default) or the first --val-data set")
     p.add_argument("--model", choices=("mlp", "linear"), default="mlp")
     p.add_argument("--hidden", type=int, default=64, help="MLP hidden units")
     p.add_argument("--out", type=Path, required=True, help="output .pev path")
@@ -700,10 +830,16 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     args = _parser().parse_args(argv)
     started = time.perf_counter()
-    for path in args.data:
-        if not path.exists():
-            print(f"no such path: {path}", file=sys.stderr)
+    for src in [*args.data, *args.val_data]:
+        if not src.path.exists():
+            print(f"no such path: {src.path}", file=sys.stderr)
             return 2
+    if args.max_per_game < 0:
+        print("--max-per-game must be >= 0", file=sys.stderr)
+        return 2
+    if args.early_stop_on == "val-data" and not args.val_data:
+        print("--early-stop-on val-data needs --val-data", file=sys.stderr)
+        return 2
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -737,7 +873,16 @@ def main(argv=None) -> int:
         args.q_kind, args.q_eval_scale, residual=args.residual,
         td_lambda=args.td_lambda, td_n=args.td_n, td_mu=mu,
         feature_version=feature_version, x_dtype=x_dtype,
+        max_per_game=args.max_per_game, seed=args.seed,
     )
+    extra_val: list[tuple[str, Data]] = []
+    for vsrc in args.val_data:
+        print(f"--- val-data {vsrc.path}")
+        extra_val.append((str(vsrc.path), load_data(
+            [vsrc], args.states, args.weighting, "outcome", residual=args.residual,
+            feature_version=feature_version, x_dtype=x_dtype,
+            max_per_game=args.max_per_game, seed=args.seed,
+        )))
     tr_idx, va_idx = split_by_battle(data.tags, args.val_fraction, args.seed)
     if len(va_idx) == 0 or len(tr_idx) == 0:
         print("need at least two battles for a train/val split", file=sys.stderr)
@@ -774,13 +919,19 @@ def main(argv=None) -> int:
     result = fit(
         model, train, val, device=device, epochs=args.epochs, patience=args.patience,
         batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay, seed=args.seed,
-        augmenter=augmenter,
+        augmenter=augmenter, extra_val=extra_val, early_stop_on=args.early_stop_on,
     )
-    print(f"best epoch {result.best_epoch} of {result.epochs_run}")
+    print(f"best epoch {result.best_epoch} of {result.epochs_run}"
+          f" (early stopping on {args.early_stop_on})")
     if args.residual:
         print(f"learned a = {float(result.model.a.item()):.4f}  "
               f"(stock_coef = {result.model.stock_coef:.6f})")
     report(result.model, train, val, device)
+    for name, vd in extra_val:
+        m = evaluate_extra(result.model, vd, device)
+        print(f"val-data {name}: BCE vs outcome weighted {m['bce_w']:.4f}  unweighted "
+              f"{m['bce']:.4f}  decisive accuracy {m['acc']:.3f}  ({m['n']} samples, "
+              f"{m['n_decisive']} decisive)")
     export_pev(result.model, args.out, feature_version)
     rng = random.Random(args.seed)
     pool = [s for s in val.states if s]
