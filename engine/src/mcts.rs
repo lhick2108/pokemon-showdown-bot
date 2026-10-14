@@ -296,6 +296,40 @@ pub struct MctsResult {
     pub iteration_count: u32,
     /// Root joint matrix (only cells that were expanded); `Some` only when requested.
     pub joint: Option<Vec<JointCell>>,
+    /// Sampled interior search nodes (bead rnm); `Some` only when requested.
+    pub nodes: Option<Vec<ExportedNode>>,
+    /// Absolute P(side one wins) the evaluator gives the root (always filled).
+    pub root_value: f32,
+    /// Absolute P(side one wins) the search assigns the root: the root's mean score (the same
+    /// number as the sum of `s1` scores over the iterations) converted by
+    /// `LeafEval::absolute_logit`.
+    pub root_search_value: f32,
+}
+
+/// Which interior nodes `perform_mcts_export` returns: up to `max_nodes` nodes (not the root)
+/// with at least `min_visits` visits, sampled without replacement with probability
+/// proportional to their visit count (weighted reservoir sampling), one entry per distinct
+/// position.
+#[derive(Clone, Debug)]
+pub struct ExportConfig {
+    pub max_nodes: usize,
+    pub min_visits: u32,
+}
+
+/// One exported interior node: the position after `depth` joint turns of the search tree.
+#[derive(Clone, Debug)]
+pub struct ExportedNode {
+    /// `State::serialize` of the node's position (side one is still the root's side one)
+    pub state: String,
+    pub visits: u32,
+    /// Search value of the node: the mean backed-up leaf score of its visits, converted to an
+    /// absolute P(side one wins) (the scores are relative to the root evaluation; see
+    /// `LeafEval::absolute_logit`).
+    pub value: f32,
+    /// The evaluator's own absolute P(side one wins) at this position (no search); the gap
+    /// `value - static_value` is what the search added.
+    pub static_value: f32,
+    pub depth: u32,
 }
 
 fn mcts_iteration(
@@ -425,6 +459,32 @@ pub fn perform_mcts_joint(
     sel: &SelectionConfig,
     want_joint: bool,
 ) -> MctsResult {
+    perform_mcts_export(
+        state,
+        side_one_options,
+        side_two_options,
+        max_time,
+        max_iterations,
+        evaluator,
+        sel,
+        want_joint,
+        None,
+    )
+}
+
+/// Like `perform_mcts_joint`; with `export` the result also carries sampled interior nodes
+/// (`MctsResult::nodes`). `None` is exactly `perform_mcts_joint`.
+pub fn perform_mcts_export(
+    state: &mut State,
+    side_one_options: Vec<MoveChoice>,
+    side_two_options: Vec<MoveChoice>,
+    max_time: Duration,
+    max_iterations: u32,
+    evaluator: Option<&Evaluator>,
+    sel: &SelectionConfig,
+    want_joint: bool,
+    export: Option<&ExportConfig>,
+) -> MctsResult {
     let mut leaf_eval = LeafEval::new(evaluator);
     let mut root_node = Node::new();
     unsafe {
@@ -504,10 +564,117 @@ pub fn perform_mcts_joint(
         None
     };
 
+    let nodes = match export {
+        Some(cfg) if cfg.max_nodes > 0 => Some(export_interior_nodes(
+            &root_node, &children, state, &mut leaf_eval, root_eval, cfg,
+        )),
+        _ => None,
+    };
+    let root_value = logistic(leaf_eval.abs_logit_of_raw(root_eval));
+    let root_search_value = if root_node.times_visited > 0 {
+        let mean = root_node.total_score / root_node.times_visited as f32;
+        logistic(leaf_eval.absolute_logit(root_eval, mean))
+    } else {
+        root_value
+    };
+
     MctsResult {
         joint,
+        nodes,
+        root_value,
+        root_search_value,
         s1: side_results(root_node.s1_options.as_ref().unwrap(), root_node.stats.as_ref().map(|n| &n.s1)),
         s2: side_results(root_node.s2_options.as_ref().unwrap(), root_node.stats.as_ref().map(|n| &n.s2)),
         iteration_count: root_node.times_visited,
     }
+}
+
+fn logistic(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+/// Weighted reservoir sample (Efraimidis-Spirakis, weight = visits) of the search tree's
+/// interior nodes, each serialised with the position it stands for. Walks the tree
+/// iteratively (the tree can be a chain tens of thousands deep) applying and reversing each
+/// node's instructions on `state`, which is back at the root position on return. A node's
+/// children never have more visits than it has, so subtrees below `min_visits` are skipped.
+fn export_interior_nodes(
+    root: &Node,
+    children: &HashMap<(usize, usize, usize), Box<[Node]>>,
+    state: &mut State,
+    leaf_eval: &mut LeafEval,
+    root_raw: f32,
+    cfg: &ExportConfig,
+) -> Vec<ExportedNode> {
+    let mut by_parent: HashMap<usize, Vec<&Box<[Node]>>> = HashMap::new();
+    for ((ptr, _, _), group) in children.iter() {
+        by_parent.entry(*ptr).or_default().push(group);
+    }
+    enum Step {
+        Enter(*const Node, u32),
+        Exit(*const Node),
+    }
+    let mut rng = rng();
+    // (key, node); key = ln(u) / visits, the K largest keys are kept
+    let mut kept: Vec<(f64, ExportedNode)> = Vec::new();
+    let mut stack: Vec<Step> = vec![Step::Enter(root as *const Node, 0)];
+    while let Some(step) = stack.pop() {
+        match step {
+            Step::Exit(node) => unsafe {
+                state.reverse_instructions(&(*node).instructions.instruction_list);
+            },
+            Step::Enter(node, depth) => {
+                let node_ref: &Node = unsafe { &*node };
+                if depth > 0 {
+                    if node_ref.times_visited < cfg.min_visits {
+                        continue;
+                    }
+                    state.apply_instructions(&node_ref.instructions.instruction_list);
+                    stack.push(Step::Exit(node));
+                    if state.battle_is_over() == 0.0 {
+                        let u: f64 = rng.random_range(f64::MIN_POSITIVE..1.0);
+                        let key = u.ln() / node_ref.times_visited as f64;
+                        let worth = kept.len() < cfg.max_nodes
+                            || kept.iter().map(|(k, _)| *k).fold(f64::INFINITY, f64::min) < key;
+                        if worth {
+                            let mean = node_ref.total_score / node_ref.times_visited as f32;
+                            let raw = leaf_eval.value(state);
+                            let entry = ExportedNode {
+                                state: state.serialize(),
+                                visits: node_ref.times_visited,
+                                value: logistic(leaf_eval.absolute_logit(root_raw, mean)),
+                                static_value: logistic(leaf_eval.abs_logit_of_raw(raw)),
+                                depth,
+                            };
+                            if let Some(dup) = kept.iter().position(|(_, n)| n.state == entry.state) {
+                                // the same position reached by another path (or a chain of
+                                // no-op turns): keep one copy, the better visited one
+                                if entry.visits > kept[dup].1.visits {
+                                    kept[dup] = (key, entry);
+                                }
+                            } else if kept.len() < cfg.max_nodes {
+                                kept.push((key, entry));
+                            } else {
+                                let (idx, _) = kept
+                                    .iter()
+                                    .enumerate()
+                                    .min_by(|a, b| a.1 .0.partial_cmp(&b.1 .0).unwrap())
+                                    .unwrap();
+                                kept[idx] = (key, entry);
+                            }
+                        }
+                    }
+                }
+                if let Some(groups) = by_parent.get(&(node as usize)) {
+                    for group in groups {
+                        for child in group.iter() {
+                            stack.push(Step::Enter(child as *const Node, depth + 1));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    kept.sort_by(|a, b| b.1.visits.cmp(&a.1.visits));
+    kept.into_iter().map(|(_, n)| n).collect()
 }

@@ -16,7 +16,7 @@ use poke_engine::features::{
     FEATURE_VERSION,
 };
 use poke_engine::learned::{Evaluator, Scratch};
-use poke_engine::mcts::{perform_mcts_joint, MctsResult, MctsSideResult};
+use poke_engine::mcts::{perform_mcts_export, ExportConfig, MctsResult, MctsSideResult};
 use poke_engine::selection::{SelectionConfig, SelectionMode};
 use poke_engine::mcts_threaded::perform_mcts_shared_tree_with;
 use poke_engine::pokemon::PokemonName;
@@ -886,6 +886,13 @@ struct PyMctsResult {
     iteration_count: u32,
     /// (s1 index, s2 index, visits, mean score for side one); None unless return_joint
     joint: Option<Vec<(usize, usize, u32, f32)>>,
+    /// sampled interior search nodes (state string, visits, search value, static value,
+    /// depth); None unless export_nodes > 0. Values are absolute P(side one wins).
+    nodes: Option<Vec<(String, u32, f32, f32, u32)>>,
+    /// the evaluator's absolute P(side one wins) at the root (NaN with threads > 1)
+    root_value: f32,
+    /// the search's absolute P(side one wins) at the root (NaN with threads > 1)
+    root_search_value: f32,
 }
 
 impl PyMctsResult {
@@ -905,6 +912,14 @@ impl PyMctsResult {
             joint: result
                 .joint
                 .map(|cells| cells.iter().map(|c| (c.s1, c.s2, c.visits, c.mean)).collect()),
+            nodes: result.nodes.map(|nodes| {
+                nodes
+                    .into_iter()
+                    .map(|n| (n.state, n.visits, n.value, n.static_value, n.depth))
+                    .collect()
+            }),
+            root_value: result.root_value,
+            root_search_value: result.root_search_value,
         }
     }
 }
@@ -1132,7 +1147,7 @@ fn feature_length(version: Option<u32>) -> PyResult<usize> {
 }
 
 #[pyfunction]
-#[pyo3(signature = (py_state, duration_ms, iterations, threads, evaluator=None, selection="ucb1", gamma=0.1, return_joint=false))]
+#[pyo3(signature = (py_state, duration_ms, iterations, threads, evaluator=None, selection="ucb1", gamma=0.1, return_joint=false, export_nodes=0, export_min_visits=16))]
 fn mcts(
     py_state: PyState,
     duration_ms: u64,
@@ -1142,6 +1157,8 @@ fn mcts(
     selection: &str,
     gamma: f64,
     return_joint: bool,
+    export_nodes: usize,
+    export_min_visits: u32,
 ) -> PyResult<PyMctsResult> {
     let mode = SelectionMode::parse(selection).ok_or_else(|| {
         pyo3::exceptions::PyValueError::new_err(format!(
@@ -1163,6 +1180,15 @@ fn mcts(
             "return_joint is single-threaded only (use threads=1)",
         ));
     }
+    if export_nodes > 0 && threads > 1 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "export_nodes is single-threaded only (use threads=1)",
+        ));
+    }
+    let export_config = ExportConfig {
+        max_nodes: export_nodes,
+        min_visits: export_min_visits.max(1),
+    };
     let selection_config = SelectionConfig { mode, gamma };
     let evaluator_ref: Option<&Evaluator> = evaluator.as_ref().map(|e| e.inner.as_ref());
     let mut state: State = py_state.into();
@@ -1182,7 +1208,7 @@ fn mcts(
             evaluator_ref,
         )
     } else {
-        perform_mcts_joint(
+        perform_mcts_export(
             &mut state,
             s1_options,
             s2_options,
@@ -1191,6 +1217,7 @@ fn mcts(
             evaluator_ref,
             &selection_config,
             return_joint,
+            if export_nodes > 0 { Some(&export_config) } else { None },
         )
     };
 

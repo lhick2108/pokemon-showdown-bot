@@ -125,12 +125,26 @@ class MctsResult:
         ``(i, j, visits, mean)`` for every expanded cell, i indexing ``side_one`` and j
         ``side_two``; ``mean`` is side one's mean score in [0, 1]
     :type joint: list[tuple[int, int, int, float]] | None
+    :param nodes: sampled interior search nodes, only with ``export_nodes > 0``: a list of
+        ``(state_string, visits, value, static_value, depth)``. ``value`` is the search's
+        absolute P(side one wins) for the node (mean backed-up leaf score of its visits, converted
+        from the root-relative score); ``static_value`` is the evaluator's own absolute P at the
+        node's position; ``depth`` counts joint turns below the root
+    :type nodes: list[tuple[str, int, float, float, int]] | None
+    :param root_value: the evaluator's absolute P(side one wins) at the root (NaN if threads > 1)
+    :type root_value: float
+    :param root_search_value: the search's absolute P(side one wins) at the root, comparable with
+        the ``value`` of the exported nodes (NaN if threads > 1)
+    :type root_search_value: float
     """
 
     side_one: list[MctsSideResult]
     side_two: list[MctsSideResult]
     total_visits: int
     joint: "list[tuple[int, int, int, float]] | None" = None
+    nodes: "list[tuple[str, int, float, float, int]] | None" = None
+    root_value: float = float("nan")
+    root_search_value: float = float("nan")
 
     @classmethod
     def _from_rust(cls, rust_result):
@@ -155,6 +169,9 @@ class MctsResult:
             ],
             total_visits=rust_result.iteration_count,
             joint=(None if rust_result.joint is None else list(rust_result.joint)),
+            nodes=(None if rust_result.nodes is None else list(rust_result.nodes)),
+            root_value=rust_result.root_value,
+            root_search_value=rust_result.root_search_value,
         )
 
 
@@ -167,6 +184,8 @@ def monte_carlo_tree_search(
     selection: str = "ucb1",
     gamma: float = 0.1,
     return_joint: bool = False,
+    export_nodes: int = 0,
+    export_min_visits: int = 16,
 ) -> MctsResult:
     """
     Perform monte-carlo-tree-search on the given state and for the given duration
@@ -190,12 +209,19 @@ def monte_carlo_tree_search(
     :param return_joint: also return the root joint-action matrix (``MctsResult.joint``);
         single-threaded only (threads > 1 raises ValueError)
     :type return_joint: bool
+    :param export_nodes: also return up to this many sampled interior nodes of the search tree
+        (``MctsResult.nodes``; sampled without replacement, probability proportional to visits,
+        among nodes with at least ``export_min_visits`` visits); 0 = off. Single-threaded only
+    :type export_nodes: int
+    :param export_min_visits: minimum visits of an exported node
+    :type export_min_visits: int
     :return: the result of the search
     :rtype: MctsResult
     """
     return MctsResult._from_rust(
         mcts(
-            state, duration_ms, iterations, threads, evaluator, selection, gamma, return_joint
+            state, duration_ms, iterations, threads, evaluator, selection, gamma, return_joint,
+            export_nodes, export_min_visits,
         )
     )
 

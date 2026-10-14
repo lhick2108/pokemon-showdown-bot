@@ -32,6 +32,9 @@ VALUE_BY_RESULT = {recorder.RESULT_WIN: 1.0, recorder.RESULT_TIE: 0.5, recorder.
 
 KIND_WORLD = "world"
 KIND_TRUTH = "truth"
+KIND_NODE = "node"  # a sampled interior search node (bead rnm); see ``nodes`` below
+
+NODE_MODES = ("off", "on", "only")
 
 Q_SOURCES = ("decision", "world")
 Q_KINDS = ("relative", "absolute")
@@ -65,6 +68,11 @@ class Sample:
     decision_idx: int = 0
     decision_q_abs: float | None = None
     decision_q: float | None = None
+    # kind "node" only: visits of the interior node, joint turns below the searched root, and
+    # the evaluator's own absolute value there (``search_value_abs`` is the search's)
+    node_visits: int = 0
+    node_depth: int = 0
+    node_static: float | None = None
 
     def as_tuple(self) -> tuple[list[float], float, dict[str, float] | None]:
         return self.features, self.value, self.policy
@@ -126,6 +134,9 @@ def iter_samples(
     max_per_game: int = 0,
     seed: int = 0,
     files: Sequence[Path] | None = None,
+    nodes: str = "off",
+    node_min_visits: int = 0,
+    nodes_per_world: int = 0,
 ) -> Iterator[Sample]:
     """Yield one ``Sample`` per stored state (every searched world, plus truth).
 
@@ -143,9 +154,21 @@ def iter_samples(
     world ``avg_score`` (``q_source="decision"``, also used for truth states), or
     for world samples that world's own ``avg_score`` (``q_source="world"``, falling
     back to None if that world has no usable score; truth stays the decision mean).
+
+    ``nodes`` (bead rnm): ``off`` ignores the interior nodes some recordings carry
+    (``worlds[i]["nodes"]``, written by searches run with ``export_nodes``); ``on`` also
+    yields one ``kind="node"`` sample per exported node with at least ``node_min_visits``
+    visits; ``only`` yields just those. A node sample's ``search_value_abs`` is the exported
+    absolute search value (already anchored to the evaluator the search used, so
+    ``q_eval_scale`` does not apply), ``search_value`` equals it, and ``node_visits`` /
+    ``node_depth`` / ``node_static`` carry the weighting information for the trainer.
+    ``nodes_per_world`` > 0 keeps only that many of a world's eligible nodes (a uniform
+    random subset, reproducible from ``seed``, the file name and the decision index).
     """
     if q_source not in Q_SOURCES:
         raise ValueError(f"q_source must be one of {Q_SOURCES}")
+    if nodes not in NODE_MODES:
+        raise ValueError(f"nodes must be one of {NODE_MODES}")
     import poke_engine
 
     # None = the engine's default feature version (old engines have no ``version`` argument)
@@ -196,8 +219,10 @@ def iter_samples(
             world_abs: list[float | None] = []
             for w in decision.get("worlds", ()):
                 score, st = _valid_score(w), parse(w["state"])
+                exported = w.get("search_value")  # absolute root value, exported with the nodes
                 world_abs.append(
                     None if score is None or st is None
+                    else float(exported) if exported is not None
                     else absolute_search_value(poke_engine.evaluate(st), score, q_eval_scale)
                 )
             valid_abs = [v for v in world_abs if v is not None]
@@ -215,9 +240,12 @@ def iter_samples(
                 tstate = parse(tstring)
                 t_abs = (
                     None if tstate is None or q_mean is None
+                    else abs_mean if all(w.get("search_value") is not None for w in decision["worlds"])
                     else absolute_search_value(poke_engine.evaluate(tstate), q_mean, q_eval_scale)
                 )
                 states.append((KIND_TRUTH, tstring, q_mean, t_abs))
+            if nodes == "only":
+                states = []
             # decision-level absolute q: the truth state's if there is one, else the world mean
             dec_abs = abs_mean
             if truth and decision.get("truth") and states and states[-1][0] == KIND_TRUTH                     and states[-1][3] is not None:
@@ -248,6 +276,38 @@ def iter_samples(
                             None if q_abs is None else (q_abs if side == 1 else 1.0 - q_abs)
                         ),
                     )
+            if nodes != "off":
+                for wi, w in enumerate(decision.get("worlds", ())):
+                    eligible = [nd for nd in (w.get("nodes") or ()) if nd[1] >= node_min_visits]
+                    if nodes_per_world and len(eligible) > nodes_per_world:
+                        eligible = random.Random(f"{seed}:{path.name}:{decision_idx}:{wi}").sample(
+                            eligible, nodes_per_world)
+                    for node in eligible:
+                        n_state, n_visits, n_value, n_static, n_depth = node
+                        n_parsed = parse(n_state)
+                        if n_parsed is None:
+                            stats.bad_states += 1
+                            continue
+                        for side in sides:
+                            yield Sample(
+                                features=poke_engine.state_features(n_parsed, side, **feat_kwargs),
+                                value=value_target(result, side),
+                                policy=None,
+                                kind=KIND_NODE,
+                                side=side,
+                                battle_tag=tag,
+                                turn=decision.get("turn"),
+                                state=n_state,
+                                search_value=n_value if side == 1 else 1.0 - n_value,
+                                stock_eval=float(poke_engine.evaluate(n_parsed)),
+                                game_id=str(path),
+                                decision_idx=decision_idx,
+                                search_value_abs=n_value if side == 1 else 1.0 - n_value,
+                                node_visits=int(n_visits),
+                                node_depth=int(n_depth),
+                                node_static=(None if n_static is None else
+                                             (n_static if side == 1 else 1.0 - n_static)),
+                            )
 
 
 def _fill_gaps(q: np.ndarray, z: float) -> tuple[np.ndarray, int]:
