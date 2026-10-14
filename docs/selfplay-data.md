@@ -101,3 +101,15 @@ Known gaps:
 
 Self-play with the same net on both sides makes the two files of a battle opposite
 labels for nearly identical positions; keep both (or one) deliberately.
+
+## Fork-augmented records (`source: "fork"`)
+
+`scripts/fork_augment.py` (code: `src/showdown_bot/fork_augment.py`, bead showdown-bot-sd0) forks
+recorded truth states, perturbs them (HP, status, stat stages, hazards, screens, weather,
+terrain) and plays them out engine-only with one perfect-information MCTS per turn serving both
+sides. Output uses this schema; the header adds `source: "fork"` and
+`fork: {seed, origin, edited_state, edits, capped, edit_config}`. Each decision is side one's, with
+the searched state both as `truth` and as the single `world` (so the search value exists for
+`train.py --value-target search`; with `--states both` the position is therefore counted twice,
+use `--states truth` to avoid that). `data/forks/<run>` can be passed to `train.py --data`
+next to normal runs; split by `source` in analysis.
