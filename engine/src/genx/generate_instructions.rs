@@ -21,6 +21,7 @@ use crate::instruction::{
     ToggleDamageDealtHitSubstituteInstruction, ToggleMegaEvolvedInstruction,
     ToggleShedTailingInstruction, ToggleTrickRoomInstruction,
 };
+use crate::pokemon::PokemonName;
 use crate::instruction::{ChangeAbilityInstruction, ToggleTerastallizedInstruction};
 use crate::instruction::{DecrementFutureSightInstruction, FormeChangeInstruction};
 use crate::instruction::{DecrementPPInstruction, SetLastUsedMoveInstruction};
@@ -4083,6 +4084,59 @@ pub fn generate_instructions_for_bss_team_preview(
     vec![state_instructions]
 }
 
+/// Terastallizing a masked Ogerpon changes it to its -Tera forme, gives it the matching
+/// Embody Aspect ability, and that ability activates immediately (+1 Spe/SpD/Atk/Def).
+/// Called right after ToggleTerastallized has been applied to the active Pokemon.
+fn ogerpon_terastallize_effects(
+    state: &mut State,
+    side_ref: SideReference,
+    instructions: &mut StateInstructions,
+) {
+    let (tera_forme, ability, stat) = match state.get_side(&side_ref).get_active().id {
+        PokemonName::OGERPON => (
+            PokemonName::OGERPONTEALTERA,
+            Abilities::EMBODYASPECTTEAL,
+            PokemonBoostableStat::Speed,
+        ),
+        PokemonName::OGERPONWELLSPRING => (
+            PokemonName::OGERPONWELLSPRINGTERA,
+            Abilities::EMBODYASPECTWELLSPRING,
+            PokemonBoostableStat::SpecialDefense,
+        ),
+        PokemonName::OGERPONHEARTHFLAME => (
+            PokemonName::OGERPONHEARTHFLAMETERA,
+            Abilities::EMBODYASPECTHEARTHFLAME,
+            PokemonBoostableStat::Attack,
+        ),
+        PokemonName::OGERPONCORNERSTONE => (
+            PokemonName::OGERPONCORNERSTONETERA,
+            Abilities::EMBODYASPECTCORNERSTONE,
+            PokemonBoostableStat::Defense,
+        ),
+        _ => return,
+    };
+    let side = state.get_side(&side_ref);
+    let active = side.get_active();
+    instructions
+        .instruction_list
+        .push(Instruction::FormeChange(FormeChangeInstruction {
+            side_ref,
+            name_change: tera_forme as i16 - active.id as i16,
+        }));
+    active.id = tera_forme;
+    active.recalculate_stats(&side_ref, instructions);
+    if active.ability != ability {
+        instructions
+            .instruction_list
+            .push(Instruction::ChangeAbility(ChangeAbilityInstruction {
+                side_ref,
+                ability_change: ability as i16 - active.ability as i16,
+            }));
+        active.ability = ability;
+    }
+    apply_boost_instruction(side, &stat, &1, &side_ref, &side_ref, instructions);
+}
+
 pub fn generate_instructions_from_move_pair(
     state: &mut State,
     side_one_move: &MoveChoice,
@@ -4247,6 +4301,7 @@ pub fn generate_instructions_from_move_pair(
                     side_ref: SideReference::SideOne,
                 },
             ));
+        ogerpon_terastallize_effects(state, SideReference::SideOne, &mut incoming_instructions);
     }
     if s2_tera {
         state.side_two.get_active().terastallized = true;
@@ -4257,6 +4312,7 @@ pub fn generate_instructions_from_move_pair(
                     side_ref: SideReference::SideTwo,
                 },
             ));
+        ogerpon_terastallize_effects(state, SideReference::SideTwo, &mut incoming_instructions);
     }
 
     run_mega_evolutions(state, s1_mega, s2_mega, &mut incoming_instructions);
@@ -4400,9 +4456,10 @@ fn get_instructions_from_pursuit_hitting_switching_target(
             .instruction_list
             .push(Instruction::ToggleTerastallized(
                 ToggleTerastallizedInstruction {
-                    side_ref: SideReference::SideOne,
+                    side_ref: pursuiting_side_ref,
                 },
             ));
+        ogerpon_terastallize_effects(state, pursuiting_side_ref, &mut incoming_instructions);
     }
 
     // reverse instructions because mega/tera might've added some

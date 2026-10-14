@@ -25,6 +25,14 @@ impl PokemonName {
             PokemonName::PALAFINHERO => (100, 160, 97, 106, 87, 100),
             PokemonName::EISCUE => (75, 80, 110, 65, 90, 50),
             PokemonName::EISCUENOICE => (75, 80, 70, 65, 50, 130),
+            PokemonName::OGERPON => (80, 120, 84, 60, 96, 110),
+            PokemonName::OGERPONWELLSPRING => (80, 120, 84, 60, 96, 110),
+            PokemonName::OGERPONHEARTHFLAME => (80, 120, 84, 60, 96, 110),
+            PokemonName::OGERPONCORNERSTONE => (80, 120, 84, 60, 96, 110),
+            PokemonName::OGERPONTEALTERA => (80, 120, 84, 60, 96, 110),
+            PokemonName::OGERPONWELLSPRINGTERA => (80, 120, 84, 60, 96, 110),
+            PokemonName::OGERPONHEARTHFLAMETERA => (80, 120, 84, 60, 96, 110),
+            PokemonName::OGERPONCORNERSTONETERA => (80, 120, 84, 60, 96, 110),
 
             // megas
             PokemonName::VENUSAURMEGA => (80, 100, 123, 122, 120, 80),

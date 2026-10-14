@@ -22377,3 +22377,90 @@ fn test_pechaberry_cures_poison() {
 fn test_pechaberry_cures_toxic() {
     assert_status_cure_berry(Items::PECHABERRY, PokemonStatus::TOXIC);
 }
+
+#[cfg(feature = "terastallization")]
+fn ogerpon_tera_instructions(
+    id: PokemonName,
+    stat: PokemonBoostableStat,
+    ability: Abilities,
+    tera_id: PokemonName,
+) {
+    let mut state = State::default();
+    state.side_one.get_active().id = id;
+    state.side_one.get_active().ability = Abilities::DEFIANT;
+    state.side_one.get_active().base_ability = Abilities::DEFIANT;
+    let vec_of_instructions = generate_instructions_with_state_assertion(
+        &mut state,
+        &MoveChoice::MoveTera(PokemonMoveIndex::M0),
+        &MoveChoice::None,
+    );
+    assert_eq!(1, vec_of_instructions.len());
+    let list = &vec_of_instructions[0].instruction_list;
+    assert!(list.contains(&Instruction::FormeChange(FormeChangeInstruction {
+        side_ref: SideReference::SideOne,
+        name_change: tera_id as i16 - id as i16,
+    })));
+    assert!(list.contains(&Instruction::ChangeAbility(ChangeAbilityInstruction {
+        side_ref: SideReference::SideOne,
+        ability_change: ability as i16 - Abilities::DEFIANT as i16,
+    })));
+    assert!(list.contains(&Instruction::Boost(BoostInstruction {
+        side_ref: SideReference::SideOne,
+        stat,
+        amount: 1,
+    })));
+    // apply and check resulting state
+    state.apply_instructions(list);
+    assert_eq!(tera_id, state.side_one.get_active().id);
+    assert_eq!(ability, state.side_one.get_active().ability);
+    assert!(state.side_one.get_active().terastallized);
+}
+
+#[cfg(feature = "terastallization")]
+#[test]
+fn test_ogerpon_teal_terastallize_gets_embody_aspect_speed() {
+    ogerpon_tera_instructions(
+        PokemonName::OGERPON,
+        PokemonBoostableStat::Speed,
+        Abilities::EMBODYASPECTTEAL,
+        PokemonName::OGERPONTEALTERA,
+    );
+}
+
+#[cfg(feature = "terastallization")]
+#[test]
+fn test_ogerpon_masks_terastallize_get_embody_aspect() {
+    ogerpon_tera_instructions(
+        PokemonName::OGERPONWELLSPRING,
+        PokemonBoostableStat::SpecialDefense,
+        Abilities::EMBODYASPECTWELLSPRING,
+        PokemonName::OGERPONWELLSPRINGTERA,
+    );
+    ogerpon_tera_instructions(
+        PokemonName::OGERPONHEARTHFLAME,
+        PokemonBoostableStat::Attack,
+        Abilities::EMBODYASPECTHEARTHFLAME,
+        PokemonName::OGERPONHEARTHFLAMETERA,
+    );
+    ogerpon_tera_instructions(
+        PokemonName::OGERPONCORNERSTONE,
+        PokemonBoostableStat::Defense,
+        Abilities::EMBODYASPECTCORNERSTONE,
+        PokemonName::OGERPONCORNERSTONETERA,
+    );
+}
+
+#[cfg(feature = "terastallization")]
+#[test]
+fn test_non_ogerpon_terastallize_unchanged() {
+    let mut state = State::default();
+    let vec_of_instructions = generate_instructions_with_state_assertion(
+        &mut state,
+        &MoveChoice::MoveTera(PokemonMoveIndex::M0),
+        &MoveChoice::None,
+    );
+    assert!(!vec_of_instructions[0]
+        .instruction_list
+        .iter()
+        .any(|i| matches!(i, Instruction::FormeChange(_) | Instruction::ChangeAbility(_))));
+}
