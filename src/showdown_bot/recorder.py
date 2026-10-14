@@ -70,6 +70,11 @@ def world_record(
             move["strategy"] = float(share)
     if nash is not None:  # Nash mode: our equilibrium strategy and the game value
         record["nash"] = nash
+    nodes = getattr(outcome, "nodes", None)
+    if nodes is not None:  # interior-node export (bead rnm): [state, visits, value, static, depth]
+        record["search_value"] = round(float(outcome.search_value), 5)
+        record["nodes"] = [[s, int(v), round(float(val), 5), round(float(st), 5), int(d)]
+                           for s, v, val, st, d in nodes]
     return record
 
 

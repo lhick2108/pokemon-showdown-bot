@@ -241,6 +241,46 @@ Single seed; differences of ~0.005 are probably within noise. Pure TD without
 the own q is about equal to the blend; mixing in the decision's own q (mu=0.5)
 or a 1-step target is slightly better. Duels pending.
 
+### Interior-node targets (bead showdown-bot-rnm)
+
+A root decision gives one search-backed value per searched world, although the tree below
+it has already valued thousands of deeper positions (a KO two turns out, the end of a heal
+loop, a hazard that stuck). `selfplay.py --export-nodes K` has the engine sample K interior
+nodes per searched world, visit-weighted, and record `[state, visits, value, static_value,
+depth]` (format and sampling: docs/selfplay-data.md, "Interior nodes"; needs engine
+0.0.48+sdb.9 and `--threads 1`). `train.py --nodes on` turns each into an extra sample whose
+target is the node's absolute search value, exactly like a root `--value-target search`.
+
+* **Leaf-dominated nodes.** A node's first visit is its own leaf evaluation, so a node with a
+  handful of visits only repeats what the net already thinks. Nodes under
+  `--node-min-visits` (default 16) are dropped and the rest are weighted by
+  `--node-weight * min(1, visits / --node-visit-ref)` (default ref 64) times
+  `--node-depth-discount ** (depth - 1)`. The weights are relative to a root sample (1.0) and are
+  normalised with the per-battle weighting like every other sample.
+* **Scale.** The node value is anchored to the evaluator that ran the search (stock: 0.0125 *
+  evaluate; learned: its logit and leaf scale), and a world with exported nodes also records the
+  exact absolute root value, which the loader then uses instead of reconstructing it with the
+  stock evaluation. Recordings without nodes load exactly as before.
+* **Size.** K = 8 adds about 1 KB gzipped per decision (measured: 0.8 -> 1.8 KB per
+  2-world decision at 300 ms) and costs no search time. In memory every node is a full feature
+  row (738 floats), so thin them at load time with `--nodes-per-world N`.
+* The existing targets are untouched: `--nodes off` is the default and
+  `--value-target outcome|blend|td|nstep` ignore the recorded nodes (nodes need `search|blend`).
+
+Recipe (3000 battles, then a with/without-nodes A/B on the same data):
+
+```powershell
+# 1. data: net-guided search, 300 ms x 2 worlds per decision, 8 interior nodes per world
+python scripts/selfplay.py --games 3000 --pairs 4 --run-id gen7 --search-time-ms 300 --worlds 2 `
+    --evaluator models/gen2-res-searchabs-mlp16.pev --leaf-scale 1.5 --export-nodes 8 --export-min-visits 24
+# 2. train with nodes (and the control without them)
+python -m showdown_bot.train --data data/selfplay/gen7 --model mlp --hidden 16 --residual `
+    --value-target search --nodes on --nodes-per-world 3 --node-min-visits 24 --node-weight 0.5 `
+    --node-depth-discount 0.9 --x-dtype float16 --out models/gen7-res-nodes-mlp16.pev
+python -m showdown_bot.train --data data/selfplay/gen7 --model mlp --hidden 16 --residual `
+    --value-target search --x-dtype float16 --out models/gen7-res-root-mlp16.pev
+```
+
 ## Reading the results
 
 - Val BCE must beat the constant predictor (`ln 2 = 0.693` for a balanced set).
