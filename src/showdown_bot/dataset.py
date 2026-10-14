@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import random
 import sys
 from collections import Counter
 from collections.abc import Iterable, Iterator, Sequence
@@ -122,8 +123,17 @@ def iter_samples(
     q_eval_scale: float = Q_EVAL_SCALE,
     with_stock_eval: bool = False,
     feature_version: int | None = None,
+    max_per_game: int = 0,
+    seed: int = 0,
 ) -> Iterator[Sample]:
     """Yield one ``Sample`` per stored state (every searched world, plus truth).
+
+    ``max_per_game=K > 0`` keeps at most K decisions per game record, chosen uniformly
+    without replacement among the decisions that have a state under the ``worlds`` /
+    ``truth`` filter, by an RNG seeded with ``seed`` and the record's file name (so it is
+    reproducible and independent of the other records). It is applied before any
+    parsing or feature extraction, so memory and time drop with it. ``decision_idx``
+    stays the decision's index in the full record.
 
     ``worlds="fallback"`` includes a decision's worlds only when it has no truth
     state (with ``truth=True`` this means "prefer truth").
@@ -154,7 +164,18 @@ def iter_samples(
         stats.games += 1
         stats.results[result] += 1
         tag = game["header"].get("battle_tag", "")
+        keep: set[int] | None = None
+        if max_per_game > 0:
+            eligible = [
+                i for i, d in enumerate(game["decisions"])
+                if (worlds and (worlds != "fallback" or not d.get("truth")) and d.get("worlds"))
+                or (truth and d.get("truth"))
+            ]
+            if len(eligible) > max_per_game:
+                keep = set(random.Random(f"{seed}:{path.name}").sample(eligible, max_per_game))
         for decision_idx, decision in enumerate(game["decisions"]):
+            if keep is not None and decision_idx not in keep:
+                continue
             policy = decision.get("policy") or None
             q_mean = decision_search_value(decision)
             parsed: dict[str, Any] = {}
