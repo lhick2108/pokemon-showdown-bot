@@ -40,6 +40,14 @@ only poke-env options), these environment variables:
                                  prior pseudo-observations of the Nash class mix (default 4)
     SHOWDOWN_SEARCH_TENDENCY_DELTA
                                  max worst-case win-probability loss vs Nash (default 0.05)
+    SHOWDOWN_SEARCH_OPP_MODEL    path of a human-policy .npz (showdown_bot.human_policy): bounded
+                                 best response to a model of how humans choose (default off); mode
+                                 mixed or argmax. Also SHOWDOWN_SEARCH_OPP_ELO (elo bucket or
+                                 rating, default unknown), SHOWDOWN_SEARCH_EXPLOIT_DELTA (worst-case
+                                 win-probability loss bound, default 0.05), ..._EXPLOIT_WEIGHT
+                                 (max step toward the best response, default 1), ..._EXPLOIT_KAPPA
+                                 (in-game class adaptation, default 4; 0 off), ..._EXPLOIT_GAIN
+                                 (min belief gain to deviate, default 0.005)
     SHOWDOWN_SEARCH_SELECTION    engine tree-policy: "ucb1" (default), "exp3" or "rm";
                                  exp3/rm need threads == 1 (see docs/selection.md)
     SHOWDOWN_SEARCH_SELECTION_GAMMA
@@ -95,11 +103,13 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from poke_env.player import Player
 from poke_env.ps_client import AccountConfiguration
 from poke_env.player.battle_order import BattleOrder, DefaultBattleOrder
 
 from showdown_bot import belief as belief_module
+from showdown_bot import human_exploit
 from showdown_bot import decision_quality as dq
 from showdown_bot import endgame as endgame_module
 from showdown_bot import engine_state, nash as nash_module, recorder as recorder_module
@@ -214,6 +224,13 @@ class SearchConfig:
     tendency: bool = False  # 589.40 opponent tendency model (implies nash-style root solve)
     tendency_kappa: float = tendency_module.DEFAULT_KAPPA  # prior pseudo-observations
     tendency_delta: float = tendency_module.DEFAULT_DELTA  # safe-exploitation loss bound
+    # Human-model exploitation (showdown_bot.human_policy / human_exploit; default off)
+    opp_model: str | None = None  # path of the human action-policy .npz
+    opp_elo: str | None = None  # opponent elo bucket / rating the model is conditioned on (None: unknown)
+    exploit_delta: float = human_exploit.DEFAULT_DELTA  # max worst-case win-prob loss vs the base policy
+    exploit_weight: float = 1.0  # max fraction of the way from the base policy to the best response
+    exploit_kappa: float = human_exploit.DEFAULT_KAPPA  # in-game class adaptation prior (0: off)
+    exploit_gain: float = human_exploit.DEFAULT_MIN_GAIN  # min expected gain (under the belief) to deviate
     inference: bool = True  # 589.28 opponent set inference (False: pre-589.28 sampling)
     damage_inference: bool = True  # ...of which: damage-roll inference (needs inference)
     eval_lowhp_knee: float = 0.0  # 589.32 experiment: >0 discounts alive/item/boost value of low-HP mons
@@ -287,6 +304,12 @@ class SearchConfig:
             tendency_delta=_env_float(
                 "SHOWDOWN_SEARCH_TENDENCY_DELTA", tendency_module.DEFAULT_DELTA, 0.0, 1.0
             ),
+            opp_model=(os.environ.get("SHOWDOWN_SEARCH_OPP_MODEL", "").strip() or None),
+            opp_elo=(os.environ.get("SHOWDOWN_SEARCH_OPP_ELO", "").strip() or None),
+            exploit_delta=_env_float("SHOWDOWN_SEARCH_EXPLOIT_DELTA", human_exploit.DEFAULT_DELTA, 0.0, 1.0),
+            exploit_weight=_env_float("SHOWDOWN_SEARCH_EXPLOIT_WEIGHT", 1.0, 0.0, 1.0 + 1e-9),
+            exploit_kappa=_env_float("SHOWDOWN_SEARCH_EXPLOIT_KAPPA", human_exploit.DEFAULT_KAPPA, 0.0, math.inf),
+            exploit_gain=_env_float("SHOWDOWN_SEARCH_EXPLOIT_GAIN", human_exploit.DEFAULT_MIN_GAIN, 0.0, 1.0),
             inference=os.environ.get("SHOWDOWN_INFERENCE", "1").strip().lower()
             not in ("0", "off", "false", "no"),
             damage_inference=os.environ.get("SHOWDOWN_INFERENCE_DAMAGE", "1").strip().lower()
@@ -339,6 +362,10 @@ class SearchStats:
     endgame_decisions: int = 0  # decisions decided by endgame expectiminimax
     endgame_fallbacks: int = 0  # endgame decisions that fell back to MCTS (error / degenerate)
     decision_timeouts: int = 0  # decisions whose pool search hit the hard cap (pool recycled)
+    exploit_decisions: int = 0  # decisions where the human model produced a belief for >= 1 world
+    exploit_shifted: int = 0  # ...of which the strategy moved toward a best response (lambda > 0)
+    exploit_changed: int = 0  # ...of which the chosen policy's top choice changed
+    exploit_ms: float = 0.0  # time spent predicting + solving
     fallback_reasons: Counter = field(default_factory=Counter)
 
     def summary(self) -> str:
@@ -358,6 +385,12 @@ class SearchStats:
             )
             + (f" decision_timeouts={self.decision_timeouts}" if self.decision_timeouts else "")
             + (
+                f" exploit={self.exploit_decisions} shifted={self.exploit_shifted} "
+                f"changed={self.exploit_changed} exploit_ms={self.exploit_ms:.0f}"
+                if self.exploit_decisions
+                else ""
+            )
+            + (
                 f" endgame={self.endgame_decisions} endgame_fallbacks={self.endgame_fallbacks}"
                 if self.endgame_decisions or self.endgame_fallbacks
                 else ""
@@ -376,7 +409,8 @@ def total_stats() -> SearchStats:
             "decisions", "searched", "forced", "fallbacks", "worlds_run",
             "world_errors", "iterations", "search_ms", "unknown_ids", "illusion_worlds",
             "escalations", "noop_pruned", "tera_folded", "endgame_decisions",
-            "endgame_fallbacks", "decision_timeouts",
+            "endgame_fallbacks", "decision_timeouts", "exploit_decisions", "exploit_shifted",
+            "exploit_changed", "exploit_ms",
         ):
             setattr(total, name, getattr(total, name) + getattr(stats, name))
         total.fallback_reasons.update(stats.fallback_reasons)
@@ -697,6 +731,24 @@ def mode_for_record(config: SearchConfig) -> str:
     return NASH if config.tendency else config.mode
 
 
+def needs_joint(config: SearchConfig) -> bool:
+    """Whether workers must return the root joint matrix (nash / tendency / human-model exploit)."""
+    return mode_for_record(config) == NASH or bool(config.opp_model)
+
+
+_HUMAN_MODELS: dict[str, Any] = {}
+
+
+def load_human_model(path: str) -> Any:
+    """The ``HumanPolicy`` at ``path`` (loaded once per process)."""
+    model = _HUMAN_MODELS.get(path)
+    if model is None:
+        from showdown_bot.human_policy import HumanPolicy
+
+        model = _HUMAN_MODELS[path] = HumanPolicy.load(path)
+    return model
+
+
 class SearchPlayer(OpponentModelPlayerMixin, Player):
     """MCTS over sampled opponent worlds; see the module docstring."""
 
@@ -781,6 +833,23 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             raise ValueError(f"tendency_kappa must be finite and >= 0, got {self.config.tendency_kappa}")
         if not (math.isfinite(self.config.tendency_delta) and 0 <= self.config.tendency_delta < 1):
             raise ValueError(f"tendency_delta must be in [0, 1), got {self.config.tendency_delta}")
+        cfg = self.config
+        if cfg.opp_model is not None:
+            if not Path(cfg.opp_model).is_file():
+                raise FileNotFoundError(f"opp_model file not found: {cfg.opp_model}")
+            self.config = cfg = dataclasses.replace(cfg, opp_model=str(Path(cfg.opp_model).resolve()))
+            if cfg.threads > 1:
+                raise ValueError("opp_model needs threads == 1 (it uses the root joint matrix)")
+            if cfg.tendency or cfg.mode == NASH:
+                raise ValueError("opp_model works on top of mode mixed or argmax (not nash / tendency)")
+            if not (math.isfinite(cfg.exploit_delta) and 0 <= cfg.exploit_delta < 1):
+                raise ValueError(f"exploit_delta must be in [0, 1), got {cfg.exploit_delta}")
+            if not (math.isfinite(cfg.exploit_weight) and 0 <= cfg.exploit_weight <= 1):
+                raise ValueError(f"exploit_weight must be in [0, 1], got {cfg.exploit_weight}")
+            if not (math.isfinite(cfg.exploit_kappa) and cfg.exploit_kappa >= 0):
+                raise ValueError(f"exploit_kappa must be >= 0, got {cfg.exploit_kappa}")
+            if not (math.isfinite(cfg.exploit_gain) and cfg.exploit_gain >= 0):
+                raise ValueError(f"exploit_gain must be >= 0, got {cfg.exploit_gain}")
         if self.config.tendency and self.config.threads > 1:
             raise ValueError("tendency needs threads == 1 (it solves the root joint matrix)")
         if self.config.mode == NASH and self.config.threads > 1:
@@ -850,6 +919,9 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         self.tendency_decisions = 0  # decisions where evidence moved the strategy
         self.last_choice: str | None = None
         self.last_changes: dict[str, Any] = {}
+        self.last_exploit: dict[str, Any] | None = None  # diagnostics of the last human-model exploit
+        self._human_model = load_human_model(self.config.opp_model) if self.config.opp_model else None
+        self._adapters: dict[str, human_exploit.ClassAdapter] = {}
         # Recording is off unless a recorder is passed or SHOWDOWN_RECORD_DIR is set.
         self._recorder = recorder if recorder is not None else recorder_module.from_env()
         self._paired: list[tuple[str, WorldResult]] = []
@@ -917,6 +989,13 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
                 query = self._tendency_query(battle)
             except Exception:  # the model must never cost a decision
                 logger.exception("Tendency query failed in %s", battle.battle_tag)
+        if self._human_model is not None and not self.config.tendency:
+            try:  # let the tendency tracker log the opponent's action class every turn
+                if not getattr(battle, "force_switch", False):
+                    tracker = tendency_module.for_battle(battle.battle_tag, create=True)
+                    tracker.set_context(battle.turn, self._tendency_context or tendency_module.Context())
+            except Exception:
+                logger.debug("Exploit context registration failed", exc_info=True)
         if self.config.belief_reweight:
             self._apply_belief_action(battle)
         legal = battle.valid_orders
@@ -958,7 +1037,9 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         pool_size = getattr(self._executor, "_max_workers", None) or cfg.parallelism
         waves = max(1, -(-len(state_strings) // max(1, pool_size)))
         spent_s = waves * time_ms / 1000.0  # compute time used so far (queue-free)
-        policy, nash_records, mode = self._policy_of(results, battle, query)
+        policy, nash_records, mode = self._policy_of(
+            results, battle, query, [state_strings[i] for i in result_worlds]
+        )
         adjusted, changes = dq.adjust_policy(
             policy, results, noop=noop, tera_margin=cfg.tera_margin
         )
@@ -983,7 +1064,9 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
                 results, final_ms = more, new_ms
                 result_worlds = list(self._result_worlds)
                 escalated += 1
-                policy, nash_records, mode = self._policy_of(results, battle, query)
+                policy, nash_records, mode = self._policy_of(
+                    results, battle, query, [state_strings[i] for i in result_worlds]
+                )
                 adjusted, changes = dq.adjust_policy(
                     policy, results, noop=noop, tera_margin=cfg.tera_margin
                 )
@@ -1259,7 +1342,8 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             logger.exception("Belief bookkeeping failed in %s", battle.battle_tag)
 
     def _policy_of(
-        self, results: list[WorldResult], battle: Any, query: TendencyQuery | None = None
+        self, results: list[WorldResult], battle: Any, query: TendencyQuery | None = None,
+        states: list[str] | None = None,
     ) -> tuple[dict[str, float], list[dict[str, Any] | None], str]:
         """Aggregate the world results into a root policy; returns ``(policy, nash records, mode)``."""
         mode = NASH if self.config.tendency else self.config.mode
@@ -1275,7 +1359,131 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
                 mode = MIXED
         if not policy:
             policy = aggregate_policy(results)
+        self.last_exploit = None
+        if self._human_model is not None and mode != NASH and states is not None:
+            try:
+                policy = self._exploit_policy(results, policy, battle, states)
+            except Exception:  # the model must never cost a decision
+                logger.exception("Human-model exploit failed in %s", battle.battle_tag)
+                self.last_exploit = None
         return policy, nash_records, mode
+
+    def _exploit_policy(
+        self, results: list[WorldResult], base_policy: dict[str, float], battle: Any, states: list[str]
+    ) -> dict[str, float]:
+        """Bounded best response to the human model's belief, world by world.
+
+        Each world's base strategy is its own root visit share (the same quantity the default
+        policy averages); it is moved toward the best response to the model's prediction of the
+        opponent's reply, never letting the worst-case payoff fall more than ``exploit_delta``
+        below the base strategy's (``human_exploit.safe_best_response``). The per-world results
+        are averaged exactly like ``aggregate_policy`` does.
+        """
+        cfg = self.config
+        started = time.perf_counter()
+        usable = [k for k, r in enumerate(results) if r[0] > 0 and r[1]]
+        elig: list[int] = []
+        for k in usable:
+            r = results[k]
+            cols = r[4] if len(r) > 4 and r[4] else None
+            if len(r) < 4 or r[3] is None or not cols or len(cols) < 2:
+                continue
+            if all(str(c).startswith("switch") for c in cols):  # replacement turn: untrained situation
+                continue
+            elig.append(k)
+        if not elig:
+            return base_policy
+        dists = self._human_model.predict_many(
+            [states[k] for k in elig], [results[k][4] for k in elig], cfg.opp_elo, side=2
+        )
+        tag = battle.battle_tag
+        adapter = self._adapters.get(tag)
+        if adapter is None:
+            adapter = self._adapters[tag] = human_exploit.ClassAdapter(cfg.exploit_kappa)
+            while len(self._adapters) > 64:
+                self._adapters.pop(next(iter(self._adapters)))
+        tracker = tendency_module.for_battle(tag)
+        if tracker is not None and cfg.exploit_kappa > 0:
+            adapter.absorb(tracker.history)
+        mult = adapter.multipliers() if cfg.exploit_kappa > 0 else {}
+        weight = 1.0 / len(usable)
+        shares: dict[int, dict[str, float]] = {}
+        infos: list[dict[str, Any]] = []
+        forecast: dict[str, float] = {}
+        belief_sum: dict[str, float] = {}
+        for k, dist in zip(elig, dists):
+            result = results[k]
+            options, cols = result[1], list(result[4])
+            k2, cells = result[3]
+            A = nash_module.shrunk_matrix(len(options), int(k2), cells, cfg.nash_pseudocount)
+            if A.shape[1] != len(cols):
+                continue
+            base = self._world_shares(result)
+            raw = human_exploit.belief_from_model(cols, dist, None, floor=0.0)
+            for c, m in human_exploit.class_mass(cols, raw).items():
+                forecast[c] = forecast.get(c, 0.0) + m / len(elig)
+            belief = human_exploit.belief_from_model(cols, dist, mult)
+            x, info = human_exploit.safe_best_response(
+                A, base, belief, cfg.exploit_delta, cfg.exploit_weight, cfg.exploit_gain
+            )
+            strategy: dict[str, float] = {}
+            for (choice, _v, _s), p in zip(options, x):
+                strategy[choice] = strategy.get(choice, 0.0) + float(p)
+            shares[k] = strategy
+            for c, p in zip(cols, belief):
+                belief_sum[c] = belief_sum.get(c, 0.0) + float(p) / len(elig)
+            if str(info["target"]).isnumeric():
+                info["target"] = options[int(info["target"])][0]
+            infos.append(info)
+        if not shares:
+            return base_policy
+        if cfg.exploit_kappa > 0:
+            adapter.forecast(int(battle.turn), forecast)
+        policy: dict[str, float] = {}
+        for k in usable:
+            strategy = shares.get(k) or self._world_shares(results[k], by_choice=True)
+            for choice, p in strategy.items():
+                policy[choice] = policy.get(choice, 0.0) + weight * p
+        base_top = max(base_policy.items(), key=lambda kv: kv[1])[0] if base_policy else None
+        new_top = max(policy.items(), key=lambda kv: kv[1])[0] if policy else None
+        shifted = any(i["lambda"] > 0 for i in infos)
+        elapsed = (time.perf_counter() - started) * 1000.0
+        self.stats.exploit_decisions += 1
+        self.stats.exploit_shifted += bool(shifted)
+        self.stats.exploit_changed += bool(base_top != new_top)
+        self.stats.exploit_ms += elapsed
+        top_belief = sorted(belief_sum.items(), key=lambda kv: -kv[1])[:4]
+        self.last_exploit = {
+            "turn": int(battle.turn), "worlds": len(infos), "shifted": shifted,
+            "changed": base_top != new_top, "base_top": base_top, "top": new_top,
+            "belief": [[c, round(p, 4)] for c, p in top_belief],
+            "class_belief": {c: round(m, 4) for c, m in forecast.items()},
+            "class_mult": {c: round(m, 3) for c, m in mult.items()},
+            "n_observed": adapter.n,
+            "lambda": [round(i["lambda"], 4) for i in infos],
+            "target": [i["target"] for i in infos],
+            "gain": [round(i["gain"], 4) for i in infos],
+            "security_base": [round(i["security_base"], 4) for i in infos],
+            "security": [round(i["security"], 4) for i in infos],
+            "ms": round(elapsed, 1),
+        }
+        return policy
+
+    @staticmethod
+    def _world_shares(result: WorldResult, by_choice: bool = False):
+        """A world's base strategy: the visit share (average-strategy share for exp3 / rm)."""
+        options = result[1]
+        if len(result) > 2 and result[2] is not None:
+            shares = [float(x) for x in result[2]]
+        else:
+            total = sum(v for _, v, _ in options) or result[0]
+            shares = [v / total for _, v, _ in options]
+        if not by_choice:
+            return np.array(shares)
+        out: dict[str, float] = {}
+        for (choice, _v, _s), p in zip(options, shares):
+            out[choice] = out.get(choice, 0.0) + p
+        return out
 
     def _tendency_query(self, battle: Any) -> TendencyQuery:
         """Observed counts for the current context; also registers it for the tracker."""
@@ -1407,15 +1615,16 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         self._paired = []
         search_fn = functools.partial(
             _worker.search_world,
-            opp_names=bool(self.config.tendency),
+            opp_names=bool(self.config.tendency or self.config.opp_model),
             opp_visits=bool(self.config.belief_reweight),
-        ) if (self.config.tendency or self.config.belief_reweight) else _worker.search_world
+        ) if (self.config.tendency or self.config.belief_reweight or self.config.opp_model) \
+            else _worker.search_world
         futures = [
             loop.run_in_executor(
                 executor, search_fn, state, time_ms, self.config.threads,
                 ev_path, ev_scale,
                 self.config.selection, self.config.selection_gamma,
-                mode_for_record(self.config) == NASH, self.config.eval_lowhp_knee,
+                needs_joint(self.config), self.config.eval_lowhp_knee,
                 self.config.eval_boost_scale,
             )
             for state, (ev_path, ev_scale) in zip(
@@ -1524,6 +1733,7 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
                     "truth": {"state": truth_state} if truth_state else None,
                     "truth_status": truth_status,
                     "opp_facts": opp_facts,
+                    **({"exploit": self.last_exploit} if self.last_exploit else {}),
                 },
             )
         except Exception:
