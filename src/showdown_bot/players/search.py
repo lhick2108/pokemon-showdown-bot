@@ -1070,13 +1070,17 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         ]
         pool_size = getattr(executor, "_max_workers", None) or self.config.parallelism
         waves = -(-len(futures) // max(1, pool_size))
-        timeout = waves * (time_ms / 1000.0 + 1.0) + 10.0
+        # Hard wall-clock limit: the planned compute plus 1 s of IPC grace, never beyond the
+        # decision cap, so a wedged worker costs at most this before MCTS answers instead.
+        timeout = min(waves * time_ms / 1000.0 + 1.0, self.config.endgame_cap_ms / 1000.0)
         try:
             outcomes = await asyncio.wait_for(
                 asyncio.gather(*futures, return_exceptions=True), timeout=timeout
             )
         except asyncio.TimeoutError:
-            logger.error("Endgame search timed out after %.0fs", timeout)
+            # A hung engine call cannot be interrupted: kill the (owned) pool's workers so the
+            # next decision gets a healthy one; a caller-supplied executor is left alone.
+            logger.error("Endgame search timed out after %.1fs", timeout)
             if self._executor is None:
                 reset_pool(self.config.parallelism, only=executor, kill=True)
             raise

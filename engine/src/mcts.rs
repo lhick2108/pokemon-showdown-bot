@@ -82,6 +82,9 @@ impl Node {
         choice
     }
 
+    /// Walks from `self` down the tree to the first node whose chosen joint action has no
+    /// child yet. Iterative: in a stalling position the tree is a chain tens of thousands of
+    /// nodes deep, and recursing there overflowed the stack (bead sdb.8).
     pub unsafe fn selection(
         &mut self,
         state: &mut State,
@@ -89,34 +92,37 @@ impl Node {
         rng: &mut impl Rng,
         sel: &SelectionConfig,
     ) -> (*mut Node, usize, usize) {
-        if self.s1_options.is_none() {
-            let (s1_options, s2_options) = state.get_all_options();
-            self.populate(s1_options, s2_options);
-        }
+        let mut node: *mut Node = self;
+        loop {
+            if (*node).s1_options.is_none() {
+                let (s1_options, s2_options) = state.get_all_options();
+                (*node).populate(s1_options, s2_options);
+            }
 
-        let (s1_mc_index, s2_mc_index) = if sel.mode == SelectionMode::Ucb1 {
-            (
-                self.maximize_ucb_for_side(self.s1_options.as_ref().unwrap()),
-                self.maximize_ucb_for_side(self.s2_options.as_ref().unwrap()),
-            )
-        } else {
-            if self.stats.is_none() {
-                let k1 = self.s1_options.as_ref().unwrap().len();
-                let k2 = self.s2_options.as_ref().unwrap().len();
-                self.stats = Some(Box::new(NodeStats::new(sel, k1, k2)));
+            let (s1_mc_index, s2_mc_index) = if sel.mode == SelectionMode::Ucb1 {
+                (
+                    (*node).maximize_ucb_for_side((*node).s1_options.as_ref().unwrap()),
+                    (*node).maximize_ucb_for_side((*node).s2_options.as_ref().unwrap()),
+                )
+            } else {
+                if (*node).stats.is_none() {
+                    let k1 = (*node).s1_options.as_ref().unwrap().len();
+                    let k2 = (*node).s2_options.as_ref().unwrap().len();
+                    (*node).stats = Some(Box::new(NodeStats::new(sel, k1, k2)));
+                }
+                let st = (*node).stats.as_mut().unwrap();
+                (st.s1.select(rng), st.s2.select(rng))
+            };
+            let key = (node as usize, s1_mc_index, s2_mc_index);
+            match children.get_mut(&key) {
+                Some(child_vector) => {
+                    let child_vec_ptr = child_vector as *mut Box<[Node]>;
+                    let chosen_child = (*node).sample_node(child_vec_ptr, rng);
+                    state.apply_instructions(&(*chosen_child).instructions.instruction_list);
+                    node = chosen_child;
+                }
+                None => return (node, s1_mc_index, s2_mc_index),
             }
-            let st = self.stats.as_mut().unwrap();
-            (st.s1.select(rng), st.s2.select(rng))
-        };
-        let key = (self as *mut Node as usize, s1_mc_index, s2_mc_index);
-        match children.get_mut(&key) {
-            Some(child_vector) => {
-                let child_vec_ptr = child_vector as *mut Box<[Node]>;
-                let chosen_child = self.sample_node(child_vec_ptr, rng);
-                state.apply_instructions(&(*chosen_child).instructions.instruction_list);
-                (*chosen_child).selection(state, children, rng, sel)
-            }
-            None => (self as *mut Node, s1_mc_index, s2_mc_index),
         }
     }
 
@@ -184,31 +190,37 @@ impl Node {
         new_node_ptr
     }
 
+    /// Adds `score` to this node and every ancestor, undoing the instructions on the way up.
+    /// Iterative (see `selection`).
     pub unsafe fn backpropagate(&mut self, score: f32, state: &mut State) {
-        self.times_visited += 1;
-        self.total_score += score;
-        if self.root {
-            return;
-        }
+        let mut node: *mut Node = self;
+        loop {
+            (*node).times_visited += 1;
+            (*node).total_score += score;
+            if (*node).root {
+                return;
+            }
+            let parent = (*node).parent;
+            let s1_choice = (*node).s1_choice as usize;
+            let s2_choice = (*node).s2_choice as usize;
 
-        let parent_s1_movenode =
-            &mut (*self.parent).s1_options.as_mut().unwrap()[self.s1_choice as usize];
-        parent_s1_movenode.total_score += score;
-        parent_s1_movenode.visits += 1;
-        if let Some(stats) = (*self.parent).stats.as_mut() {
-            stats.s1.update(self.s1_choice as usize, score);
-        }
+            let parent_s1_movenode = &mut (*parent).s1_options.as_mut().unwrap()[s1_choice];
+            parent_s1_movenode.total_score += score;
+            parent_s1_movenode.visits += 1;
+            if let Some(stats) = (*parent).stats.as_mut() {
+                stats.s1.update(s1_choice, score);
+            }
 
-        let parent_s2_movenode =
-            &mut (*self.parent).s2_options.as_mut().unwrap()[self.s2_choice as usize];
-        parent_s2_movenode.total_score += 1.0 - score;
-        parent_s2_movenode.visits += 1;
-        if let Some(stats) = (*self.parent).stats.as_mut() {
-            stats.s2.update(self.s2_choice as usize, 1.0 - score);
-        }
+            let parent_s2_movenode = &mut (*parent).s2_options.as_mut().unwrap()[s2_choice];
+            parent_s2_movenode.total_score += 1.0 - score;
+            parent_s2_movenode.visits += 1;
+            if let Some(stats) = (*parent).stats.as_mut() {
+                stats.s2.update(s2_choice, 1.0 - score);
+            }
 
-        state.reverse_instructions(&self.instructions.instruction_list);
-        (*self.parent).backpropagate(score, state);
+            state.reverse_instructions(&(*node).instructions.instruction_list);
+            node = parent;
+        }
     }
 
     pub fn rollout(&mut self, state: &mut State, root_eval: &f32, leaf_eval: &mut LeafEval) -> f32 {

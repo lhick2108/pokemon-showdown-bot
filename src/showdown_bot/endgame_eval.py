@@ -254,3 +254,119 @@ def summarize(scores: list[float], seed: int = 0, resamples: int = 4000) -> dict
         "n": n, "mean": mean, "se": se, "lo": mean - 1.96 * se, "hi": mean + 1.96 * se,
         "boot_lo": means[int(0.025 * resamples)], "boot_hi": means[int(0.975 * resamples) - 1],
     }
+
+
+# ---------------------------------------------------------------------------------------------
+# Crash- and hang-proof game runner
+# ---------------------------------------------------------------------------------------------
+
+
+def append_result(path: Any, result: dict[str, Any]) -> None:
+    """Append one finished game as a JSON line (flushed at once so partial runs survive)."""
+    import json
+
+    prefix = ""
+    if os.path.exists(path) and os.path.getsize(path):
+        with open(path, "rb") as probe:
+            probe.seek(-1, os.SEEK_END)
+            if probe.read(1) != b"\n":  # torn last line from a killed run: start a fresh one
+                prefix = "\n"
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(prefix + json.dumps(result) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def load_results(path: Any) -> list[dict[str, Any]]:
+    import json
+
+    if not os.path.exists(path):
+        return []
+    out = []
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            try:
+                out.append(json.loads(line))
+            except ValueError:
+                continue  # a torn last line from a killed run
+    return out
+
+
+def latest_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One result per (position, seat): an ok game wins over an error, later over earlier."""
+    best: dict[tuple[int, int], dict[str, Any]] = {}
+    for r in results:
+        key = (r["index"], r["a_side"])
+        if key not in best or r.get("ok") or not best[key].get("ok"):
+            best[key] = r
+    return list(best.values())
+
+
+def _child(task: dict[str, Any], conn: Any) -> None:
+    try:
+        conn.send(run_task(task))
+    finally:
+        conn.close()
+
+
+def _failure(task: dict[str, Any], error: str) -> dict[str, Any]:
+    return {"index": task["index"], "a_side": task["a_side"], "ok": False, "error": error,
+            "state": task["state"]}
+
+
+def _selftest_child(task: dict[str, Any], conn: Any) -> None:
+    """Stand-in game for tests: ``task["mode"]`` is ok | die (abrupt exit) | hang."""
+    mode = task.get("mode", "ok")
+    if mode == "die":
+        os._exit(3)
+    if mode == "hang":
+        time.sleep(3600)
+    conn.send({"index": task["index"], "a_side": task["a_side"], "ok": True, "score": 1.0})
+    conn.close()
+
+
+def run_games(
+    tasks: list[dict[str, Any]], workers: int, timeout_s: float, on_result: Any,
+    target: Any = None,
+) -> None:
+    """Run every task in its OWN process (at most ``workers`` at once).
+
+    A game that exceeds ``timeout_s`` is killed, and a process that dies without answering (an
+    engine abort / stack overflow cannot be caught in-process) is reported; both come back as
+    ``{"ok": False, "error": ..., "state": ...}`` instead of hanging the run, which a
+    ``multiprocessing.Pool`` does when one of its workers dies. ``on_result(result)`` is
+    called in the parent as each game finishes.
+    """
+    import multiprocessing as mp
+    from multiprocessing.connection import wait
+
+    ctx = mp.get_context("spawn")
+    pending = list(tasks)
+    running: dict[Any, tuple[Any, dict[str, Any], float]] = {}
+    while pending or running:
+        while pending and len(running) < max(1, workers):
+            task = pending.pop(0)
+            parent, child = ctx.Pipe(duplex=False)
+            proc = ctx.Process(target=target or _child, args=(task, child), daemon=True)
+            proc.start()
+            child.close()
+            running[parent] = (proc, task, time.time())
+        for conn in wait(list(running), timeout=1.0):
+            proc, task, _t0 = running.pop(conn)
+            try:
+                result = conn.recv()
+            except (EOFError, OSError):
+                proc.join(5)
+                result = _failure(task, f"worker died (exit code {proc.exitcode})")
+            else:
+                proc.join(5)
+            conn.close()
+            on_result(result)
+        now = time.time()
+        for conn, (proc, task, t0) in list(running.items()):
+            if now - t0 > timeout_s:
+                proc.kill()
+                proc.join(5)
+                del running[conn]
+                conn.close()
+                on_result(_failure(task, f"timeout after {timeout_s:.0f} s (killed)"))
