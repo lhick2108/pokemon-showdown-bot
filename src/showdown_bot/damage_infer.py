@@ -29,6 +29,7 @@ from typing import Any
 
 import poke_engine as pe
 
+from showdown_bot import belief as belief_module
 from showdown_bot import engine_state
 from showdown_bot.inference import Constraint, DamageObs, set_key, to_id
 
@@ -117,6 +118,10 @@ class DamageInferer:
         ALL_STATS.append(self.stats)
         self._bad_moves: set[str] = set()
         self._illusion_p = 0.0  # P(the active opponent is a disguised Zoroark)
+        # Soft belief (bead showdown-bot-1wu): with ``belief`` on, every evaluated observation
+        # also leaves ``(tracker_key, {set_key: likelihood factor})`` in ``likelihoods``.
+        self.belief = False
+        self.likelihoods: list[tuple[str, dict[tuple, float]]] = []
 
     def evaluate_all(
         self, battle: Any, trackers: dict[str, Any], observations: list[DamageObs],
@@ -124,6 +129,7 @@ class DamageInferer:
     ) -> list[tuple[DamageObs, str, Constraint]]:
         """Return ``(obs, tracker_key, constraint)`` for every informative observation."""
         results: list[tuple[DamageObs, str, Constraint]] = []
+        self.likelihoods = []
         self._illusion_p = illusion_p
         started = time.perf_counter()
         try:
@@ -231,9 +237,11 @@ class DamageInferer:
             return (float(result[0][0]), pokemon.maxhp) if result else None
 
         rejected: set[tuple] = set()
+        soft: list[tuple[list, float | None]] = []  # (members, likelihood) per group
         for members in groups.values():
             species_id, sample = members[0]
             if opp_attacks and to_id(sample.ability) in _UNRELIABLE_ABILITIES:
+                soft.append((members, None))
                 continue
             predicted = predict(species_id, sample)
             if predicted is None:
@@ -241,9 +249,15 @@ class DamageInferer:
             high, maxhp = predicted
             if opp_attacks:
                 ok = roll_consistent(high, observed, True, our_poke.hp)
+                if self.belief:
+                    soft.append((members, belief_module.damage_likelihood(
+                        high, observed, True, float(our_poke.hp))))
             else:
                 scale = 100.0 / max(1, maxhp)
                 ok = roll_consistent(high * scale, observed_pct, False, obs.hp_before * 100.0)
+                if self.belief:
+                    soft.append((members, belief_module.damage_likelihood(
+                        high * scale, observed_pct, False, obs.hp_before * 100.0)))
             if not ok:
                 rejected.update(set_key(sid, fs) for sid, fs in members)
 
@@ -255,14 +269,31 @@ class DamageInferer:
 
         self.stats.evaluated += 1
         self.stats.candidates += len(pool)
-        if not rejected:
-            return None
         if len(rejected) >= len(pool):
             self.stats.all_rejected += 1
+            return None
+        if self.belief:
+            self._note_soft(key, soft, rejected)
+        if not rejected:
             return None
         self.stats.narrowed += 1
         self.stats.rejected += len(rejected)
         return obs, key, Constraint("reject", (frozenset(rejected),))
+
+    def _note_soft(self, key: str, soft: list, rejected: set) -> None:
+        started = time.perf_counter()
+        try:
+            alive = [(m, x) for m, x in soft if not any(set_key(s, f) in rejected for s, f in m)]
+            if len(alive) < 2:
+                return
+            factors = belief_module.group_damage_factors([x for _, x in alive])
+            out: dict[tuple, float] = {}
+            for (members, _x), factor in zip(alive, factors):
+                for sid, fs in members:
+                    out[set_key(sid, fs)] = factor
+            self.likelihoods.append((key, out))
+        finally:
+            belief_module.STATS.damage_seconds += time.perf_counter() - started
 
     def _candidate(self, battle, opp_mon, species_id: str, full_set):
         sampled = engine_state.SampledSet(

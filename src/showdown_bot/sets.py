@@ -27,7 +27,10 @@ from showdown_bot.inference import (
     SpeedObs,
     constraint_allows,
     resolve_speed,
+    set_key,
+    speed_tie_factors,
 )
+from showdown_bot import belief as belief_module
 
 logger = logging.getLogger(__name__)
 
@@ -598,6 +601,67 @@ class SetTracker:
         self._provisional_constraints: list[Constraint] = []
         self._signature: tuple | None = None
         self._match_cache: list[tuple[str, FullSet]] | None = None
+        # Soft belief (bead showdown-bot-1wu): likelihood factor per candidate set key, on top
+        # of the occurrence-count prior.  Inert unless ``belief_enabled``.
+        self.belief_enabled = False
+        self.belief_floor = belief_module.DEFAULT_FLOOR
+        self.belief: dict[tuple, float] = {}
+        self._weights_cache: tuple[Any, int, list[float]] | None = None
+        self._belief_version = 0
+
+    # -- soft belief ---------------------------------------------------------
+
+    def update_belief(self, factors: Mapping[tuple, float]) -> bool:
+        """Multiply likelihood ``factors`` (set key -> factor) into the belief.
+
+        The pool's weights are then renormalised to a maximum of 1 and floored, so evidence
+        stays soft and a set can recover when the others are contradicted in turn.
+        """
+        if not factors:
+            return False
+        matches = self._matching_full_sets()
+        if not matches:
+            return False
+        keys = [set_key(sid, fs) for sid, fs in matches]
+        if all(abs(factors.get(k, 1.0) - 1.0) < 1e-12 for k in keys):
+            return False
+        raw = [self.belief.get(k, 1.0) * float(factors.get(k, 1.0)) for k in keys]
+        for k, w in zip(keys, belief_module.normalise_factors(raw, self.belief_floor)):
+            self.belief[k] = w
+        self._belief_version += 1
+        return True
+
+    def _belief_weights(self, matches: list[tuple[str, FullSet]]) -> list[float]:
+        cache = self._weights_cache
+        if cache is not None and cache[0] is matches and cache[1] == self._belief_version:
+            return cache[2]
+        factors = [self.belief.get(set_key(sid, fs), 1.0) for sid, fs in matches]
+        weights = belief_module.effective_weights(
+            [fs.count for _, fs in matches], factors, self.belief_floor
+        )
+        self._weights_cache = (matches, self._belief_version, weights)
+        return weights
+
+    def belief_summary(self) -> dict[str, Any] | None:
+        """Diagnostics: entropy (bits) of prior vs posterior, top set and its probability."""
+        matches = self._matching_full_sets()
+        if not matches:
+            return None
+        counts = [max(0.0, float(fs.count)) for _, fs in matches]
+        weights = self._belief_weights(matches) if self.belief_enabled else counts
+        total = sum(weights)
+        if total <= 0:
+            return None
+        top = max(range(len(weights)), key=weights.__getitem__)
+        sid, fs = matches[top]
+        return {
+            "n": len(matches),
+            "prior_entropy": round(belief_module.entropy_bits(counts), 3),
+            "entropy": round(belief_module.entropy_bits(weights), 3),
+            "top_p": round(weights[top] / total, 4),
+            "top_prior_p": round(counts[top] / sum(counts), 4) if sum(counts) > 0 else None,
+            "top": [sid, str(fs.item), str(fs.ability), "/".join(fs.moves)],
+        }
 
     @property
     def constraints(self) -> tuple[Constraint, ...]:
@@ -773,7 +837,10 @@ class SetTracker:
                 self.species,
             )
             return self._sample_role_based(rng)
-        weights = [full_set.count for _, full_set in matches]
+        if self.belief_enabled and self.belief:
+            weights = self._belief_weights(matches)
+        else:
+            weights = [full_set.count for _, full_set in matches]
         index = _weighted_index(rng, weights)
         species_id, full_set = matches[index]
         return SampledSet(
@@ -1045,6 +1112,10 @@ class _BattleOpponentState:
     # (DamageObs, attacker session, defender session) read from the current
     # message and not yet evaluated against the pre-message battle state.
     pending_damage: list = field(default_factory=list)
+    # Soft belief (bead showdown-bot-1wu): the opponent's chosen actions and the speed
+    # observations already folded into a tracker's belief.
+    watcher: Any = field(default_factory=belief_module.ActionWatcher)
+    belief_seen: set = field(default_factory=set)
 
 
 def _protocol_name(value: Any) -> tuple[str, str] | None:
@@ -1456,6 +1527,11 @@ class OpponentModel:
         # False disables the 589.28 inference (item/ability origin reveals,
         # negative evidence, speed): the pre-589.28 behaviour, for A/B duels.
         self.inference_enabled = inference
+        # Soft Bayesian belief reweighting of candidate sets (bead showdown-bot-1wu); off by
+        # default, in which case sampling is exactly the pre-belief behaviour.
+        self.belief_enabled = False
+        self.belief_tau = belief_module.DEFAULT_TAU
+        self.belief_floor = belief_module.DEFAULT_FLOOR
 
     def observe(self, battle_tag: str, event: list[str]) -> None:
         """Consume one raw ``parse_message`` event (see ``_observe_core``).
@@ -1512,7 +1588,53 @@ class OpponentModel:
         for event in events:
             if len(event) >= 2 and event[0] == "":
                 self.observe(battle_tag, list(event))
+        if self.belief_enabled:
+            self._watch_actions(battle_tag, events, battle)
         self.resolve_damage(battle_tag, battle)
+
+    def _watch_actions(
+        self, battle_tag: str, events: Sequence[Sequence[str]], battle: Any | None
+    ) -> None:
+        """Record the opponent's chosen action each turn (for action conditioning)."""
+        role = getattr(battle, "player_role", None)
+        if role not in ("p1", "p2"):
+            return
+        opp_role = "p2" if role == "p1" else "p1"
+        state = self._battles.setdefault(str(battle_tag), _BattleOpponentState())
+        for event in events:
+            if len(event) >= 2 and event[0] == "":
+                state.watcher.observe(event, opp_role)
+
+    def observed_action(self, battle_tag: str, turn: int) -> str | None:
+        """The opponent's engine-style choice on ``turn`` (None if not seen)."""
+        state = self._battles.get(str(battle_tag))
+        return None if state is None else state.watcher.observed.get(int(turn))
+
+    def apply_action_belief(self, battle: Any, record: Any) -> bool:
+        """Fold the opponent's observed action into the belief of its active Pokemon.
+
+        ``record`` is a ``belief.ActionRecord`` built from the solve of ``record.turn``.
+        """
+        started = time.perf_counter()
+        try:
+            tag = str(getattr(battle, "battle_tag", ""))
+            observed = self.observed_action(tag, record.turn)
+            if observed is None:
+                return False
+            state = self._battles.get(tag)
+            tracker = None if state is None else state.trackers.get(record.tracker_key)
+            if tracker is None:
+                return False
+            factors = belief_module.action_factors(record.worlds, observed, self.belief_tau)
+            if factors is None:
+                belief_module.STATS.action_skipped += 1
+                return False
+            tracker.belief_floor = self.belief_floor
+            applied = tracker.update_belief(factors)
+            belief_module.STATS.action_updates += int(applied)
+            return applied
+        finally:
+            belief_module.STATS.action_seconds += time.perf_counter() - started
 
     def resolve_damage(self, battle_tag: str, battle: Any | None) -> None:
         state = self._battles.get(str(battle_tag))
@@ -1531,9 +1653,18 @@ class OpponentModel:
                 illusion_p = sum(self.illusion_probability(battle).values())
             except Exception:
                 illusion_p = 0.0
+            self._damage_inferer.belief = self.belief_enabled
             results = self._damage_inferer.evaluate_all(
                 battle, trackers, [record[0] for record in pending], illusion_p
             )
+            if self.belief_enabled:
+                started = time.perf_counter()
+                for tracker_key, factors in self._damage_inferer.likelihoods:
+                    tracker = trackers.get(tracker_key)
+                    if tracker is not None:
+                        tracker.belief_floor = self.belief_floor
+                        belief_module.STATS.damage_updates += int(tracker.update_belief(factors))
+                belief_module.STATS.damage_seconds += time.perf_counter() - started
             role = getattr(battle, "player_role", None)
             for obs, _key, constraint in results:
                 for record in pending:
@@ -2017,12 +2148,15 @@ class OpponentModel:
             tracker = state.trackers.get(tracker_id)
             if tracker is None:
                 continue
+            tracker.belief_enabled = self.belief_enabled
+            tracker.belief_floor = self.belief_floor
             identity = _protocol_identity(tracker_id)
             protocol_pokemon = state.pokemon.get(identity) if identity is not None else None
             can_be_disguise = zoroark_possible and not (
                 set(tracker._species_ids) & set(_ZOROARK_SPECIES_IDS)
             )
             observations: list[tuple[str, str, bool]] = []
+            pending_speed: list[tuple[Any, Constraint]] = []
             for session in protocol_pokemon.sessions if protocol_pokemon else ():
                 resolved = self._resolved_observations(tracker, session)
                 suspect = can_be_disguise and any(
@@ -2053,13 +2187,33 @@ class OpponentModel:
                         speed = self._speed_constraint(battle, obs)
                         if speed is not None:
                             observations.append(("constraint", speed, suspect))
+                            if self.belief_enabled and not suspect:
+                                pending_speed.append((obs, speed))
             # The tracker keeps the first copy of a repeated observation, so
             # feed binding evidence first: a clean switch-in confirming
             # something seen during a suspect one makes it binding.
             observations.sort(key=lambda observation: observation[2])
             tracker._replace_observations(observations)
+            for obs, speed in pending_speed:
+                self._speed_belief(state, tracker_id, tracker, obs, speed)
 
         return dict(state.trackers)
+
+    def _speed_belief(
+        self, state: _BattleOpponentState, tracker_id: str, tracker: SetTracker,
+        obs: SpeedObs, constraint: Constraint,
+    ) -> None:
+        """Soft speed evidence, once per observation: an exact speed tie is a coin flip."""
+        key = (tracker_id, obs)
+        if key in state.belief_seen:
+            return
+        state.belief_seen.add(key)
+        started = time.perf_counter()
+        try:
+            factors = speed_tie_factors(tracker, constraint)
+            belief_module.STATS.speed_updates += int(tracker.update_belief(factors))
+        finally:
+            belief_module.STATS.speed_seconds += time.perf_counter() - started
 
     @staticmethod
     def _speed_constraint(battle: Any, obs: SpeedObs) -> Constraint | None:

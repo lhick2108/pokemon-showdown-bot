@@ -32,6 +32,20 @@ def get_evaluator(path: str, scale: float = 1.0):
     return evaluator
 
 
+class OppTuple(tuple):
+    """A search result tuple that also carries ``opp``: the opponent's ``(choice, visits)``
+    root options (soft belief, bead showdown-bot-1wu).  Equal to the plain tuple; the
+    attribute survives pickling to the parent process."""
+
+    def __new__(cls, items=(), opp=None):
+        obj = super().__new__(cls, items)
+        obj.opp = opp
+        return obj
+
+    def __getnewargs__(self):
+        return (tuple(self), self.opp)
+
+
 def search_world(
     state_string: str,
     search_time_ms: int,
@@ -44,6 +58,7 @@ def search_world(
     eval_knee: float = 0.0,
     eval_boost_scale: float = 1.0,
     opp_names: bool = False,
+    opp_visits: bool = False,
 ) -> tuple:
     """Run MCTS on one serialised world.
 
@@ -59,6 +74,8 @@ def search_world(
     setting is process-wide in the engine, so it is applied before every search.
     With ``opp_names`` (tendency model, needs ``joint``) a fifth element lists the
     opponent's option choice strings, aligned with the joint matrix columns.
+    With ``opp_visits`` the result is an ``OppTuple`` whose ``.opp`` lists the opponent's
+    (side_two) root ``(choice, visits)`` options.
     Plain tuples keep the result cheap to pickle. A Rust panic surfaces in
     Python as ``pyo3_runtime.PanicException`` (a ``BaseException``), so it is
     converted to an ordinary ``RuntimeError`` here.
@@ -83,32 +100,41 @@ def search_world(
         if joint:
             kwargs["return_joint"] = True
         result = monte_carlo_tree_search(state, search_time_ms, threads=threads, **kwargs)
-        options = [
-            (option.move_choice, int(option.visits), float(option.total_score))
-            for option in result.side_one
-        ]
-        if joint:
-            cells = [(int(i), int(j), int(v), float(m)) for i, j, v, m in result.joint]
-            strategies = (
-                [float(option.avg_strategy) for option in result.side_one]
-                if selection != "ucb1"
-                else None
+        out = _format(result, selection, joint, opp_names)
+        if opp_visits:
+            return OppTuple(
+                out, [(str(o.move_choice), int(o.visits)) for o in result.side_two]
             )
-            out = (int(result.total_visits), options, strategies, (len(result.side_two), cells))
-            if opp_names:
-                out += ([str(option.move_choice) for option in result.side_two],)
-            return out
-        if selection != "ucb1":
-            return (
-                int(result.total_visits),
-                options,
-                [float(option.avg_strategy) for option in result.side_one],
-            )
-        return (int(result.total_visits), options)
+        return out
     except Exception:
         raise
     except BaseException as exc:  # pyo3 PanicException
         raise RuntimeError(f"engine panic: {exc!r}") from None
+
+
+def _format(result, selection: str, joint: bool, opp_names: bool) -> tuple:
+    options = [
+        (option.move_choice, int(option.visits), float(option.total_score))
+        for option in result.side_one
+    ]
+    if joint:
+        cells = [(int(i), int(j), int(v), float(m)) for i, j, v, m in result.joint]
+        strategies = (
+            [float(option.avg_strategy) for option in result.side_one]
+            if selection != "ucb1"
+            else None
+        )
+        out = (int(result.total_visits), options, strategies, (len(result.side_two), cells))
+        if opp_names:
+            out += ([str(option.move_choice) for option in result.side_two],)
+        return out
+    if selection != "ucb1":
+        return (
+            int(result.total_visits),
+            options,
+            [float(option.avg_strategy) for option in result.side_one],
+        )
+    return (int(result.total_visits), options)
 
 
 def evaluator_loads() -> int:

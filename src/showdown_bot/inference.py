@@ -239,6 +239,39 @@ def _speed_allows(data: tuple, species_id: str, full_set: Any, item: str, abilit
     return speed - tolerance <= our_speed
 
 
+def speed_tie_factors(pool: Any, constraint: Constraint) -> dict[tuple, float]:
+    """Soft speed evidence: ``{set_key: factor}`` for the sets whose speed EQUALS ours.
+
+    The hard ``speed`` constraint already rejects sets on the wrong side of our speed; a set
+    with exactly our effective speed moves first or second at random, so the observed order
+    has probability 1/2 under it (and 1 under any other consistent set).  ``pool`` is a
+    ``SetTracker`` (or anything with ``_matching_full_sets()``).
+    """
+    from showdown_bot import belief  # lazy: belief imports nothing heavy
+
+    our_speed, _opp_first, _tr, stage, par, tailwind, status_move = constraint.data
+    out: dict[tuple, float] = {}
+    for species_id, full_set in pool._matching_full_sets():
+        item = to_id(full_set.item) if full_set.item else ""
+        ability = to_id(full_set.ability)
+        if ability in _SPEED_ABILITIES or ability == "galewings":
+            continue
+        if status_move and ability in _PRIORITY_ABILITIES:
+            continue
+        stat = _set_speed_stat(
+            species_id, int(full_set.level), tuple(to_id(m) for m in full_set.moves), ability, item
+        )
+        if stat is None:
+            continue
+        speed = effective_speed(stat, stage, par, tailwind, item == "choicescarf")
+        if item == "ironball":
+            speed = int(speed * 0.5)
+        factor = belief.speed_tie_factor(speed, our_speed)
+        if factor != 1.0:
+            out[set_key(species_id, full_set)] = factor
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Raw speed observation (resolved against our own stats in OpponentModel.update)
 # ---------------------------------------------------------------------------

@@ -78,6 +78,14 @@ def _parser() -> argparse.ArgumentParser:
                    help="589.40 opponent tendency model on the net side (default off)")
     p.add_argument("--stock-tendency", choices=("on", "off"), default="off",
                    help="589.40 opponent tendency model on the stock side (default off)")
+    for side in ("net", "stock"):
+        p.add_argument(f"--{side}-belief", action="store_true",
+                       help=f"{side} side: soft Bayesian belief reweighting of opponent sets "
+                            "(bead showdown-bot-1wu; default off)")
+    p.add_argument("--belief-tau", type=float, default=None,
+                   help="tempering exponent for action evidence (default 0.5)")
+    p.add_argument("--belief-floor", type=float, default=None,
+                   help="min share of the likeliest set (default 0.05)")
     p.add_argument("--tendency-kappa", type=float, default=None, help="prior pseudo-observations")
     p.add_argument("--tendency-delta", type=float, default=None, help="max loss vs Nash")
     for side in ("net", "stock"):
@@ -143,6 +151,15 @@ def _tendency_fields(args, flag: str) -> dict:
     return fields
 
 
+def _belief_fields(args, side: str) -> dict:
+    fields = {"belief_reweight": bool(getattr(args, f"{side}_belief"))}
+    if args.belief_tau is not None:
+        fields["belief_tau"] = args.belief_tau
+    if args.belief_floor is not None:
+        fields["belief_floor"] = args.belief_floor
+    return fields
+
+
 def _quality(args, side: str) -> dict:
     """SearchConfig fields of the 589.47 decision-quality options for one side."""
     get = lambda name: getattr(args, f"{side}_{name}")  # noqa: E731
@@ -185,6 +202,7 @@ async def _duel_pair(args, share: int, pool, plans=None, live=None):
                           "eval_lowhp_knee": args.net_eval_lowhp,
                           "eval_boost_scale": args.net_eval_boost_scale,
                           **_tendency_fields(args, args.net_tendency),
+                          **_belief_fields(args, "net"),
                           **_quality(args, "net")}),
         executor=pool, **options,
     )
@@ -207,6 +225,7 @@ async def _duel_pair(args, share: int, pool, plans=None, live=None):
             "eval_lowhp_knee": args.stock_eval_lowhp,
             "eval_boost_scale": args.stock_eval_boost_scale,
             **_tendency_fields(args, args.stock_tendency),
+            **_belief_fields(args, "stock"),
             **_quality(args, "stock"),
         }),
         executor=pool, **options,
@@ -372,7 +391,8 @@ def main(argv=None) -> int:
     print(f"selection: net={args.net_selection} stock={args.stock_selection} "
           f"(gamma {args.selection_gamma:g} for exp3/rm); "
           f"mode: net={args.net_mode} stock={args.stock_mode}; "
-          f"tendency: net={args.net_tendency} stock={args.stock_tendency}")
+          f"tendency: net={args.net_tendency} stock={args.stock_tendency}; "
+          f"belief: net={args.net_belief} stock={args.stock_belief}")
     for side in ("net", "stock"):
         q = _quality(args, side)
         if q["escalate"] or q["prune_noop"] or q["tera_margin"]:
