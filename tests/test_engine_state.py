@@ -1,4 +1,4 @@
-"""State conversion and opponent-team sampling (no server needed)."""
+﻿"""State conversion and opponent-team sampling (no server needed)."""
 
 from __future__ import annotations
 
@@ -425,3 +425,71 @@ def test_choice_locked_world_searches_with_fewer_opponent_options(data, sampler)
     result = pe.monte_carlo_tree_search(built.state, 20)
     non_switch = {o.move_choice for o in result.side_two if not o.move_choice.startswith("switch ")}
     assert non_switch <= {"moonblast", "moonblast-tera"}
+
+# --- opponent formes ----------------------------------------------------------
+
+
+def _forme_battle(nickname, details, new_details):
+    battle = make_battle(request_for())
+    event(battle, "start")
+    opp_switch(battle, nickname, details)
+    event(battle, "detailschange", f"p2a: {nickname}", new_details)
+    return battle
+
+
+def _find_slot(slots, species):
+    return next(s for s in slots if s.species_id == species)
+
+
+def test_opponent_palafin_hero_uses_hero_id_and_stats(data, sampler):
+    battle = _forme_battle("Palafin", "Palafin, L77", "Palafin-Hero, L77")
+    # poke-env keeps `species` through detailschange but updates base_stats.
+    built, slots = _build(battle, data, sampler)
+    mon = built.state.side_two.pokemon[0]
+    assert mon.id.lower() == "palafinhero"
+    base = es.dex_entry("palafinhero")["baseStats"]
+    assert base["atk"] == 160
+    # Hero attack is far above Zero-form attack at the same level.
+    zero = es.dex_entry("palafin")["baseStats"]
+    assert mon.attack > es.calc_stat(zero["atk"], 77, 252) + 40
+    assert mon.attack == es.compute_stats(base, 77, *es.randbats_evs_ivs("palafin", 77, [to_id(m.id) for m in mon.moves], mon.ability, mon.item))["atk"]
+
+
+def test_opponent_palafin_hero_via_switch_in_details(data, sampler):
+    battle = make_battle(request_for())
+    event(battle, "start")
+    opp_switch(battle, "Palafin", "Palafin-Hero, L77")
+    assert battle.opponent_active_pokemon.species == "palafinhero"
+    built, _ = _build(battle, data, sampler)
+    mon = built.state.side_two.pokemon[0]
+    assert mon.id.lower() == "palafinhero"
+    assert mon.attack > 250
+
+
+def test_opponent_unchanged_forme_keeps_sampled_species(data, sampler):
+    battle = _forme_battle("Palafin", "Palafin, L77", "Palafin, L77")
+    built, _ = _build(battle, data, sampler)
+    assert built.state.side_two.pokemon[0].id.lower() == "palafin"
+
+
+def test_opponent_terastallized_ogerpon_gets_tera_forme_and_embody_aspect(data, sampler):
+    battle = make_battle(request_for())
+    event(battle, "start")
+    opp_switch(battle, "Ogerpon", "Ogerpon, L77")
+    event(battle, "-terastallize", "p2a: Ogerpon", "Grass")
+    event(battle, "detailschange", "p2a: Ogerpon", "Ogerpon-Teal-Tera, L77")
+    built, _ = _build(battle, data, sampler)
+    mon = built.state.side_two.pokemon[0]
+    assert mon.id.lower() == "ogerpontealtera"
+    assert mon.ability.lower() == "embodyaspectteal"
+    assert mon.terastallized
+
+
+def test_opponent_forme_only_applies_to_matching_species():
+    class Mon:
+        species = "palafinhero"
+
+    slot = es.OpponentSlot("gardevoir", None, Mon())
+    assert es.opponent_forme_id(slot) == "gardevoir"
+    slot = es.OpponentSlot("palafin", None, Mon(), disguised=True)
+    assert es.opponent_forme_id(slot) == "palafin"

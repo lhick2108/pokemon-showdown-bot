@@ -58,7 +58,10 @@ track the value). Every one of these is silently approximated or dropped:
 * Pledge/G-Max side conditions: engine has none.
 * Formes: Pokemon are given the id of their current poke-env forme (ours) or of
   the sampled randbats species (opponent). Mid-battle forme changes of the
-  opponent (e.g. Mimikyu-Busted) are not reflected.
+  opponent that change base stats or the engine's forme logic (Palafin-Hero,
+  Ogerpon-*-Tera, Mimikyu-Busted, ...; see ``_OPPONENT_FORMES``) are reflected:
+  the engine id and base stats are those of the poke-env current forme, the
+  set (level, EVs, IVs, moves, item) stays the sampled one.
 * Mega/Z/Dynamax: not part of Gen 9 randbats.
 * Illusion: the opponent model's own handling decides which set a disguised
   Pokemon gets; this module does not second-guess it.
@@ -423,6 +426,68 @@ class TeamSampler:
     def sample_set(self, species_id: str, rng: random.Random) -> SampledSet:
         """A whole set for an unrevealed species (no evidence to condition on)."""
         return SetTracker(self.data, species_id).sample(rng)
+
+
+# Persistent in-battle formes: current poke-env forme id -> the sampled randbats
+# species ids it can grow out of. A revealed opponent in one of these formes is
+# given the forme's engine id and base stats instead of the sampled species'.
+_OPPONENT_FORMES: dict[str, frozenset[str]] = {
+    "palafinhero": frozenset({"palafin"}),
+    "mimikyubusted": frozenset({"mimikyu"}),
+    "miniormeteor": frozenset({"minior"}),
+    "aegislashblade": frozenset({"aegislash"}),
+    "meloettapirouette": frozenset({"meloetta"}),
+    "cramorantgulping": frozenset({"cramorant"}),
+    "cramorantgorging": frozenset({"cramorant"}),
+    "eiscuenoice": frozenset({"eiscue"}),
+    "morpekohangry": frozenset({"morpeko"}),
+    "terapagosterastal": frozenset({"terapagos"}),
+    "terapagosstellar": frozenset({"terapagos", "terapagosterastal"}),
+    "wishiwashischool": frozenset({"wishiwashi"}),
+    "ogerpontealtera": frozenset({"ogerpon"}),
+    "ogerponwellspringtera": frozenset({"ogerponwellspring"}),
+    "ogerponhearthflametera": frozenset({"ogerponhearthflame"}),
+    "ogerponcornerstonetera": frozenset({"ogerponcornerstone"}),
+}
+
+# The ability a masked Ogerpon holds once it has Terastallized into its -Tera forme.
+_OGERPON_TERA_ABILITIES = {
+    "ogerpontealtera": "embodyaspectteal",
+    "ogerponwellspringtera": "embodyaspectwellspring",
+    "ogerponhearthflametera": "embodyaspecthearthflame",
+    "ogerponcornerstonetera": "embodyaspectcornerstone",
+}
+
+
+def opponent_forme_id(slot: "OpponentSlot") -> str:
+    """Engine species id of a revealed opponent's *current* forme (else the sampled species).
+
+    poke-env keeps ``species`` at the switch-in forme through ``-formechange`` /
+    ``detailschange`` (only a re-switch with new details rewrites it) but does update
+    ``base_stats``, so the forme is recognised from either: the species id when it is a
+    known forme of the sampled species, a terastallized Ogerpon, or a base-stat vector
+    that matches exactly one such forme and not the sampled species.
+    """
+    mon = slot.mon
+    if mon is None or slot.disguised:
+        return slot.species_id
+    sampled = slot.species_id
+    current = to_id(getattr(mon, "species", "") or "")
+    if current != sampled and sampled in _OPPONENT_FORMES.get(current, ()):
+        if dex_entry(current) is not None:
+            return current
+    candidates = [f for f, bases in _OPPONENT_FORMES.items() if sampled in bases and dex_entry(f)]
+    if getattr(mon, "is_terastallized", False):
+        for forme in candidates:
+            if forme in _OGERPON_TERA_ABILITIES:
+                return forme
+    base = dex_entry(sampled)
+    stats = getattr(mon, "base_stats", None)
+    if base is not None and stats and dict(stats) != dict(base["baseStats"]):
+        for forme in candidates:
+            if dict(dex_entry(forme)["baseStats"]) == dict(stats):
+                return forme
+    return sampled
 
 
 @dataclass
@@ -944,10 +1009,11 @@ def _locked_move(mon: Any | None, item_id: str, move_ids: Sequence[str]) -> str 
 def _opponent_pokemon(slot: OpponentSlot, battle: Any) -> tuple[pe.Pokemon, list[pe.Move], Any | None]:
     sampled = slot.sampled
     mon = slot.mon
-    entry = dex_entry(slot.species_id)
+    forme_id = opponent_forme_id(slot)
+    entry = dex_entry(forme_id)
     level = int(sampled.level)
     move_ids = [to_id(m) for m in sampled.moves][:4]
-    ability = to_id(sampled.ability)
+    ability = _OGERPON_TERA_ABILITIES.get(forme_id) or to_id(sampled.ability)
     item = to_id(sampled.item)
     if mon is not None:
         if mon.item is None or mon.item == "":
@@ -992,7 +1058,7 @@ def _opponent_pokemon(slot: OpponentSlot, battle: Any) -> tuple[pe.Pokemon, list
                 pp = known.current_pp
         moves.append(_engine_move(move_id, pp, disabled=locked_to is not None and move_id != locked_to))
     pokemon = pe.Pokemon(
-        id=slot.species_id,
+        id=forme_id,
         level=level,
         types=types,
         base_types=types,
