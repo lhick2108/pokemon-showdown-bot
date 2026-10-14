@@ -59,7 +59,16 @@ ENDGAME_FIELDS = {"eg_alive": "endgame_max_alive", "eg_side": "endgame_max_side"
                   "eg_ms": "endgame_time_ms", "eg_worlds": "endgame_worlds",
                   "eg_cap": "endgame_cap_ms"}
 
+# Human-model exploitation (showdown_bot.human_exploit): opp_model=<human-policy .npz>, opp_elo
+# (bucket or rating the model is conditioned on), exploit_delta (worst-case win-prob loss bound),
+# exploit_weight (max step toward the best response), exploit_kappa (in-game class adaptation),
+# exploit_gain (min expected gain to deviate).
+EXPLOIT_KEYS = {"opp_model": str, "opp_elo": str, "exploit_delta": float, "exploit_weight": float,
+                "exploit_kappa": float, "exploit_gain": float}
+
 SPEC_KEYS = {
+    # a no-search bot that plays like a ladder human (showdown_bot.players.human)
+    "human": {"model": str, "pick": str, "elo": str, "temp": float},
     "search": {"evaluator": str, "scale": float, "time_ms": int, "worlds": int,
                "selection": str, "gamma": float, "mode": str,
                "tendency": str, "tkappa": float, "tdelta": float,
@@ -67,7 +76,7 @@ SPEC_KEYS = {
                 "escalate": int, "escalate_gap": float, "escalate_factor": float,
                 "escalate_steps": int, "escalate_cap_ms": int, "prune_noop": int, "noop_switches": int,
                 "tera_margin": float, "ev2": str, "scale2": float,
-                **ENDGAME_KEYS},
+                **ENDGAME_KEYS, **EXPLOIT_KEYS},
     "search-net": {"evaluator": str, "scale": float, "time_ms": int, "worlds": int,
                    "selection": str, "gamma": float, "mode": str,
                "tendency": str, "tkappa": float, "tdelta": float,
@@ -75,7 +84,7 @@ SPEC_KEYS = {
                 "escalate": int, "escalate_gap": float, "escalate_factor": float,
                 "escalate_steps": int, "escalate_cap_ms": int, "prune_noop": int, "noop_switches": int,
                 "tera_margin": float, "ev2": str, "scale2": float,
-                **ENDGAME_KEYS},
+                **ENDGAME_KEYS, **EXPLOIT_KEYS},
 }
 
 
@@ -172,6 +181,16 @@ def parse_spec(text: str) -> BotSpec:
                 raise ValueError(f"{key} must be >= 1 in bot spec {raw!r}")
             if key == "eg_side" and parsed < 0:
                 raise ValueError(f"eg_side must be >= 0 in bot spec {raw!r}")
+            if key == "pick" and parsed.lower() not in ("sample", "argmax"):
+                raise ValueError(f"pick must be sample or argmax in bot spec {raw!r}")
+            if key == "temp" and not (math.isfinite(parsed) and parsed > 0):
+                raise ValueError(f"temp must be > 0 in bot spec {raw!r}")
+            if key == "exploit_delta" and not (math.isfinite(parsed) and 0 <= parsed < 1):
+                raise ValueError(f"exploit_delta must be in [0, 1) in bot spec {raw!r}")
+            if key == "exploit_weight" and not (math.isfinite(parsed) and 0 <= parsed <= 1):
+                raise ValueError(f"exploit_weight must be in [0, 1] in bot spec {raw!r}")
+            if key in ("exploit_kappa", "exploit_gain") and not (math.isfinite(parsed) and parsed >= 0):
+                raise ValueError(f"{key} must be >= 0 in bot spec {raw!r}")
             if key == "tendency" and parsed.lower() not in ("on", "off"):
                 raise ValueError(f"tendency must be on or off in bot spec {raw!r}")
             if key == "belief" and parsed not in (0, 1):
@@ -182,7 +201,7 @@ def parse_spec(text: str) -> BotSpec:
                 raise ValueError(f"bfloor must be in [0, 1) in bot spec {raw!r}")
             if key in ("tkappa", "tdelta") and not (math.isfinite(parsed) and parsed >= 0):
                 raise ValueError(f"{key} must be >= 0 in bot spec {raw!r}")
-            params.append((key, parsed.lower() if key in ("selection", "mode", "tendency", "endgame") else parsed))
+            params.append((key, parsed.lower() if key in ("selection", "mode", "tendency", "endgame", "pick") else parsed))
     keys = dict(params)
     if "scale2" in keys and "ev2" not in keys:
         raise ValueError(f"scale2 needs ev2=<path.pev> in bot spec {raw!r}")
@@ -667,6 +686,9 @@ def _quality_kwargs(spec: BotSpec) -> dict:
         out["belief_floor"] = spec.param("bfloor")
     if spec.param("noop_switches") is not None:
         out["noop_vs_switches"] = bool(spec.param("noop_switches"))
+    for key in ("opp_model", "opp_elo", "exploit_delta", "exploit_weight", "exploit_kappa", "exploit_gain"):
+        if spec.param(key) is not None:
+            out[key] = spec.param(key)
     for key in ("escalate_gap", "escalate_factor", "escalate_steps", "escalate_cap_ms", "tera_margin"):
         if spec.param(key) is not None:
             out[key] = spec.param(key)
@@ -715,6 +737,14 @@ def _make_player(spec: BotSpec, cfg: LeagueConfig, recorder, concurrency: int, s
         save_replays=str(cfg.out / "replays"),
     )
     kwargs.update(extra or {})
+    if spec.type == "human":
+        if spec.param("model") is None:
+            raise ValueError(f"{spec.label}: human bot needs model=<human-policy .npz>")
+        kwargs["model"] = spec.param("model")
+        for key in ("pick", "elo", "temp"):
+            if spec.param(key) is not None:
+                kwargs[key] = spec.param(key)
+        kwargs["seed"] = cfg.seed * 1000 + salt
     if spec.type in SEARCH_BOTS:
         from showdown_bot.players.search import SearchConfig, get_pool
 
@@ -1149,7 +1179,7 @@ def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     p.add_argument("--bots", help="comma-separated label=type[:key=value...] or plain type. Types: "
                    + ", ".join(sorted(bench.PLAYER_REGISTRY)) + ", foulplay. search keys: "
-                   "evaluator, scale, time_ms, worlds, selection (ucb1|exp3|rm), gamma, mode (mixed|argmax|nash), tendency (on|off), tkappa, tdelta, endgame (off|safest|nash), eg_alive, eg_side, eg_ms, eg_worlds, eg_cap. e.g. net=search-net:evaluator=m.pev:scale=4:endgame=safest:eg_alive=5:eg_ms=1500")
+                   "evaluator, scale, time_ms, worlds, selection (ucb1|exp3|rm), gamma, mode (mixed|argmax|nash), tendency (on|off), tkappa, tdelta, endgame (off|safest|nash), eg_alive, eg_side, eg_ms, eg_worlds, eg_cap, opp_model, opp_elo, exploit_delta, exploit_weight, exploit_kappa, exploit_gain (docs/human-policy.md). human keys: model, pick (sample|argmax), temp, elo. e.g. net=search-net:evaluator=m.pev:scale=4:endgame=safest:eg_alive=5:eg_ms=1500")
     p.add_argument("--games-per-pair", type=bench._positive_int, default=20)
     p.add_argument("--out", type=Path, help="output dir, e.g. data/league/<run-id>")
     p.add_argument("--rate-only", type=Path, metavar="DIR", help="recompute results from DIR/games.jsonl")

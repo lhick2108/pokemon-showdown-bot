@@ -25,6 +25,7 @@ from poke_env.ps_client import (
     AccountConfiguration, LocalhostServerConfiguration, ServerConfiguration,
 )
 
+from showdown_bot.players.human import HumanPolicyPlayer
 from showdown_bot.players.search import SearchNetPlayer, SearchPlayer
 
 
@@ -38,6 +39,8 @@ PLAYER_REGISTRY: dict[str, type[Player]] = {
     # "search" in the same process would load it too; use scripts/duel.py for
     # search-net vs search (per-player config).
     "search-net": SearchNetPlayer,
+    # No-search bot that samples the human action-policy model (spec keys: model, pick, elo, temp).
+    "human": HumanPolicyPlayer,
 }
 
 # "foulplay" is a special opponent name: it is not a poke-env Player subclass.
