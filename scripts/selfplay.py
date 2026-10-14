@@ -13,7 +13,10 @@ time; both sides record, plus an exact "truth" state per decision. With
 and only our side records (no truth: Foul Play is not in this process).
 
 ``--pool a=x.pev:scale=1.5,stock`` draws side B's evaluator per game from a pool (the
-opponent's label lands in the header config as ``opponent`` for side A, ``label`` for B).
+opponent's label lands in the header config as ``opponent`` for side A, ``label`` for B, its
+full spec as ``spec``). Entries take any league search-spec key, so an AlphaStar-style
+exploiter that learns side A's habits within a game is
+``--pool exploit=models/x.pev:scale=1.5:mode=nash:tendency=on`` (see parse_pool).
 ``--full-frac P --fast-time-ms T`` is playout cap randomization: a decision gets the full
 search and is recorded with prob P, else a T ms search that is not recorded (search vs
 search only; the Foul Play path ignores it).
@@ -44,16 +47,28 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 @dataclasses.dataclass(frozen=True)
 class PoolEntry:
+    """One pool opponent: ``fields`` are SearchConfig overrides on top of side A's config."""
+
     label: str
     evaluator: str | None = None
     scale: float = 1.0
+    fields: dict = dataclasses.field(default_factory=dict)
+    spec: str = "stock"
 
 
 def parse_pool(text: str) -> list[PoolEntry]:
-    """Parse ``--pool``: comma-separated ``stock`` or ``label=evaluator_path[:scale=K]``.
+    """Parse ``--pool``: comma-separated ``stock`` or ``label=path.pev[:key=value...]``.
 
-    A Windows drive colon in the path is fine: only a trailing ``:scale=<float>`` is split off.
+    The keys are the league's search-spec keys (``league.SPEC_KEYS['search']``, parsed and
+    validated by ``league.parse_spec``): ``scale``, ``mode`` (mixed|argmax|nash), ``tendency``
+    (on|off, with ``tkappa``/``tdelta``; needs ``mode=nash``), ``time_ms``, ``worlds``,
+    ``escalate``, ``ev2``/``scale2`` (evaluator ensemble), ... The path may be ``stock`` (no
+    evaluator) to vary only the other options. A Windows drive colon in the path is fine.
+    Example exploiter:
+    ``exploit=models/gen2-res-searchabs-mlp16.pev:scale=1.5:mode=nash:tendency=on``
     """
+    from showdown_bot import league
+
     entries: list[PoolEntry] = []
     for raw in (part.strip() for part in text.split(",")):
         if not raw:
@@ -62,21 +77,22 @@ def parse_pool(text: str) -> list[PoolEntry]:
             entries.append(PoolEntry("stock"))
             continue
         if "=" not in raw:
-            raise ValueError(f"bad pool spec {raw!r}: want 'stock' or 'label=path[:scale=K]'")
+            raise ValueError(f"bad pool spec {raw!r}: want 'stock' or 'label=path[:key=value...]'")
         label, rest = raw.split("=", 1)
-        scale = 1.0
-        head, sep, tail = rest.rpartition(":scale=")
-        if sep:
-            try:
-                scale = float(tail)
-            except ValueError:
-                raise ValueError(f"bad scale in pool spec {raw!r}") from None
-            rest = head
-        if not label or not rest:
+        label = label.strip()
+        parts = league._split_spec_params(rest)
+        path = parts[0] if "=" not in parts[0] else ""
+        options = parts[1:] if path else parts
+        if not label or not path:
             raise ValueError(f"bad pool spec {raw!r}: empty label or path")
-        if not scale > 0 or scale == float("inf"):
-            raise ValueError(f"bad scale in pool spec {raw!r}")
-        entries.append(PoolEntry(label.strip(), rest, scale))
+        text_spec = f"{label}=search" + ("" if path == "stock" else f":evaluator={path}")
+        text_spec += "".join(":" + o for o in options)
+        spec = league.parse_spec(text_spec)  # validates keys and values
+        fields = league.search_config_fields(spec)
+        if fields.get("tendency") and fields.get("mode") != "nash":
+            raise ValueError(f"pool spec {raw!r}: tendency=on needs mode=nash")
+        entries.append(PoolEntry(label, fields.get("evaluator"), fields.get("evaluator_scale", 1.0),
+                                 fields, raw))
     if not entries:
         raise ValueError("empty pool")
     if len({e.label for e in entries}) != len(entries):
@@ -97,6 +113,16 @@ def sample_pool(entries: list[PoolEntry], weights: list[float], rng: random.Rand
     return rng.choices(entries, weights=weights, k=1)[0]
 
 
+def entry_config(base: SearchConfig, entry: PoolEntry) -> SearchConfig:
+    """Side B's config for a pool entry: side A's config with the entry's spec applied.
+
+    Without options an entry only swaps the evaluator/scale (as before); ``spec`` is the full
+    entry spec and lands in the game header next to ``label``.
+    """
+    fields = {"evaluator": entry.evaluator, "evaluator_scale": entry.scale, **entry.fields}
+    return dataclasses.replace(base, **fields, label=entry.label, opponent="main", spec=entry.spec)
+
+
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     p.add_argument("--games", type=bench._positive_int, default=20, help="total games")
@@ -115,7 +141,10 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--leaf-scale", type=float, default=1.0, help="leaf scale for --evaluator")
     p.add_argument("--pool", default=None,
                    help="opponent pool for side B (search vs search): comma-separated 'stock' or "
-                        "label=evaluator_path[:scale=K]; side A stays the --evaluator config")
+                        "label=evaluator_path[:key=value...] (keys of the league search spec: scale, mode, "
+                        "tendency, tkappa, tdelta, time_ms, worlds, escalate, ev2, scale2, ...); "
+                        "side A stays the --evaluator config. Exploiter example: "
+                        "exploit=models/x.pev:scale=1.5:mode=nash:tendency=on")
     p.add_argument("--pool-weights", default=None, help="comma-separated sampling weights (default uniform)")
     p.add_argument("--full-frac", type=float, default=1.0,
                    help="playout cap randomization: P(full recorded search) per decision (1.0 = off)")
@@ -179,8 +208,7 @@ async def _selfplay_pair(
     player_a = make(config, "a")
     # one side-B player per pool entry (a pool of one entry == plain self-play)
     side_b = [
-        make(dataclasses.replace(config, evaluator=e.evaluator, evaluator_scale=e.scale,
-                                 label=e.label, opponent="main"), e.label)
+        make(entry_config(config, e), e.label)
         for e in entries
     ]
     players = [player_a, *side_b]

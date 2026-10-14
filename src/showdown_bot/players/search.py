@@ -183,6 +183,12 @@ class SearchConfig:
     mixed_threshold: float = MIXED_THRESHOLD
     evaluator: str | None = None  # path of a .pev file; None: stock evaluation
     evaluator_scale: float = 1.0  # learned leaf scale k (score = sigmoid(k * dz))
+    # Evaluator ensemble: with evaluator2 set, world i is searched with evaluator i % 2 (even
+    # worlds -> evaluator, odd -> evaluator2); an odd world count gives the extra world to
+    # the primary evaluator. Needs evaluator and 2+ worlds.
+    evaluator2: str | None = None
+    evaluator2_scale: float = 1.0
+    ensemble: str = "worlds"
     selection: str = "ucb1"  # engine tree policy: ucb1 | exp3 | rm
     selection_gamma: float = 0.1  # exploration rate for exp3 / rm
     nash_pseudocount: float = nash_module.DEFAULT_PSEUDOCOUNT  # mode="nash": cell shrinkage c
@@ -210,6 +216,7 @@ class SearchConfig:
     # Self-play bookkeeping only (written to the record header; no effect on play).
     label: str = ""
     opponent: str = ""
+    spec: str = ""  # full pool/league spec text of this player (selfplay header)
 
     @classmethod
     def from_env(cls) -> SearchConfig:
@@ -250,6 +257,13 @@ class SearchConfig:
             eval_lowhp_knee=_env_float("SHOWDOWN_EVAL_LOWHP_KNEE", 0.0, 0.0, 1.0),
             eval_boost_scale=_env_float("SHOWDOWN_EVAL_BOOST_SCALE", 1.0, 0.0, 10.0),
         )
+
+    def world_evaluators(self, n_worlds: int) -> list[tuple[str | None, float]]:
+        """``(evaluator path, scale)`` of each of ``n_worlds`` worlds (job order)."""
+        if self.evaluator2 is None:
+            return [(self.evaluator, self.evaluator_scale)] * n_worlds
+        pair = [(self.evaluator, self.evaluator_scale), (self.evaluator2, self.evaluator2_scale)]
+        return [pair[i % 2] for i in range(n_worlds)]
 
     def plan(self, early: bool) -> tuple[int, int]:
         """Return ``(number_of_worlds, time_per_world_ms)`` for this decision."""
@@ -675,6 +689,18 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
                 self.config, evaluator=str(Path(self.config.evaluator).resolve())
             )
         cfg = self.config
+        if cfg.evaluator2 is not None:
+            if cfg.ensemble != "worlds":
+                raise ValueError(f"ensemble must be 'worlds', got {cfg.ensemble!r}")
+            if cfg.evaluator is None:
+                raise ValueError("evaluator2 needs a primary evaluator")
+            if not (math.isfinite(cfg.evaluator2_scale) and cfg.evaluator2_scale > 0):
+                raise ValueError(f"evaluator2_scale must be finite and > 0, got {cfg.evaluator2_scale}")
+            if cfg.worlds is not None and cfg.worlds < 2:
+                raise ValueError("the evaluator ensemble needs 2+ worlds")
+            if not Path(cfg.evaluator2).is_file():
+                raise FileNotFoundError(f"evaluator2 file not found: {cfg.evaluator2}")
+            self.config = cfg = dataclasses.replace(cfg, evaluator2=str(Path(cfg.evaluator2).resolve()))
         if not (math.isfinite(cfg.escalate_gap) and cfg.escalate_gap >= 0):
             raise ValueError(f"escalate_gap must be finite and >= 0, got {cfg.escalate_gap}")
         if not (math.isfinite(cfg.escalate_factor) and cfg.escalate_factor >= 1):
@@ -953,12 +979,13 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         futures = [
             loop.run_in_executor(
                 executor, search_fn, state, time_ms, self.config.threads,
-                self.config.evaluator, self.config.evaluator_scale,
+                ev_path, ev_scale,
                 self.config.selection, self.config.selection_gamma,
                 mode_for_record(self.config) == NASH, self.config.eval_lowhp_knee,
                 self.config.eval_boost_scale,
             )
-            for state in state_strings
+            for state, (ev_path, ev_scale) in zip(
+                state_strings, self.config.world_evaluators(len(state_strings)))
         ]
         waves = -(-len(futures) // max(1, self.config.parallelism))
         timeout = waves * (time_ms / 1000.0 + 1.0) + 10.0

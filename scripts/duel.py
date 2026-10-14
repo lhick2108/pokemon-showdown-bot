@@ -44,6 +44,12 @@ def _parser() -> argparse.ArgumentParser:
                         "either side), e.g. --net-mode nash --stock-mode mixed")
     p.add_argument("--leaf-scale", type=float, default=1.0,
                    help="learned leaf scale k: score = sigmoid(k * dz); net side only")
+    p.add_argument("--net-evaluator2", type=Path, default=None,
+                   help="second .pev for the net side: its sampled worlds alternate between "
+                        "--evaluator (even worlds) and this net (odd worlds), so with an odd "
+                        "world count --evaluator gets the extra world; needs --evaluator, 2+ worlds")
+    p.add_argument("--net-evaluator2-scale", type=float, default=1.0,
+                   help="leaf scale of --net-evaluator2 (default 1.0)")
     p.add_argument("--net-selection", choices=SELECTIONS, default="ucb1",
                    help="engine tree policy of the net side (default ucb1)")
     p.add_argument("--stock-selection", choices=SELECTIONS, default="ucb1",
@@ -165,10 +171,13 @@ async def _duel_pair(args, share: int, pool, plans=None, live=None):
     )
     evaluator_fields = ({"evaluator": str(args.evaluator.resolve()),
                          "evaluator_scale": args.leaf_scale} if args.evaluator else {})
+    ensemble_fields = ({"evaluator2": str(args.net_evaluator2.resolve()),
+                        "evaluator2_scale": args.net_evaluator2_scale}
+                       if args.net_evaluator2 else {})
     net_cls = SearchNetPlayer if args.evaluator else SearchPlayer
     net = net_cls(
         account_configuration=AccountConfiguration("dn" + secrets.token_hex(5), None),
-        config=SearchConfig(**{**base.__dict__, **evaluator_fields,
+        config=SearchConfig(**{**base.__dict__, **evaluator_fields, **ensemble_fields,
                           "selection": args.net_selection,
                           "inference": args.net_inference == "on",
                           "damage_inference": args.net_damage_inference == "on",
@@ -307,7 +316,17 @@ def main(argv=None) -> int:
     if "nash" in (args.net_mode, args.stock_mode) and args.threads > 1:
         print("nash mode needs --threads 1", file=sys.stderr)
         return 2
-    for ev in (args.evaluator, args.opponent_evaluator):
+    if args.net_evaluator2 is not None:
+        if args.evaluator is None:
+            print("--net-evaluator2 needs --evaluator", file=sys.stderr)
+            return 2
+        if args.worlds is not None and args.worlds < 2:
+            print("--net-evaluator2 needs 2+ worlds", file=sys.stderr)
+            return 2
+        if not (math.isfinite(args.net_evaluator2_scale) and args.net_evaluator2_scale > 0):
+            print("--net-evaluator2-scale must be finite and > 0", file=sys.stderr)
+            return 2
+    for ev in (args.evaluator, args.opponent_evaluator, args.net_evaluator2):
         if ev is not None and not ev.is_file():
             print(f"no such evaluator: {ev}", file=sys.stderr)
             return 2
@@ -344,6 +363,9 @@ def main(argv=None) -> int:
               f"{'both sides' if args.stock_uses_evaluator else 'net side only'})")
     else:
         print("evaluator: none (stock search on both sides)")
+    if args.net_evaluator2:
+        print(f"ensemble: net side alternates worlds between evaluator (even) and "
+              f"{args.net_evaluator2} (odd, leaf scale {args.net_evaluator2_scale:g})")
     if args.opponent_evaluator:
         print(f"opponent evaluator: {args.opponent_evaluator} "
               f"(leaf scale {args.opponent_leaf_scale:g})")
