@@ -485,11 +485,29 @@ def _choice_string(action: Action | None, built: es.BuiltState, battle: Battle, 
     return None
 
 
+@dataclass
+class FirstPerson:
+    """Live-style opponent sampling for ``states_for_role`` (the hindsight-free mode).
+
+    ``model`` observes the log event by event, so at ``|turn|N`` its set trackers only know what
+    was revealed up to then; ``sampler``/``rng`` fill the rest exactly like ``SearchPlayer``.
+    """
+
+    model: OpponentModel
+    sampler: es.TeamSampler
+    rng: random.Random
+
+
 def states_for_role(
-    events: list[list[str]], role: str, own: list[HMon], opp: list[HMon],
+    events: list[list[str]], role: str, own: list[HMon], opp: list[HMon] | None,
     actions: dict[int, dict[str, Action | None]], stats: Counter,
+    fp: FirstPerson | None = None,
 ) -> list[TurnState]:
-    """Replay the log as ``role`` (own = hindsight team) and build the state at every turn."""
+    """Replay the log as ``role`` (own = hindsight team) and build the state at every turn.
+
+    By default the opponent side is the shared hindsight team ``opp``. With ``fp`` it is instead
+    sampled per turn from only what ``role`` had seen by that turn (``opp`` is then unused).
+    """
     other = "p2" if role == "p1" else "p1"
     battle = _new_battle(_tag("s"), role, own)
     tag = battle.battle_tag
@@ -511,11 +529,20 @@ def states_for_role(
     try:
         for event in events:
             sleep_module.observe_events(tag, [event])
+            if fp is not None:
+                fp.model.observe_events(tag, [event], battle)
             battle.parse_message(event)
             if event[1] != "turn":
                 continue
             turn = int(event[2])
-            built = _build(battle, other, opp)
+            if fp is None:
+                assert opp is not None
+                built = _build(battle, other, opp)
+            else:
+                _lock_active_moves(battle)
+                trackers = fp.model.update(battle)
+                slots = es.sample_opponent_team(battle, trackers, fp.sampler, fp.rng)
+                built = es.build_state(battle, slots)
             chosen = _choice_string(actions.get(turn, {}).get(role), built, battle, role)
             legal = legal_choices(built)
             out.append(TurnState(
@@ -524,6 +551,8 @@ def states_for_role(
             ))
     finally:
         sleep_module._TRACKERS.pop(tag, None)
+        if fp is not None:
+            fp.model.forget(tag)
     return out
 
 
@@ -579,7 +608,8 @@ def result_for(winner: str, role: str) -> str:
 class Converter:
     """Holds the per-process randbats data / samplers; ``convert`` turns one log into states."""
 
-    def __init__(self, data: RandbatsData | None = None):
+    def __init__(self, data: RandbatsData | None = None, *, first_person: bool = False,
+                 fp_damage: bool = False):
         if data is None:
             from showdown_bot.players.search import default_randbats_data
 
@@ -587,6 +617,10 @@ class Converter:
         self.data = data
         self.sampler = es.TeamSampler(data)
         self.model = OpponentModel(data, damage=False)
+        self.first_person = first_person
+        # first-person pass: its own model (trackers are per battle tag, so no clash); damage-roll
+        # inference needs the actor's real stats, which the hindsight own team approximates
+        self.fp_model = OpponentModel(data, damage=fp_damage) if first_person else None
 
     def convert(self, text: str, battle_id: str, seed: int = 0) -> GameOutput:
         log = sanitize_log(text)
@@ -603,12 +637,15 @@ class Converter:
             )
         actions = extract_actions(events)
         stats: Counter = Counter()
-        states = {
-            role: states_for_role(
-                events, role, teams[role], teams["p2" if role == "p1" else "p1"], actions, stats
+        states = {}
+        for role in ("p1", "p2"):
+            fp = None
+            if self.first_person:
+                assert self.fp_model is not None
+                fp = FirstPerson(self.fp_model, self.sampler, random.Random(rng.getrandbits(64)))
+            states[role] = states_for_role(
+                events, role, teams[role], teams["p2" if role == "p1" else "p1"], actions, stats, fp
             )
-            for role in ("p1", "p2")
-        }
         assert log.winner is not None
         return GameOutput(
             battle_id,
@@ -656,8 +693,17 @@ def write_game(
 _CONVERTER: list[Converter] = []
 
 
+_FP_OPTIONS: dict[str, bool] = {"first_person": False, "fp_damage": False}
+
+
+def set_worker_options(first_person: bool = False, fp_damage: bool = False) -> None:
+    """Worker-pool initializer: the conversion mode of every Converter this process builds."""
+    _FP_OPTIONS.update(first_person=first_person, fp_damage=fp_damage)
+    _init_worker()
+
+
 def _init_worker() -> None:
-    _CONVERTER.append(Converter())
+    _CONVERTER.append(Converter(**_FP_OPTIONS))
 
 
 def process_chunk(job: dict[str, Any]) -> dict[str, Any]:

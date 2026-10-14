@@ -121,3 +121,27 @@ and `error:<ExceptionType>` for anything unexpected.
   availability beyond "one Tera per side" are not in `legal`.
 - Substitute HP, Wish, Future Sight and other things listed in the `engine_state` docstring are
   approximated exactly as in live search.
+
+## First-person (hindsight-free) mode
+
+`--first-person` (`Converter(first_person=True)`) changes only the opponent side of each state.
+The default mode above gives both seats the same whole-game team picture, built from everything
+revealed by the end of the log, so a model trained on it sees moves, items, abilities and Tera types
+that were revealed *after* the decision. Live, the bot knows only what has been revealed so far and
+fills the rest by sampling.
+
+In first-person mode `states_for_role` replays the log as the actor with a dedicated
+`OpponentModel`, feeding it every event (`observe_events`) before poke-env parses it. At each
+`|turn|N` it calls `model.update(battle)` and `engine_state.sample_opponent_team(battle, trackers,
+TeamSampler, rng)`, exactly the calls of `SearchPlayer` (one world per state), then
+`engine_state.build_state`. The opponent's revealed Pokemon therefore carry only the moves / item /
+ability / Tera type seen so far (the rest sampled from the set tracker's remaining candidates),
+unrevealed bench slots come from the team sampler, and the two seats' rows of one turn have
+different, independently sampled pictures of the opponent. The actor's own side is still the
+whole-game hindsight team (the logs never show a player's unrevealed own sets, so this is the best
+available "exact" team). `--fp-damage` also turns on damage-roll inference (the live default), off
+by default for speed and because it needs the actor's real stats. Output layout, actions and
+legal sets are unchanged; write to a separate `--out` (e.g. `data/human/pc1-fp`) so the modes are
+not mixed. Test: `tests/test_human_replays.py::test_first_person_states_do_not_leak_later_events`
+re-runs the sampler on a log cut at `|turn|k` and requires the identical state at turn k.
+Throughput is about 2.4x slower than the hindsight mode.

@@ -119,3 +119,20 @@ different sampled opponent set.
 
 Cost: encode 0.65 ms + forward 0.41 ms per state, 4.3 ms for the four worlds of a decision; with
 the matrix solves the whole exploit step measured about 8 ms per decision in a smoke league run.
+
+## Held-out test opponent (`models/human-policy-heldout.npz`)
+
+The exploit bot's `opp_model=models/human-policy.npz` must not be evaluated against an opponent that
+plays from the same weights. `human:model=models/human-policy-heldout.npz` is an independent model:
+trained only on the PokeChamp *test* split (123 of its 143 policy shards; the other 20 shards,
+211k decisions, are its validation slice), seed 7, MLP 2211 -> 768 -> 384 -> 13, 2 epochs:
+
+```
+python scripts/train_human_policy.py --data data/human/pc1/policy --train-split test --val-shards 20 \
+    --out models/human-policy-heldout.npz --h1 768 --h2 384 --seed 7 --epochs 2
+```
+
+Validation (elo known): top-1 0.454, top-3 0.811, NLL 1.468 (uniform 0.118 / 2.219; the main model
+scores 0.504 / 1.337 on its own, larger test set). Top action agrees with the main model on 69.0% of
+decisions (13k validation rows; mean KL(main || held-out) 0.16). Four epochs overfit this smaller set
+(val NLL 1.50, same top-1).

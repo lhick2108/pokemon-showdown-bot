@@ -89,6 +89,11 @@ def main(argv=None) -> int:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--shard-games", type=int, default=250, help="games per output shard")
     parser.add_argument("--no-policy", action="store_true", help="skip the policy JSONL")
+    parser.add_argument("--first-person", action="store_true",
+                        help="hindsight-free states: the opponent side of each decision is sampled from "
+                             "only what had been revealed by that turn (live-bot style), not the whole-game team")
+    parser.add_argument("--fp-damage", action="store_true",
+                        help="with --first-person: also use damage-roll inference (slower, closer to live)")
     parser.add_argument("--resume", action="store_true", help="skip shards that already finished")
     args = parser.parse_args(argv)
 
@@ -123,7 +128,8 @@ def main(argv=None) -> int:
             flush=True,
         )
 
-    with ProcessPoolExecutor(max_workers=args.workers, initializer=hr._init_worker) as pool:
+    with ProcessPoolExecutor(max_workers=args.workers, initializer=hr.set_worker_options,
+                             initargs=(args.first_person, args.fp_damage)) as pool:
         while True:
             while not exhausted and len(pending) < args.workers * 2:
                 job = next(jobs, None)
