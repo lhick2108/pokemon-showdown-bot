@@ -370,6 +370,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--eval-shards", type=int, default=0, help="test shards to evaluate (0 = all)")
     p.add_argument("--elo-dropout", type=float, default=0.15)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--train-split", default="train",
+                   help="split to train on; with 'test' the last --val-shards (seeded shuffle) are held out "
+                        "for validation and the rest are trained on (independent held-out model)")
+    p.add_argument("--val-shards", type=int, default=0, help="validation shards held out of --train-split test")
     args = p.parse_args(argv)
     args.workers = min(args.workers, 8)
     if args.report:
@@ -382,8 +386,14 @@ def main(argv: list[str] | None = None) -> int:
     torch.manual_seed(args.seed)
     torch.backends.cuda.matmul.allow_tf32 = True
 
-    train = shard_files(args.data, "train")
+    train = shard_files(args.data, args.train_split)
     test = shard_files(args.data, "test")
+    if args.train_split == "test":
+        if args.val_shards <= 0:
+            p.error("--train-split test needs --val-shards > 0")
+        order = list(train)
+        random.Random(f"split:{args.seed}").shuffle(order)
+        test, train = sorted(order[: args.val_shards]), sorted(order[args.val_shards :])
     if args.max_train_shards:
         train = random.Random(args.seed).sample(train, min(args.max_train_shards, len(train)))
     if args.eval_shards:
