@@ -539,7 +539,9 @@ def sample_opponent_team(
     if illusion is not None and illusion_rng is not None and slots:
         _apply_illusion(slots, active, illusion, sampler, illusion_rng)
     team = [info for info in (sampler.info(s.species_id) for s in slots) if info]
-    while len(slots) < team_size:
+    for _ in range(4 * team_size):  # each pass adds a slot or stops; the cap is a safety net
+        if len(slots) >= team_size:
+            break
         species_id = sampler.sample_species(team, rng, team_size=team_size)
         if species_id is None:
             break

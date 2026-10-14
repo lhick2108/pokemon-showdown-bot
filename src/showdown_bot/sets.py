@@ -1003,7 +1003,11 @@ class SetTracker:
             add(move)
 
         remaining = [move for move in role.moves if to_id(move) not in seen]
-        while len(moves) < target_count and remaining:
+        # Each pass must add a move (a move with an empty id is never added and would spin
+        # forever on the event loop); the cap guarantees termination.
+        for _ in range(len(role.moves) + 1):
+            if len(moves) >= target_count or not remaining:
+                break
             weights: list[float] = []
             for move in remaining:
                 probability = move_weights.get(to_id(move), 0.0)
@@ -1013,7 +1017,9 @@ class SetTracker:
             if selected is None:
                 break
             add(selected)
-            remaining = [move for move in remaining if to_id(move) not in seen]
+            remaining = [
+                move for move in remaining if to_id(move) not in seen and move != selected
+            ]
         return tuple(moves)
 
 

@@ -196,7 +196,9 @@ def _t_quantile(p: float, df: int) -> float:
         return 1 - tail if t > 0 else tail
 
     lo, hi = 0.0, 1.0
-    while cdf(hi) < p:
+    for _ in range(60):  # p is a probability < 1, so a few doublings suffice; never spin
+        if cdf(hi) >= p:
+            break
         hi *= 2
     for _ in range(80):
         mid = (lo + hi) / 2
