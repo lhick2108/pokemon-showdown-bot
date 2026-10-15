@@ -283,7 +283,7 @@ impl Node {
         let battle_is_over = state.battle_is_over();
         if battle_is_over == 0.0 {
             let eval = leaf_eval.value(state);
-            leaf_eval.score(eval, root_eval)
+            leaf_eval.score_state(state, eval, root_eval)
         } else if battle_is_over == -1.0 {
             0.0
         } else {

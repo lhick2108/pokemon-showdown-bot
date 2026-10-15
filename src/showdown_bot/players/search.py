@@ -211,6 +211,12 @@ class SearchConfig:
     mixed_threshold: float = MIXED_THRESHOLD
     evaluator: str | None = None  # path of a .pev file; None: stock evaluation
     evaluator_scale: float = 1.0  # learned leaf scale k (score = sigmoid(k * dz))
+    # Material blend (engine, default off): backed-up leaf value = (1-m)*value + m*material, with
+    # material a sigmoid of the HP-fraction / alive-count difference. 0 = exactly the plain search.
+    material: float = 0.0
+    # KO tie-break (root, default off): prefer an option that KOs the opponent's active when its
+    # mean score is within this of the chosen option's (see decision_quality.ko_tiebreak).
+    ko_tiebreak: float = 0.0
     # Evaluator ensemble: with evaluator2 set, world i is searched with evaluator i % 2 (even
     # worlds -> evaluator, odd -> evaluator2); an odd world count gives the extra world to
     # the primary evaluator. Needs evaluator and 2+ worlds.
@@ -375,6 +381,7 @@ class SearchStats:
     escalations: int = 0  # 589.47: decisions whose search was extended
     noop_pruned: int = 0  # 589.47: decisions where >= 1 no-op option was dropped
     tera_folded: int = 0  # 589.47: decisions where >= 1 tera option was folded away
+    ko_tiebreaks: int = 0  # 589.55: decisions where a KO option replaced the chosen one
     endgame_decisions: int = 0  # decisions decided by endgame expectiminimax
     endgame_fallbacks: int = 0  # endgame decisions that fell back to MCTS (error / degenerate)
     decision_timeouts: int = 0  # decisions whose pool search hit the hard cap (pool recycled)
@@ -399,6 +406,7 @@ class SearchStats:
                 if self.escalations or self.noop_pruned or self.tera_folded
                 else ""
             )
+            + (f" ko_tiebreaks={self.ko_tiebreaks}" if self.ko_tiebreaks else "")
             + (f" decision_timeouts={self.decision_timeouts}" if self.decision_timeouts else "")
             + (
                 f" exploit={self.exploit_decisions} shifted={self.exploit_shifted} "
@@ -424,7 +432,7 @@ def total_stats() -> SearchStats:
         for name in (
             "decisions", "searched", "forced", "fallbacks", "worlds_run",
             "world_errors", "iterations", "search_ms", "unknown_ids", "illusion_worlds",
-            "escalations", "noop_pruned", "tera_folded", "endgame_decisions",
+            "escalations", "noop_pruned", "tera_folded", "ko_tiebreaks", "endgame_decisions",
             "endgame_fallbacks", "decision_timeouts", "exploit_decisions", "exploit_shifted",
             "exploit_changed", "exploit_ms",
         ):
@@ -887,6 +895,12 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             raise ValueError("selection exp3/rm needs threads == 1 (the shared-tree search is ucb1 only)")
         if self.config.prior is not None:
             self._validate_prior()
+        if not (math.isfinite(self.config.material) and 0 <= self.config.material < 1):
+            raise ValueError(f"material must be in [0, 1), got {self.config.material}")
+        if self.config.material > 0 and self.config.evaluator is None:
+            raise ValueError("material needs a learned evaluator (evaluator=<path.pev>)")
+        if not (math.isfinite(self.config.ko_tiebreak) and self.config.ko_tiebreak >= 0):
+            raise ValueError(f"ko_tiebreak must be >= 0, got {self.config.ko_tiebreak}")
         if not (math.isfinite(self.config.evaluator_scale) and self.config.evaluator_scale > 0):
             raise ValueError(f"evaluator_scale must be finite and > 0, got {self.config.evaluator_scale}")
         if self.config.evaluator is not None:
@@ -1097,6 +1111,10 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         self.stats.escalations += bool(escalated)
         self.stats.noop_pruned += bool(changes["noop_pruned"])
         self.stats.tera_folded += bool(changes["tera_folded"])
+        if cfg.ko_tiebreak > 0:
+            adjusted, ko_pick = self._ko_tiebreak(adjusted, results, state_strings, result_worlds)
+            changes["ko_tiebreak"] = [ko_pick] if ko_pick else []
+            self.stats.ko_tiebreaks += bool(ko_pick)
         policy = adjusted
         self.last_policy = policy
         self.last_changes = {**changes, "escalated": escalated, "search_time_ms": final_ms}
@@ -1663,6 +1681,17 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             updates["prior_human"] = str(Path(human).resolve())
         self.config = dataclasses.replace(cfg, **updates)
 
+    def _ko_tiebreak(self, policy, results, state_strings, result_worlds):
+        """Root KO tie-break (``SearchConfig.ko_tiebreak``); never raises."""
+        try:
+            from poke_engine import State
+
+            states = [State.from_string(state_strings[i]) for i in result_worlds]
+            return dq.ko_tiebreak(policy, results, states, self.config.ko_tiebreak)
+        except Exception:  # noqa: BLE001 - a tie-break must not cost the decision
+            logger.exception("ko_tiebreak failed")
+            return policy, None
+
     def _prior_kwargs(self) -> dict[str, Any]:
         cfg = self.config
         if cfg.prior is None:
@@ -1681,13 +1710,14 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         export = self.config.export_nodes if self._export_now and self._recorder is not None else 0
         search_fn = functools.partial(
             _worker.search_world,
+            material=self.config.material,
             opp_names=bool(self.config.tendency or self.config.opp_model),
             opp_visits=bool(self.config.belief_reweight),
             export_nodes=export,
             export_min_visits=self.config.export_min_visits,
             **self._prior_kwargs(),
         ) if (self.config.tendency or self.config.belief_reweight or self.config.opp_model
-              or export or self.config.prior is not None) else _worker.search_world
+              or export or self.config.prior is not None or self.config.material > 0) else _worker.search_world
         futures = [
             loop.run_in_executor(
                 executor, search_fn, state, time_ms, self.config.threads,

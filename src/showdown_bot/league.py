@@ -86,6 +86,7 @@ SPEC_KEYS = {
                 "escalate": int, "escalate_gap": float, "escalate_factor": float,
                 "escalate_steps": int, "escalate_cap_ms": int, "prune_noop": int, "noop_switches": int,
                 "tera_margin": float, "ev2": str, "scale2": float,
+                "material": float, "ko_tiebreak": float,
                 **ENDGAME_KEYS, **EXPLOIT_KEYS, **PRIOR_KEYS},
     # search + final move blended with the human model: p ~ search^(1-w) * human^w (players.humansearch)
     "humansearch": {"evaluator": str, "scale": float, "time_ms": int, "worlds": int,
@@ -95,6 +96,7 @@ SPEC_KEYS = {
                     "escalate": int, "escalate_gap": float, "escalate_factor": float,
                     "escalate_steps": int, "escalate_cap_ms": int, "prune_noop": int, "noop_switches": int,
                     "tera_margin": float, "ev2": str, "scale2": float,
+                "material": float, "ko_tiebreak": float,
                     **ENDGAME_KEYS, **EXPLOIT_KEYS, **PRIOR_KEYS, **HUMAN_BLEND_KEYS},
     "search-net": {"evaluator": str, "scale": float, "time_ms": int, "worlds": int,
                    "selection": str, "gamma": float, "mode": str,
@@ -103,6 +105,7 @@ SPEC_KEYS = {
                 "escalate": int, "escalate_gap": float, "escalate_factor": float,
                 "escalate_steps": int, "escalate_cap_ms": int, "prune_noop": int, "noop_switches": int,
                 "tera_margin": float, "ev2": str, "scale2": float,
+                "material": float, "ko_tiebreak": float,
                 **ENDGAME_KEYS, **EXPLOIT_KEYS, **PRIOR_KEYS},
 }
 
@@ -218,6 +221,10 @@ def parse_spec(text: str) -> BotSpec:
                 raise ValueError(f"c_puct must be > 0 in bot spec {raw!r}")
             if key == "prior_eps" and not (math.isfinite(parsed) and 0 <= parsed < 1):
                 raise ValueError(f"prior_eps must be in [0, 1) in bot spec {raw!r}")
+            if key == "material" and not (math.isfinite(parsed) and 0 <= parsed < 1):
+                raise ValueError(f"material must be in [0, 1) in bot spec {raw!r}")
+            if key == "ko_tiebreak" and not (math.isfinite(parsed) and parsed >= 0):
+                raise ValueError(f"ko_tiebreak must be >= 0 in bot spec {raw!r}")
             if key == "fpu" and not math.isfinite(parsed):
                 raise ValueError(f"fpu must be finite in bot spec {raw!r}")
             if key == "tendency" and parsed.lower() not in ("on", "off"):
@@ -724,7 +731,8 @@ def _quality_kwargs(spec: BotSpec) -> dict:
     for key in ("opp_model", "opp_elo", "exploit_delta", "exploit_weight", "exploit_kappa", "exploit_gain"):
         if spec.param(key) is not None:
             out[key] = spec.param(key)
-    for key in ("escalate_gap", "escalate_factor", "escalate_steps", "escalate_cap_ms", "tera_margin"):
+    for key in ("escalate_gap", "escalate_factor", "escalate_steps", "escalate_cap_ms", "tera_margin",
+                "material", "ko_tiebreak"):
         if spec.param(key) is not None:
             out[key] = spec.param(key)
     if spec.param("endgame") is not None:

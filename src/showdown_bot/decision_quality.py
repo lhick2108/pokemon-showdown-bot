@@ -209,3 +209,78 @@ def noop_choices(
         if not result:
             return set()
     return result or set()
+
+
+# -- KO tie-break -----------------------------------------------------------------
+
+
+def _opp_move_replies(state: Any) -> list[str]:
+    mon = state.side_two.pokemon[int(state.side_two.active_index)]
+    return [str(m.id).lower() for m in mon.moves if not m.disabled and int(m.pp) > 0]
+
+
+def ko_probability(state: Any, mine: str, theirs: str) -> float:
+    """Probability that side two's active is at 0 HP after ``mine`` vs ``theirs`` (one turn).
+
+    ``State.apply_instructions`` returns a new State (it does not mutate).
+    """
+    from poke_engine import generate_instructions
+
+    idx = int(state.side_two.active_index)
+    total = 0.0
+    for outcome in generate_instructions(state, mine, theirs):
+        child = state.apply_instructions(outcome)
+        if int(child.side_two.pokemon[idx].hp) <= 0:
+            total += float(outcome.percentage) / 100.0
+    return total
+
+
+def is_ko_option(state: Any, choice: str) -> bool:
+    """``choice`` KOs the opponent's active with >= 50% probability against a majority of its
+    non-switch replies (same test as scripts/missed_kos.py). Switches never count."""
+    if choice.startswith("switch"):
+        return False
+    replies = _opp_move_replies(state)
+    if not replies:
+        return False
+    try:
+        hits = sum(ko_probability(state, choice, t) >= 0.5 for t in replies)
+    except BaseException:  # noqa: BLE001 - pyo3 PanicException is a BaseException
+        return False
+    return hits * 2 > len(replies)
+
+
+def ko_tiebreak(
+    policy: dict[str, float],
+    results: list[tuple],
+    states: list[Any],
+    eps: float,
+) -> tuple[dict[str, float], str | None]:
+    """Prefer a KO option over the chosen (top-mass) option when its mean score is within ``eps``.
+
+    ``states`` are the parsed worlds aligned with ``results``. An option is a KO option when
+    it KOs in a majority of the worlds (see :func:`is_ko_option`). Returns the new policy
+    (all mass on the KO option) and that option, or ``(policy, None)`` when nothing changed.
+    Does nothing for ``eps <= 0`` or when the chosen option already KOs.
+    """
+    if eps <= 0 or not policy or not states:
+        return policy, None
+    means = option_means(results)
+    best = max(policy, key=lambda c: policy[c])
+    if best not in means:
+        return policy, None
+    floor = means[best] - eps
+    rivals = [c for c in policy if c != best and means.get(c, -1.0) >= floor]
+    if not rivals:
+        return policy, None
+
+    def votes(choice: str) -> bool:
+        return sum(is_ko_option(s, choice) for s in states) * 2 > len(states)
+
+    if votes(best):
+        return policy, None
+    kos = [c for c in rivals if votes(c)]
+    if not kos:
+        return policy, None
+    pick = max(kos, key=lambda c: means[c])
+    return {pick: 1.0}, pick

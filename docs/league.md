@@ -100,3 +100,16 @@ finish nothing). Every game is appended to the jsonl as it is read back; rerunni
 `--out` and candidate resumes and plays only the missing games. Output: score per opponent
 (win 1, tie 0.5) with a Wilson 95% CI, and the mean of the per-opponent scores with a bootstrap
 95% CI (resampling games within each opponent).
+
+## Material blend and KO tie-break (bead 589.55, both default off)
+
+Search-net spec keys for positions the evaluator rates as decided:
+
+- `material=<lambda>` (0 <= lambda < 1, e.g. 0.05; needs `evaluator=`): engine leaf score becomes
+  `(1-lambda)*value + lambda*m`, `m = sigmoid(1.5*(sum hp fraction diff + 0.25*alive diff))` of side one
+  vs two. Non-terminal leaves only; won/lost terminals stay exactly 1/0. Engine `Evaluator(material=)`, wheel >= 0.0.48+sdb.12.
+- `ko_tiebreak=<eps>` (e.g. 0.01): after the root policy is aggregated, if the top option does not KO the
+  opponent active and a KO option (>= 50% KO vs a majority of its non-switch replies, in a majority of worlds)
+  has mean score within eps, play the KO option. Counted as `ko_tiebreaks` in the search stats.
+
+e.g. `net=search-net:evaluator=m.pev:scale=4:material=0.05:ko_tiebreak=0.01`

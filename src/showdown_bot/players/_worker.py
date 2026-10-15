@@ -18,15 +18,16 @@ _EVALUATORS: dict[tuple[str, float], object] = {}
 EVALUATOR_LOADS = 0
 
 
-def get_evaluator(path: str, scale: float = 1.0):
-    """The ``poke_engine.Evaluator`` for ``(path, scale)``, loaded once per process."""
+def get_evaluator(path: str, scale: float = 1.0, material: float = 0.0):
+    """The ``poke_engine.Evaluator`` for ``(path, scale, material)``, loaded once per process."""
     global EVALUATOR_LOADS
-    key = (path, float(scale))
+    key = (path, float(scale)) if not material else (path, float(scale), float(material))
     evaluator = _EVALUATORS.get(key)
     if evaluator is None:
         from poke_engine import Evaluator
 
-        evaluator = Evaluator.load(path, leaf_scale=float(scale))
+        evaluator = (Evaluator.load(path, leaf_scale=float(scale), material=float(material))
+                     if material else Evaluator.load(path, leaf_scale=float(scale)))
         EVALUATOR_LOADS += 1
         _EVALUATORS[key] = evaluator
     return evaluator
@@ -129,6 +130,7 @@ def search_world(
     human_elo=None,
     export_nodes: int = 0,
     export_min_visits: int = 16,
+    material: float = 0.0,
 ) -> tuple:
     """Run MCTS on one serialised world.
 
@@ -170,7 +172,7 @@ def search_world(
         state = State.from_string(state_string)
         kwargs: dict = {}
         if evaluator_path is not None:
-            kwargs["evaluator"] = get_evaluator(evaluator_path, evaluator_scale)
+            kwargs["evaluator"] = get_evaluator(evaluator_path, evaluator_scale, material)
         if selection != "ucb1":
             kwargs["selection"] = selection
             kwargs["gamma"] = float(selection_gamma)

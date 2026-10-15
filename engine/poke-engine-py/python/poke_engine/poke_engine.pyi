@@ -450,7 +450,7 @@ class Evaluator:
 
     @staticmethod
     def load(
-        path: str, relative_to_root: bool = True, leaf_scale: float = 1.0
+        path: str, relative_to_root: bool = True, leaf_scale: float = 1.0, material: float = 0.0
     ) -> "Evaluator": ...
     @staticmethod
     def linear(
@@ -460,6 +460,7 @@ class Evaluator:
         leaf_scale: float = 1.0,
         stock_coef: float = 0.0,
         feature_version: int = 1,
+        material: float = 0.0,
     ) -> "Evaluator": ...
     @staticmethod
     def mlp(
@@ -471,6 +472,7 @@ class Evaluator:
         leaf_scale: float = 1.0,
         stock_coef: float = 0.0,
         feature_version: int = 1,
+        material: float = 0.0,
     ) -> "Evaluator": ...
     def save(self, path: str) -> None: ...
     @property
@@ -481,6 +483,8 @@ class Evaluator:
         ...
     @property
     def leaf_scale(self) -> float: ...
+    @property
+    def material(self) -> float: ...
     @property
     def kind(self) -> str: ...
     @property
