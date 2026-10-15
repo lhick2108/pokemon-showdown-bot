@@ -92,6 +92,9 @@ pub struct Evaluator {
     pub leaf_scale: f32,
     /// If `Some(c)` the logit is `c * evaluate(state) + net(features)`.
     pub stock_coef: Option<f32>,
+    /// Material blend lambda in [0, 1): leaf score = (1-l)*score + l*material(state). 0 = off.
+    /// Runtime-only (not serialized); applied to non-terminal leaves only.
+    pub material: f32,
 }
 
 /// Per-worker scratch buffers so evaluation does not allocate.
@@ -530,6 +533,7 @@ impl Evaluator {
             relative_to_root: true,
             leaf_scale: 1.0,
             stock_coef: None,
+            material: 0.0,
         })
     }
 
@@ -592,6 +596,7 @@ impl Evaluator {
             relative_to_root: true,
             leaf_scale: 1.0,
             stock_coef: None,
+            material: 0.0,
         })
     }
 
@@ -621,6 +626,15 @@ impl Evaluator {
 
     pub fn is_residual(&self) -> bool {
         self.stock_coef.is_some()
+    }
+
+    /// Set the material blend lambda; must be finite and in [0, 1).
+    pub fn with_material(mut self, lambda: f32) -> Result<Evaluator, String> {
+        if !lambda.is_finite() || !(0.0..1.0).contains(&lambda) {
+            return Err(format!("material must be finite and in [0, 1), got {lambda}"));
+        }
+        self.material = lambda;
+        Ok(self)
     }
 
     /// Set the leaf scale; must be finite and > 0.
@@ -940,6 +954,26 @@ impl Evaluator {
     }
 }
 
+/// Material term m in (0, 1) for side one: `sigmoid(K * (hp_frac_sum_1 - hp_frac_sum_2
+/// + ALIVE_W * (alive_1 - alive_2)))`. HP fractions are per Pokemon (hp / maxhp).
+pub fn material_value(state: &State) -> f32 {
+    const K: f32 = 1.5;
+    const ALIVE_W: f32 = 0.25;
+    fn side(s: &crate::state::Side) -> (f32, f32) {
+        let (mut frac, mut alive) = (0.0f32, 0.0f32);
+        for p in &s.pokemon {
+            if p.hp > 0 {
+                frac += (p.hp as f32 / p.maxhp.max(1) as f32).min(1.0);
+                alive += 1.0;
+            }
+        }
+        (frac, alive)
+    }
+    let (f1, a1) = side(&state.side_one);
+    let (f2, a2) = side(&state.side_two);
+    logistic(K * ((f1 - f2) + ALIVE_W * (a1 - a2)))
+}
+
 /// Leaf evaluation strategy used by the MCTS loops: stock `evaluate()` or a
 /// learned `Evaluator`. Each search worker owns one (it carries scratch buffers).
 pub struct LeafEval<'a> {
@@ -998,6 +1032,17 @@ impl<'a> LeafEval<'a> {
             None => 0.0125 * root_raw + rel,
             Some(ev) if ev.relative_to_root => root_raw + rel / ev.leaf_scale,
             Some(ev) => rel / ev.leaf_scale,
+        }
+    }
+
+    /// `score` for a non-terminal `state`, with the optional material blend of the learned
+    /// evaluator (`Evaluator::material`). With material 0 this is exactly `score`.
+    #[inline]
+    pub fn score_state(&self, state: &State, leaf: f32, root: f32) -> f32 {
+        let s = self.score(leaf, root);
+        match self.learned {
+            Some(ev) if ev.material > 0.0 => (1.0 - ev.material) * s + ev.material * material_value(state),
+            _ => s,
         }
     }
 
@@ -1242,6 +1287,32 @@ mod tests {
         bad[4] = 3; // unknown format
         assert!(Evaluator::from_bytes(&bad).is_err());
         assert!(ev.clone().with_stock_coef(f32::INFINITY).is_err());
+    }
+
+    #[test]
+    fn material_zero_is_bit_identical_and_positive_prefers_material() {
+        let w = vec![0.0f32; crate::features::feature_len(1).unwrap()];
+        let base = Evaluator::linear(w, 0.0).unwrap();
+        let blended = base.clone().with_material(0.2).unwrap();
+        // two states the (all-zero) net cannot tell apart: equal score 0.5
+        let rich = state_with_hp(100, 100);
+        let mut poor = state_with_hp(100, 100);
+        poor.side_one.pokemon.pkmn[1].hp = 0;
+        poor.side_one.get_active().hp = 20;
+        let (a, b) = (LeafEval::new(Some(&base)), LeafEval::new(Some(&blended)));
+        let zero = base.clone().with_material(0.0).unwrap();
+        let off = LeafEval::new(Some(&zero));
+        for st in [&rich, &poor] {
+            let raw = a.score(0.3, 0.1);
+            assert_eq!(off.score_state(st, 0.3, 0.1).to_bits(), raw.to_bits());
+            assert_eq!(a.score_state(st, 0.3, 0.1).to_bits(), raw.to_bits());
+        }
+        assert!(material_value(&rich) > material_value(&poor));
+        assert!(b.score_state(&rich, 0.0, 0.0) > b.score_state(&poor, 0.0, 0.0));
+        let m = b.score_state(&rich, 0.0, 0.0);
+        assert!((m - (0.8 * 0.5 + 0.2 * material_value(&rich))).abs() < 1e-6);
+        assert!(base.clone().with_material(1.0).is_err());
+        assert!(base.clone().with_material(-0.1).is_err());
     }
 
     #[test]

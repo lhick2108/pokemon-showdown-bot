@@ -986,19 +986,21 @@ fn with_residual(ev: Evaluator, stock_coef: f32) -> PyResult<Evaluator> {
 impl PyEvaluator {
     /// Load a weights file written by `write_linear` / `write_mlp` (or Rust `Evaluator::save`).
     #[staticmethod]
-    #[pyo3(signature = (path, relative_to_root=true, leaf_scale=1.0))]
-    fn load(path: &str, relative_to_root: bool, leaf_scale: f32) -> PyResult<PyEvaluator> {
+    #[pyo3(signature = (path, relative_to_root=true, leaf_scale=1.0, material=0.0))]
+    fn load(path: &str, relative_to_root: bool, leaf_scale: f32, material: f32) -> PyResult<PyEvaluator> {
         let ev = Evaluator::load(path)
             .map_err(value_err)?
             .with_relative_to_root(relative_to_root)
             .with_leaf_scale(leaf_scale)
+            .map_err(value_err)?
+            .with_material(material)
             .map_err(value_err)?;
         Ok(PyEvaluator { inner: Arc::new(ev) })
     }
 
     /// value = weights . state_features + bias
     #[staticmethod]
-    #[pyo3(signature = (weights, bias=0.0, relative_to_root=true, leaf_scale=1.0, stock_coef=0.0, feature_version=1))]
+    #[pyo3(signature = (weights, bias=0.0, relative_to_root=true, leaf_scale=1.0, stock_coef=0.0, feature_version=1, material=0.0))]
     fn linear(
         weights: Vec<f32>,
         bias: f32,
@@ -1006,17 +1008,20 @@ impl PyEvaluator {
         leaf_scale: f32,
         stock_coef: f32,
         feature_version: u32,
+        material: f32,
     ) -> PyResult<PyEvaluator> {
         let ev = with_residual(Evaluator::linear_v(feature_version, weights, bias).map_err(value_err)?, stock_coef)?
             .with_relative_to_root(relative_to_root)
             .with_leaf_scale(leaf_scale)
+            .map_err(value_err)?
+            .with_material(material)
             .map_err(value_err)?;
         Ok(PyEvaluator { inner: Arc::new(ev) })
     }
 
     /// value = w2 . relu(W1 x + b1) + b2; `w1` is flat row-major [hidden][FEATURE_LENGTH].
     #[staticmethod]
-    #[pyo3(signature = (w1, b1, w2, b2=0.0, relative_to_root=true, leaf_scale=1.0, stock_coef=0.0, feature_version=1))]
+    #[pyo3(signature = (w1, b1, w2, b2=0.0, relative_to_root=true, leaf_scale=1.0, stock_coef=0.0, feature_version=1, material=0.0))]
     fn mlp(
         w1: Vec<f32>,
         b1: Vec<f32>,
@@ -1026,11 +1031,14 @@ impl PyEvaluator {
         leaf_scale: f32,
         stock_coef: f32,
         feature_version: u32,
+        material: f32,
     ) -> PyResult<PyEvaluator> {
         let hidden = b1.len();
         let ev = with_residual(Evaluator::mlp_v(feature_version, hidden, w1, b1, w2, b2).map_err(value_err)?, stock_coef)?
             .with_relative_to_root(relative_to_root)
             .with_leaf_scale(leaf_scale)
+            .map_err(value_err)?
+            .with_material(material)
             .map_err(value_err)?;
         Ok(PyEvaluator { inner: Arc::new(ev) })
     }
@@ -1054,6 +1062,12 @@ impl PyEvaluator {
     #[getter]
     fn leaf_scale(&self) -> f32 {
         self.inner.leaf_scale
+    }
+
+    /// Material blend lambda (0 = off).
+    #[getter]
+    fn material(&self) -> f32 {
+        self.inner.material
     }
 
     /// Feature version the weights consume (1 or 2).
