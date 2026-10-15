@@ -320,6 +320,20 @@ def test_v2_export_round_trip(tmp_path, state_strings, residual):
     assert train.verify_export(model, out, state_strings, tol=1e-3) < 1e-3
 
 
+@pytest.mark.parametrize("residual", [False, True])
+def test_v3_export_round_trip(tmp_path, state_strings, residual):
+    n = pe.feature_length(3)
+    torch.manual_seed(5)
+    model = train.build_model("mlp", n, 16, (0.8, 0.1) if residual else None)
+    with torch.no_grad():
+        for p in model.parameters():
+            p.add_(torch.randn_like(p) * 0.2)
+    out = tmp_path / "v3.pev"
+    train.export_pev(model, out, feature_version=3)
+    assert pe.Evaluator.load(str(out)).feature_version == 3
+    assert train.verify_export(model, out, state_strings, tol=1e-3) < 1e-3
+
+
 def test_float16_data_keeps_the_stock_eval_separate(state_strings):
     states = [pe.State.from_string(s) for s in state_strings]
     x = np.array([pe.state_features(s, 1, 2) for s in states], dtype=np.float16)

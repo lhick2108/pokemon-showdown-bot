@@ -43,9 +43,10 @@ use crate::engine::items::Items;
 use crate::engine::state::{PokemonVolatileStatus as V, Terrain, Weather};
 use crate::features::{
     feature_len, features_versioned_into, FEATURE_LEN, FEATURE_LEN_V2, FEATURE_VERSION_1,
-    FEATURE_VERSION_2, PER_POKEMON, PER_SIDE, TEAM_SLOTS,
+    FEATURE_VERSION_2, FEATURE_VERSION_3, PER_POKEMON, PER_SIDE, TEAM_SLOTS,
 };
 use crate::features_v2::{self, Sink};
+use crate::features_v3;
 use crate::state::{PokemonStatus, PokemonType, Side, SideReference, State};
 use std::convert::TryInto;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -82,7 +83,7 @@ pub struct Evaluator {
     model: Model,
     /// Identifies the weights; keys the per-`Scratch` static-feature cache.
     id: u64,
-    /// Feature version the weights were trained with (1 or 2); the input length follows from it.
+    /// Feature version the weights were trained with (1, 2 or 3); the input length follows from it.
     feat_ver: u32,
     /// CPU supports AVX2 (runtime-detected; enables a wider build of the fast MLP path).
     avx2: bool,
@@ -512,7 +513,7 @@ impl Evaluator {
         Evaluator::linear_v(FEATURE_VERSION_1, w, b)
     }
 
-    /// value = w . features + b over the features of `feat_ver` (1 or 2).
+    /// value = w . features + b over the features of `feat_ver` (1, 2 or 3).
     pub fn linear_v(feat_ver: u32, w: Vec<f32>, b: f32) -> Result<Evaluator, String> {
         let n_in = feature_len(feat_ver).ok_or_else(|| format!("unknown feature version {feat_ver}"))?;
         if w.len() != n_in {
@@ -595,7 +596,7 @@ impl Evaluator {
         })
     }
 
-    /// Feature version of the weights (1 or 2).
+    /// Feature version of the weights (1, 2 or 3).
     pub fn feature_version(&self) -> u32 {
         self.feat_ver
     }
@@ -783,7 +784,10 @@ impl Evaluator {
         state: &State,
         scratch: &mut Scratch,
     ) -> f32 {
-        let acc = hidden_acc::<H, V2>(self.id, w1t, b1, state, SideReference::SideOne, scratch);
+        let mut acc = hidden_acc::<H, V2>(self.id, w1t, b1, state, SideReference::SideOne, scratch);
+        if self.feat_ver == FEATURE_VERSION_3 {
+            features_v3::matchup_blocks(&mut AccSink::<H> { acc: &mut acc, w1t }, state, SideReference::SideOne);
+        }
         let mut z = b2;
         for j in 0..H {
             z += acc[j].max(0.0) * w2[j];
@@ -865,7 +869,7 @@ impl Evaluator {
         }
         let feat_ver = u32_at(8);
         let expected_in = feature_len(feat_ver).ok_or_else(|| {
-            format!("weights were trained with unknown FEATURE_VERSION {feat_ver} (this engine knows 1 and 2)")
+            format!("weights were trained with unknown FEATURE_VERSION {feat_ver} (this engine knows 1, 2 and 3)")
         })?;
         let kind = u32_at(12);
         let n_in = u32_at(16) as usize;

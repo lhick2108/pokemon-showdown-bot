@@ -406,6 +406,9 @@ unsafe fn eval_avx2<const H: usize>(
 
 impl PolicyNet {
     pub fn new(feat_ver: u32, hidden: usize, w: PolicyWeights) -> Result<PolicyNet, String> {
+        if feat_ver == crate::features::FEATURE_VERSION_3 {
+            return Err("policy nets support feature versions 1 and 2 only".to_string());
+        }
         let n_in = feature_len(feat_ver).ok_or_else(|| format!("unknown feature version {feat_ver}"))?;
         if !matches!(hidden, 16 | 32 | 64 | 128) {
             return Err(format!("policy hidden size must be 16, 32, 64 or 128 (got {hidden})"));

@@ -407,7 +407,7 @@ def load_data(
 
     ``residual`` appends the raw stock ``evaluate(state)`` as the last column of ``x``
     (with ``x_dtype="float16"`` it is kept in a separate float32 array instead).
-    ``feature_version`` selects the engine feature layout (1 or 2); float16 halves the memory
+    ``feature_version`` selects the engine feature layout (1, 2 or 3); float16 halves the memory
     of the (N, n_in) matrix, which matters for the 2.1k-wide version 2.
 
     ``workers``: 0 = ``os.cpu_count() - 2`` (min 1), 1 = serial, >1 = that many processes
@@ -1036,9 +1036,10 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="auto", help="auto (cuda if available), cpu or cuda")
-    p.add_argument("--features", choices=("v1", "v2"), default="v1",
+    p.add_argument("--features", choices=("v1", "v2", "v3", "1", "2", "3"), default="v1",
                    help="engine feature layout: v1 (738 values) or v2 (v1 + item / ability / "
-                        "move-property features, see docs/features-v2.md)")
+                        "move-property features, see docs/features-v2.md) or v3 (v1 + pairwise "
+                        "speed / damage / revenge-kill matchup features, 926 values; '3' = 'v3')")
     p.add_argument("--x-dtype", choices=("float32", "float16"), default=None,
                    help="in-memory dtype of the feature matrix (default float32 for v1, "
                         "float16 for v2: halves RAM / GPU memory)")
@@ -1090,9 +1091,9 @@ def main(argv=None) -> int:
         else f" (n={args.td_n}, mu={mu}, q-kind={args.q_kind})" if args.value_target == "nstep"
         else "")
     print(f"value target: {target_desc}")
-    feature_version = 2 if args.features == "v2" else 1
-    x_dtype = args.x_dtype or ("float16" if feature_version == 2 else "float32")
-    if feature_version == 2 and (args.augment_bench or args.augment_sides):
+    feature_version = int(args.features.lstrip("v"))
+    x_dtype = args.x_dtype or ("float16" if feature_version >= 2 else "float32")
+    if feature_version != 1 and (args.augment_bench or args.augment_sides):
         print("--augment-* supports only --features v1", file=sys.stderr)
         return 2
     print(f"features: {args.features}, x dtype {x_dtype}")

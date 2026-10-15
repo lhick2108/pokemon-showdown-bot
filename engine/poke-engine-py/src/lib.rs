@@ -13,7 +13,7 @@ use poke_engine::engine::state::{MoveChoice, PokemonVolatileStatus, Terrain, Wea
 use poke_engine::instruction::{Instruction, StateInstructions};
 use poke_engine::features::{
     feature_len, feature_names_versioned, features_versioned, FEATURE_LEN, FEATURE_LEN_V2,
-    FEATURE_VERSION,
+    FEATURE_LEN_V3, FEATURE_VERSION,
 };
 use poke_engine::learned::{Evaluator, Scratch};
 use poke_engine::mcts::{perform_mcts_export, ExportConfig, MctsResult, MctsSideResult};
@@ -1266,7 +1266,7 @@ fn state_features(py_state: PyState, side: u8, version: Option<u32>) -> PyResult
 fn check_version(version: Option<u32>) -> PyResult<u32> {
     let v = version.unwrap_or(FEATURE_VERSION);
     if feature_len(v).is_none() {
-        return Err(value_err(format!("unknown feature version {v} (known: 1, 2)")));
+        return Err(value_err(format!("unknown feature version {v} (known: 1, 2, 3)")));
     }
     Ok(v)
 }
@@ -1595,7 +1595,8 @@ fn py_poke_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("FEATURE_VERSION", FEATURE_VERSION)?;
     m.add("FEATURE_LENGTH", FEATURE_LEN)?;
     m.add("FEATURE_LENGTH_V2", FEATURE_LEN_V2)?;
-    m.add("FEATURE_VERSIONS", vec![1u32, 2u32])?;
+    m.add("FEATURE_LENGTH_V3", FEATURE_LEN_V3)?;
+    m.add("FEATURE_VERSIONS", vec![1u32, 2u32, 3u32])?;
     m.add_function(wrap_pyfunction!(feature_length, m)?)?;
     m.add_class::<PyEvaluator>()?;
     m.add_class::<PyPolicyPrior>()?;

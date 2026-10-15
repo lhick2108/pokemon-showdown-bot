@@ -98,6 +98,11 @@ fn main() {
             dynamic_blocks(&mut n, black_box(s), SideReference::SideOne);
             n.0
         });
+        micro("v3 matchup", &mut |s| {
+            let mut n = Null(0.0);
+            poke_engine::features_v3::matchup_blocks(&mut n, black_box(s), SideReference::SideOne);
+            n.0
+        });
         micro("v2 keys x12", &mut |s| {
             let mut a = 0u64;
             for side in [&s.side_one, &s.side_two] {
