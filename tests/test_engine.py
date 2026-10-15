@@ -284,12 +284,15 @@ def _v2_state() -> State:
 
 
 def test_feature_versions_and_lengths():
-    assert poke_engine.FEATURE_VERSIONS == [1, 2]
+    assert poke_engine.FEATURE_VERSIONS == [1, 2, 3]
     assert poke_engine.feature_length() == FEATURE_LENGTH == DOCUMENTED_FEATURE_LENGTH
     assert poke_engine.feature_length(2) == poke_engine.FEATURE_LENGTH_V2 > FEATURE_LENGTH
     assert 1500 < poke_engine.FEATURE_LENGTH_V2 < 3000
     assert len(state_feature_names(2)) == poke_engine.FEATURE_LENGTH_V2
     assert state_feature_names(2)[:FEATURE_LENGTH] == state_feature_names(1)
+    assert poke_engine.feature_length(3) == poke_engine.FEATURE_LENGTH_V3 == FEATURE_LENGTH + 5 * 36 + 8
+    assert len(state_feature_names(3)) == poke_engine.FEATURE_LENGTH_V3
+    assert state_feature_names(3)[:FEATURE_LENGTH] == state_feature_names(1)
     with pytest.raises(ValueError):
         state_features(make_state(), 1, 7)
 
@@ -311,6 +314,35 @@ def test_v2_features_extend_v1_with_identity_features():
     assert at("own.active.moves_first") == 1.0
     flipped = state_features(state, 2, 2)
     assert flipped[names.index("opp.p0.item.lifeorb")] == 1.0
+
+
+def test_v3_matchup_features_extend_v1():
+    state = _v2_state()  # corviknight (fast, Bravebird vs grass) against ferrothorn
+    v1, v3 = state_features(state, 1), state_features(state, 1, 3)
+    assert v3[:FEATURE_LENGTH] == v1 and len(v3) == poke_engine.FEATURE_LENGTH_V3
+    names = state_feature_names(3)
+
+    def at(vec, n):
+        return vec[names.index(n)]
+
+    assert at(v3, "match.speed.own0.opp0") == 1.0
+    assert at(v3, "match.dmg_own.own0.opp0") > at(v3, "match.dmg_opp.own0.opp0") > 0.0
+    assert at(v3, "match.speed.own1.opp0") == 0.0  # empty slots
+    flipped = state_features(state, 2, 3)
+    assert at(flipped, "match.speed.own0.opp0") == -1.0
+    assert at(flipped, "match.dmg_opp.own0.opp0") == at(v3, "match.dmg_own.own0.opp0")
+
+
+def test_v3_evaluator_roundtrip(tmp_path):
+    n = poke_engine.FEATURE_LENGTH_V3
+    names = state_feature_names(3)
+    w1 = [0.0] * (2 * n)
+    w1[names.index("match.speed.own0.opp0")] = 2.0  # hidden 0
+    path = tmp_path / "v3.pev"
+    write_mlp(str(path), w1, [0.0, 0.0], [1.0, 0.0], 0.0, feature_version=3)
+    ev = Evaluator.load(str(path))
+    assert ev.feature_version == 3 and ev.hidden_size == 2
+    assert ev.evaluate(_v2_state()) == pytest.approx(2.0)
 
 
 def test_v2_evaluator_roundtrip(tmp_path):

@@ -508,7 +508,12 @@ pub(crate) fn stage_mult(b: i8) -> f32 {
 }
 
 pub(crate) fn effective_speed(p: &Pokemon, side: &Side) -> f32 {
-    let mut s = p.speed as f32 * stage_mult(side.speed_boost);
+    effective_speed_with(p, side.speed_boost, side)
+}
+
+/// `effective_speed` with an explicit speed stage (the engine keeps stages per side).
+pub(crate) fn effective_speed_with(p: &Pokemon, speed_boost: i8, side: &Side) -> f32 {
+    let mut s = p.speed as f32 * stage_mult(speed_boost);
     if p.status == PokemonStatus::PARALYZE && p.ability != Abilities::QUICKFEET {
         s *= 0.5;
     }
