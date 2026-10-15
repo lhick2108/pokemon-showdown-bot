@@ -117,7 +117,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from showdown_bot import augment, dataset, recorder
+from showdown_bot import augment, auxtargets as aux, dataset, recorder
 
 WEIGHTINGS = ("sqrt", "game", "none")
 STATE_CHOICES = ("both", "truth", "worlds", "prefer-truth")
@@ -173,6 +173,9 @@ class Data:
     residual: bool = False
     e_sep: np.ndarray | None = None
     feature_version: int = 1
+    # auxiliary targets (--aux on): (N, aux.N_AUX) targets and 0/1 masks, see auxtargets.py
+    aux_y: np.ndarray | None = None
+    aux_m: np.ndarray | None = None
 
     @property
     def e(self) -> np.ndarray:
@@ -217,6 +220,8 @@ class Data:
             self.residual,
             None if self.e_sep is None else self.e_sep[idx],
             self.feature_version,
+            None if self.aux_y is None else self.aux_y[idx],
+            None if self.aux_m is None else self.aux_m[idx],
         )
 
 
@@ -297,6 +302,8 @@ def _load_chunk(job: tuple) -> dict:
     feats, ys, qs, evals, dqs, didx, wm, nd = [], [], [], [], [], [], [], []
     tags, strings, gids = [], [], []
     seen = set()
+    ay, am = [], []
+    fin_cache: tuple[str, object] = ("", None)  # (game_id, parsed final state)
     for s in dataset.iter_samples(
         files[0], sides=(1,), max_per_game=max_per_game, seed=kw["seed"],
         nodes=kw["nodes"], node_min_visits=kw["node_min_visits"], nodes_per_world=kw["nodes_per_world"],
@@ -317,6 +324,17 @@ def _load_chunk(job: tuple) -> dict:
         dq = s.decision_q_abs if q_kind == "absolute" else s.decision_q
         dqs.append(np.nan if dq is None else dq)
         nd.append(s.kind == dataset.KIND_NODE)
+        if kw["aux"]:
+            import poke_engine
+            if fin_cache[0] != s.game_id:
+                fin_cache = (s.game_id, poke_engine.State.from_string(s.final_state)
+                             if s.final_state else None)
+            if fin_cache[1] is None:
+                y_a, m_a = np.zeros(aux.N_AUX, np.float32), np.zeros(aux.N_AUX, np.float32)
+            else:
+                y_a, m_a = aux.aux_targets(poke_engine.State.from_string(s.state), fin_cache[1], s.result)
+            ay.append(y_a)
+            am.append(m_a)
         wm.append(node_multiplier(s, kw["node_weight"], kw["node_visit_ref"], kw["node_depth_discount"]))
     x_path = None
     if feats:
@@ -329,6 +347,8 @@ def _load_chunk(job: tuple) -> dict:
         "evals": np.asarray(evals, dtype=np.float32), "dqs": np.asarray(dqs, dtype=np.float64),
         "didx": np.asarray(didx, dtype=np.int64), "wm": np.asarray(wm, dtype=np.float64),
         "nd": np.asarray(nd, dtype=bool),
+        "ay": np.asarray(ay, dtype=np.float32).reshape(-1, aux.N_AUX),
+        "am": np.asarray(am, dtype=np.float32).reshape(-1, aux.N_AUX),
         "tags": tags, "strings": strings, "gids": gids, "decisions": len(seen),
         "stats": {"games": stats.games, "skipped_games": stats.skipped_games,
                   "bad_states": stats.bad_states, "results": dict(stats.results)},
@@ -341,7 +361,7 @@ def _load_source(path: Path, k: int, workers: int, kw: dict, spill_dir: str, job
     files = list(recorder.iter_game_files(path))
     jobs = [(job0 + n, files[i:i + chunk], k, kw, spill_dir)
             for n, i in enumerate(range(0, len(files), chunk))]
-    out: dict = {n: [] for n in ("ys", "qs", "evals", "dqs", "didx", "wm", "nd", "tags", "strings", "gids")}
+    out: dict = {n: [] for n in ("ys", "qs", "evals", "dqs", "didx", "wm", "nd", "ay", "am", "tags", "strings", "gids")}
     out["x_parts"] = []  # (npy path, rows) in order
     out["decisions"] = 0
     out["jobs"] = len(jobs)
@@ -350,7 +370,7 @@ def _load_source(path: Path, k: int, workers: int, kw: dict, spill_dir: str, job
     def absorb(r: dict) -> None:
         if r["x_path"] is not None:
             out["x_parts"].append((r["x_path"], r["rows"]))
-        for n in ("ys", "qs", "evals", "dqs", "didx", "wm", "nd"):
+        for n in ("ys", "qs", "evals", "dqs", "didx", "wm", "nd", "ay", "am"):
             out[n].append(r[n])
         for n in ("tags", "strings", "gids"):
             out[n] += r[n]
@@ -398,6 +418,7 @@ def load_data(
     node_visit_ref: float = 64.0,
     node_depth_discount: float = 1.0,
     nodes_per_world: int = 0,
+    aux_targets: bool = False,
 ) -> Data:
     """Load the samples of the given run directories (``Source`` / path / spec) into memory.
 
@@ -422,7 +443,7 @@ def load_data(
         workers = max(1, (os.cpu_count() or 1) - 2)
     np_dtype = np.dtype(x_dtype)
     tags, strings, gids = [], [], []
-    cols: dict[str, list] = {n: [] for n in ("ys", "qs", "evals", "dqs", "didx", "wm", "nd")}
+    cols: dict[str, list] = {n: [] for n in ("ys", "qs", "evals", "dqs", "didx", "wm", "nd", "ay", "am")}
     if nodes not in dataset.NODE_MODES:
         raise ValueError(f"nodes must be one of {dataset.NODE_MODES}")
     if nodes != "off" and (value_target not in ("search", "blend") or q_kind != "absolute"):
@@ -436,7 +457,7 @@ def load_data(
               feature_version=feature_version, x_dtype=x_dtype, seed=seed, keep_every=STATE_KEEP_EVERY,
               nodes=nodes, node_min_visits=node_min_visits, node_weight=node_weight,
               node_visit_ref=node_visit_ref, node_depth_discount=node_depth_discount,
-              nodes_per_world=nodes_per_world)
+              nodes_per_world=nodes_per_world, aux=aux_targets)
     with tempfile.TemporaryDirectory(prefix="pev-load-") as spill:
         job0 = 0
         for source in sources:
@@ -462,6 +483,7 @@ def load_data(
         n_in = np.load(x_parts[0][0], mmap_mode="r").shape[1]
         y, q, evals, dqs, didx, wmult, is_node = (
             np.concatenate(cols[n]) for n in ("ys", "qs", "evals", "dqs", "didx", "wm", "nd"))
+        aux_y, aux_m = (np.concatenate(cols[n]) for n in ("ay", "am"))
         del cols
         extra = 1 if residual and np_dtype == np.float32 else 0
         x = np.empty((n_rows, n_in + extra), dtype=np_dtype)
@@ -509,6 +531,7 @@ def load_data(
         x, y, sample_weights(tags, weighting, mult), tags, strings, q,
         None if value_target == "outcome" else target,
         np.asarray(evals, dtype=np.float32), residual, e_sep, feature_version,
+        aux_y if aux_targets else None, aux_m if aux_targets else None,
     )
 
 
@@ -547,6 +570,35 @@ def build_model(
     if residual is not None:
         return ResidualNet(net, residual[0], residual[1], freeze_a)
     return net
+
+
+def add_aux_head(model: nn.Module, hidden: int) -> None:
+    """Attach the auxiliary head (12 survival logits + 1 remaining-difference output) that reads
+    the SAME hidden layer as the value head. Training only: ``export_pev`` never sees it."""
+    model.aux_head = nn.Linear(hidden, aux.N_AUX)
+
+
+def forward_with_aux(model: nn.Module, xe: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(value logit (B,), aux outputs (B, N_AUX))`` for an mlp (plain or ResidualNet) model."""
+    res = isinstance(model, ResidualNet)
+    net = model.net if res else model
+    h = net[:-1](xe[:, :-1] if res else xe)
+    z = net[-1](h)
+    if res:
+        z = z + STOCK_SCALE * model.a * xe[:, -1:]
+    return z.squeeze(-1), model.aux_head(h)
+
+
+def aux_loss(out: torch.Tensor, y: torch.Tensor, m: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """Survival BCE (masked, per-sample mean over its valid slots) + remaining-difference MSE
+    (tanh output vs the [-1, 1] target), weighted by the sample weights ``w``."""
+    ns = 2 * aux.N_SLOTS
+    bce = nn.functional.binary_cross_entropy_with_logits(out[:, :ns], y[:, :ns], reduction="none")
+    surv = (bce * m[:, :ns]).sum(1) / m[:, :ns].sum(1).clamp(min=1)
+    has = (m[:, :ns].sum(1) > 0).float()
+    surv = (surv * w * has).sum() / (w * has).sum().clamp(min=1e-9)
+    diff = ((torch.tanh(out[:, ns]) - y[:, ns]) ** 2 * m[:, ns] * w).sum() / (m[:, ns] * w).sum().clamp(min=1e-9)
+    return surv + diff
 
 
 STOCK_SCALE = 0.0125  # the stock search scale: P = sigmoid(0.0125 * evaluate)
@@ -710,6 +762,7 @@ def fit(
     augmenter: augment.Augmenter | None = None,
     extra_val: list[tuple[str, Data]] | None = None,
     early_stop_on: str = "val",
+    aux_weight: float = 0.0,
 ) -> FitResult:
     """AdamW on weighted BCE; early stopping on weighted val BCE (best weights restored).
 
@@ -718,6 +771,9 @@ def fit(
     one), otherwise they are just logged.
     """
     extra_val = extra_val or []
+    use_aux = aux_weight > 0 and hasattr(model, "aux_head")
+    if use_aux and (train.aux_y is None or augmenter is not None):
+        raise ValueError("aux needs aux targets loaded and no --augment-*")
     if early_stop_on == "val-data" and not extra_val:
         raise ValueError("early_stop_on='val-data' needs extra_val")
     torch.manual_seed(seed)
@@ -727,6 +783,8 @@ def fit(
     yv, wv = (torch.from_numpy(a).to(device) for a in (val.y_fit, val.w))
     et = None if train.e_sep is None else torch.from_numpy(train.e_sep).to(device)
     ev = None if val.e_sep is None else torch.from_numpy(val.e_sep).to(device)
+    if use_aux:
+        ayt, amt = (torch.from_numpy(a).to(device) for a in (train.aux_y, train.aux_m))
     extra_t = [
         (name, place_x(d.x, device), *(torch.from_numpy(a).to(device) for a in (d.y, d.w)),
          None if d.e_sep is None else torch.from_numpy(d.e_sep).to(device))
@@ -753,10 +811,14 @@ def fit(
             yb = yt[b]
             if augmenter is not None:
                 xb, yb = augmenter(xb, yb)
-            loss = nn.functional.binary_cross_entropy_with_logits(
-                model(xb).squeeze(-1), yb, reduction="none"
-            )
+            if use_aux:
+                zb, ab = forward_with_aux(model, xb)
+            else:
+                zb = model(xb).squeeze(-1)
+            loss = nn.functional.binary_cross_entropy_with_logits(zb, yb, reduction="none")
             loss = (loss * wt[b]).sum() / wt[b].sum()
+            if use_aux:
+                loss = loss + aux_weight * aux_loss(ab, ayt[b], amt[b], wt[b])
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
@@ -905,6 +967,66 @@ def stock_eval_logistic_bce(
     return bce, a, b
 
 
+def aux_head_outputs(model: nn.Module, x: np.ndarray, e: np.ndarray | None, device: torch.device,
+                     batch: int = 8192) -> np.ndarray:
+    model.eval().to(device)
+    outs = []
+    with torch.no_grad():
+        for i in range(0, len(x), batch):
+            xb = model_input(torch.from_numpy(x[i:i + batch]).to(device),
+                             None if e is None else torch.from_numpy(e[i:i + batch]).to(device))
+            outs.append(forward_with_aux(model, xb)[1].cpu())
+    return torch.cat(outs).numpy()
+
+
+def aux_report(model: nn.Module | None, val: Data, device: torch.device) -> dict[str, float]:
+    """Held-out accuracy of the auxiliary targets (and of simple baselines) on ``val``.
+
+    Survival is judged on the masked slots only (alive now, found in the final state). Every
+    masked slot is alive in the input state, so "currently alive => survives" is the constant
+    "survives" predictor (accuracy = the survive rate); ``hp>=0.5`` predicts survival only for
+    healthy slots. ``model`` None (a net trained without --aux) reports the baselines only.
+    """
+    ns = 2 * aux.N_SLOTS
+    y, m = val.aux_y, val.aux_m
+    sm = m[:, :ns] > 0
+    hp = np.concatenate([val.x[:, 53 * k].astype(np.float32)[:, None] for k in range(6)]
+                        + [val.x[:, 363 + 53 * k].astype(np.float32)[:, None] for k in range(6)], 1)
+    ys = y[:, :ns]
+    out: dict[str, float] = {"n_slots": int(sm.sum())}
+    out["survive_rate"] = float(ys[sm].mean())
+    out["base_acc_alive_survives"] = out["survive_rate"]
+    out["base_acc_hp_half"] = float(((hp[sm] >= 0.5) == (ys[sm] > 0.5)).mean())
+    p = min(max(out["survive_rate"], 1e-6), 1 - 1e-6)
+    out["base_bce_const"] = float(-(ys[sm] * math.log(p) + (1 - ys[sm]) * math.log(1 - p)).mean())
+    own = np.zeros_like(sm)
+    own[:, :6] = True
+    sels = (("own", own & sm), ("opp", ~own & sm))
+    for name, sel in sels:
+        out[f"survive_rate_{name}"] = float(ys[sel].mean())
+    dm = m[:, ns] > 0
+    out["base_mse_diff_const"] = float(((y[dm, ns] - y[dm, ns].mean()) ** 2).mean())
+    if model is not None and hasattr(model, "aux_head"):
+        o = aux_head_outputs(model, val.x, val.e_sep if val.residual else None, device)
+        lg = o[:, :ns]
+        out["acc"] = float(((lg[sm] > 0) == (ys[sm] > 0.5)).mean())
+        out["bce"] = float(nn.functional.binary_cross_entropy_with_logits(
+            torch.from_numpy(lg[sm]), torch.from_numpy(ys[sm])))
+        for name, sel in sels:
+            out[f"acc_{name}"] = float(((lg[sel] > 0) == (ys[sel] > 0.5)).mean())
+        out["mse_diff"] = float(((np.tanh(o[dm, ns]) - y[dm, ns]) ** 2).mean())
+    print("\n=== auxiliary targets on val (masked: slots alive now and found in the final state) ===")
+    print(f"survival slots {out['n_slots']}; survive rate {out['survive_rate']:.3f} "
+          f"(own {out['survive_rate_own']:.3f}, opp {out['survive_rate_opp']:.3f})")
+    print(f"baselines: 'alive now => survives' acc {out['base_acc_alive_survives']:.3f}; "
+          f"'hp>=0.5 => survives' acc {out['base_acc_hp_half']:.3f}; constant BCE {out['base_bce_const']:.4f}")
+    print(f"remaining-difference constant-mean MSE {out['base_mse_diff_const']:.4f}")
+    if "acc" in out:
+        print(f"aux head: survival acc {out['acc']:.3f} (own {out['acc_own']:.3f}, opp {out['acc_opp']:.3f}), "
+              f"BCE {out['bce']:.4f}; remaining-difference MSE {out['mse_diff']:.4f}")
+    return out
+
+
 def report(model: nn.Module, train: Data, val: Data, device: torch.device) -> dict[str, float]:
     model.to(device)
     t = {k: torch.from_numpy(getattr(train, k)).to(device) for k in ("y", "w")}
@@ -1028,6 +1150,13 @@ def _parser() -> argparse.ArgumentParser:
                    help="swap own/opp (side-two view) with p=1/2 in training batches, label 1-y")
     p.add_argument("--dropout", type=float, default=0.0,
                    help="MLP dropout after the hidden ReLU (training only; export unaffected)")
+    p.add_argument("--aux", choices=("off", "on"), default="off",
+                   help="on: auxiliary per-Pokemon survival + remaining-difference heads on the "
+                        "value net's hidden layer (training only; the .pev is unchanged), see auxtargets.py")
+    p.add_argument("--aux-weight", type=float, default=0.5,
+                   help="weight of the auxiliary loss added to the value BCE (default 0.5)")
+    p.add_argument("--aux-metrics", action="store_true",
+                   help="load the aux targets and print the baselines even with --aux off")
     p.add_argument("--val-fraction", type=float, default=0.1)
     p.add_argument("--epochs", type=int, default=60)
     p.add_argument("--patience", type=int, default=6)
@@ -1104,7 +1233,7 @@ def main(argv=None) -> int:
         max_per_game=args.max_per_game, seed=args.seed, workers=args.load_workers,
         nodes=args.nodes, node_min_visits=args.node_min_visits, node_weight=args.node_weight,
         node_visit_ref=args.node_visit_ref, node_depth_discount=args.node_depth_discount,
-        nodes_per_world=args.nodes_per_world,
+        nodes_per_world=args.nodes_per_world, aux_targets=args.aux == "on" or args.aux_metrics,
     )
     extra_val: list[tuple[str, Data]] = []
     for vsrc in args.val_data:
@@ -1144,6 +1273,13 @@ def main(argv=None) -> int:
         return 2
     model = build_model(args.model, n_feat, args.hidden, res_init, args.freeze_stock_coef,
                         args.dropout)
+    if args.aux == "on":
+        if args.model != "mlp" or args.augment_bench or args.augment_sides or args.aux_weight <= 0 \
+                or feature_version != 1 or args.nodes != "off":
+            print("--aux on needs --model mlp, --features v1, --nodes off, no --augment-*, "
+                  "--aux-weight > 0", file=sys.stderr)
+            return 2
+        add_aux_head(model, args.hidden)
     augmenter = None
     if args.augment_bench or args.augment_sides:
         augmenter = augment.Augmenter(args.augment_bench, args.augment_sides, args.residual,
@@ -1152,6 +1288,7 @@ def main(argv=None) -> int:
         model, train, val, device=device, epochs=args.epochs, patience=args.patience,
         batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay, seed=args.seed,
         augmenter=augmenter, extra_val=extra_val, early_stop_on=args.early_stop_on,
+        aux_weight=args.aux_weight if args.aux == "on" else 0.0,
     )
     print(f"best epoch {result.best_epoch} of {result.epochs_run}"
           f" (early stopping on {args.early_stop_on})")
@@ -1159,6 +1296,8 @@ def main(argv=None) -> int:
         print(f"learned a = {float(result.model.a.item()):.4f}  "
               f"(stock_coef = {result.model.stock_coef:.6f})")
     report(result.model, train, val, device)
+    if val.aux_y is not None:
+        aux_report(result.model if args.aux == "on" else None, val, device)
     for name, vd in extra_val:
         m = evaluate_extra(result.model, vd, device)
         print(f"val-data {name}: BCE vs outcome weighted {m['bce_w']:.4f}  unweighted "

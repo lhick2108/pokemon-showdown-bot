@@ -73,6 +73,10 @@ class Sample:
     node_visits: int = 0
     node_depth: int = 0
     node_static: float | None = None
+    # the recording's last stored state (truth if it has one, else the first world): the best
+    # available stand-in for the end of the game, used for auxiliary targets (auxtargets.py)
+    final_state: str | None = None
+    result: str | None = None  # the recording player's result ("win" / "loss" / "tie")
 
     def as_tuple(self) -> tuple[list[float], float, dict[str, float] | None]:
         return self.features, self.value, self.policy
@@ -189,6 +193,12 @@ def iter_samples(
         stats.games += 1
         stats.results[result] += 1
         tag = game["header"].get("battle_tag", "")
+        final_state = None
+        for d_ in reversed(game["decisions"]):
+            final_state = (d_.get("truth") or {}).get("state") or (
+                d_["worlds"][0]["state"] if d_.get("worlds") else None)
+            if final_state:
+                break
         keep: set[int] | None = None
         if max_per_game > 0:
             eligible = [
@@ -272,6 +282,8 @@ def iter_samples(
                         decision_idx=decision_idx,
                         decision_q_abs=dec_abs,
                         decision_q=q_mean,
+                        final_state=final_state,
+                        result=result,
                         search_value_abs=(
                             None if q_abs is None else (q_abs if side == 1 else 1.0 - q_abs)
                         ),
@@ -303,6 +315,8 @@ def iter_samples(
                                 game_id=str(path),
                                 decision_idx=decision_idx,
                                 search_value_abs=n_value if side == 1 else 1.0 - n_value,
+                                final_state=final_state,
+                                result=result,
                                 node_visits=int(n_visits),
                                 node_depth=int(n_depth),
                                 node_static=(None if n_static is None else
