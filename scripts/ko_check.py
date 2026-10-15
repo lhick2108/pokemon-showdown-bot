@@ -82,6 +82,35 @@ def _boosts(side, which: str) -> dict:
     }
 
 
+QP_STATS = {"ATK": "atk", "DEF": "def", "SPA": "spa", "SPD": "spd", "SPE": "spe"}
+
+
+NO_STATE = False  # --no-ability-state: feed calc nothing (the original 589.58 behaviour)
+
+
+def ability_state(side, mon) -> dict:
+    """In-battle ability state the engine exposes (volatile statuses / team) in @smogon/calc terms."""
+    vols = set(side.volatile_statuses)
+    out = {"vols": sorted(vols)}
+    if NO_STATE:
+        return out
+    ab = mon.ability
+    if ab in ("PROTOSYNTHESIS", "QUARKDRIVE"):
+        pre = "PROTOSYNTHESIS" if ab == "PROTOSYNTHESIS" else "QUARKDRIVE"
+        for k, v in QP_STATS.items():
+            if pre + k in vols:
+                out["boostedStat"] = v
+    elif ab == "FLASHFIRE":
+        out["abilityOn"] = "FLASHFIRE" in vols
+    elif ab == "SLOWSTART":
+        out["abilityOn"] = "SLOWSTART" in vols
+    elif ab == "ELECTROMORPHOSIS":
+        out["abilityOn"] = "CHARGE" in vols
+    elif ab == "SUPREMEOVERLORD":
+        out["alliesFainted"] = sum(1 for p in side.pokemon if p.hp <= 0)
+    return out
+
+
 def mon_dict(side, mon) -> dict:
     types = [t for t in mon.types if t != "TYPELESS"]
     return {
@@ -90,7 +119,7 @@ def mon_dict(side, mon) -> dict:
         "stats": {"hp": mon.maxhp, "atk": mon.attack, "def": mon.defense,
                   "spa": mon.special_attack, "spd": mon.special_defense, "spe": mon.speed},
         "types": types, "tera": mon.tera_type if mon.terastallized else None,
-        "weightkg": mon.weight_kg,
+        "weightkg": mon.weight_kg, **ability_state(side, mon),
     }
 
 
@@ -161,7 +190,11 @@ def iter_decision_states(files, rng: random.Random, per_game: int):
             yield st, {"game": Path(f).name, "turn": d.get("turn")}
 
 
-def collect(n_uniform: int, n_near: int, seed: int, per_game: int = 3, max_games: int = 700):
+def is_focus(sit) -> bool:
+    return any(sit[k]["ability"] in STATEFUL_LEGACY or "TERAPAGOS" in sit[k]["species"].upper() for k in ("atk", "def"))
+
+
+def collect(n_uniform: int, n_near: int, seed: int, per_game: int = 3, max_games: int = 700, focus: bool = False):
     rng = random.Random(seed)
     files = []
     for root in DATA_ROOTS:
@@ -172,6 +205,8 @@ def collect(n_uniform: int, n_near: int, seed: int, per_game: int = 3, max_games
     pool_u, pool_n = [], []
     for st, meta in iter_decision_states(files, rng, per_game):
         for sit in situations_from_state(st, meta):
+            if focus and not is_focus(sit):
+                continue
             em = engine_max(st, sit["a"], sit["move"])
             if not em or em[0] <= 0:
                 continue
@@ -251,6 +286,11 @@ def evaluate(sits, check_gi: bool):
             "tera": bool(s["atk"]["tera"] or s["def"]["tera"]), "status": s["atk"]["status"],
             "screens": any(s["field"]["defSide"][k] for k in ("reflect", "light_screen", "aurora_veil")),
             "hp": hp, "engine_max": s["engine_max"], "meta": s["meta"],
+            "atk_species_vols": s["atk"]["vols"], "def_vols": s["def"]["vols"],
+            "atk_state": {k: s["atk"][k] for k in ("boostedStat", "abilityOn", "alliesFainted") if k in s["atk"]},
+            "def_state": {k: s["def"][k] for k in ("boostedStat", "abilityOn", "alliesFainted") if k in s["def"]},
+            "def_hp_full": s["def"]["hp"] >= s["def"]["stats"]["hp"], "atk_tera_type": s["atk"]["tera"],
+            "def_tera_type": s["def"]["tera"],
             "multihit": bool(c.get("multihit")), "excluded": None,
         }
         if not c.get("rolls"):
@@ -258,20 +298,34 @@ def evaluate(sits, check_gi: bool):
         else:
             rolls = c["rolls"]
             r["calc_max"] = max(rolls)
+            if abs(s["engine_max"] / max(r["calc_max"], 1) - 1) > 0.05:  # keep what is needed to replay it
+                r["dbg"] = {"state": s["state"].to_string(), "a": s["a"], "atk": s["atk"], "def": s["def"],
+                            "field": s["field"], "rolls": rolls}
             r["exact_k"] = exact_kill_rolls(rolls, hp)
             r["engine_k"] = engine_kill_rolls(s["engine_max"], hp)
             r["engine_k_on_calc_max"] = engine_kill_rolls(max(rolls), hp)
             if r["multihit"]:
                 r["excluded"] = "multihit"
+            elif r["move"] in ASSUMPTION_MOVES:
+                r["excluded"] = "assumption-move"
             if check_gi and r["excluded"] is None and r["move"] and hp > 0:
                 pass
         recs.append(r)
     return recs
 
 
+# Moves whose calc result rests on an assumption the engine state cannot share (calc adds the charge-turn
+# boost, forces the crit, or assumes who moved first); excluded from the headline numbers.
+ASSUMPTION_MOVES = {"meteorbeam", "electroshot", "flowertrick", "wickedblow", "surgingstrikes", "frostbreath",
+                    "stormthrow", "payback", "revenge", "avalanche", "assurance"}
+
+
 # --------------------------------------------------------------------- report
-STATEFUL = {"PROTOSYNTHESIS", "QUARKDRIVE", "ELECTROMORPHOSIS", "SLOWSTART", "SUPREMEOVERLORD", "TOXICBOOST",
-            "FLASHFIRE", "TERASHELL", "ZEROTOHERO", "DEFEATIST", "STAKEOUT", "ANGERSHELL"}
+# Abilities whose damage effect depends on state the engine string does not expose; with --no-ability-state
+# the old behaviour (also exclude the ones the harness can now reconstruct) is restored.
+STATEFUL = {"STAKEOUT"}
+STATEFUL_LEGACY = {"PROTOSYNTHESIS", "QUARKDRIVE", "ELECTROMORPHOSIS", "SLOWSTART", "SUPREMEOVERLORD", "TOXICBOOST",
+                   "FLASHFIRE", "TERASHELL", "ZEROTOHERO", "DEFEATIST", "STAKEOUT", "ANGERSHELL"}
 
 
 def classify(k: int) -> str:
@@ -345,6 +399,34 @@ def analyze(path: str):
         print(f"\n-- worst by {field} (KO-relevant cases; abs err sum, n, mean abs, mean signed(+=engine over), class diffs)")
         for row in offenders([r for r in recs if r["stratum"] == "near"] or recs, field):
             print("  %-18s n=%-4d sum=%.2f mean=%.3f signed=%+.3f cd=%d" % (row[1], row[2], row[0], row[3], row[4], row[5]))
+
+
+def ability_table(path: str, show_worst: int = 0):
+    """Engine max vs calc max per (role, ability), nothing excluded (except no-roll / multihit moves)."""
+    recs = [json.loads(line) for line in open(path, encoding="utf-8")]
+    rows = collections.defaultdict(list)
+    for r in recs:
+        if not r.get("calc_max") or r["multihit"] or r["move"] in ASSUMPTION_MOVES:
+            continue
+        for role in ("atk", "def"):
+            ab = r[role + "_ability"]
+            key = ab if ab in STATEFUL_LEGACY else ("TERAPAGOS*" if "TERAPAGOS" in r[role + "_species"].upper() else None)
+            if key:
+                rows[(role, key)].append(r)
+    print("%-28s %5s %7s %7s %7s %7s" % ("role:ability", "n", "exact%", ">5%dev", "medianR", "maxR"))
+    for (role, key), rs in sorted(rows.items(), key=lambda kv: -len(kv[1])):
+        ratios = [r["engine_max"] / r["calc_max"] for r in rs]
+        ex = 100 * sum(1 for r in rs if r["engine_max"] == r["calc_max"]) / len(rs)
+        dev = 100 * sum(1 for x in ratios if abs(x - 1) > 0.05) / len(rs)
+        print("%-28s %5d %6.1f%% %6.1f%% %7.3f %7.3f" % (role + ":" + key, len(rs), ex, dev,
+                                                       statistics.median(ratios), max(ratios)))
+        if show_worst:
+            bad = sorted(rs, key=lambda r: -abs(math.log(max(r["engine_max"], 1) / r["calc_max"])))
+            for r in bad[:show_worst]:
+                if abs(r["engine_max"] / r["calc_max"] - 1) > 0.05:
+                    print("     ", r["move"], r["atk_species"], "->", r["def_species"], "eng", r["engine_max"], "calc",
+                          r["calc_max"], "hp", r["hp"], r["atk_state"], r["def_state"], r["atk_species_vols"], r["def_vols"],
+                          r["atk_item"], r["def_item"], r["weather"], r["terrain"], r["atk_tera_type"], r["def_tera_type"])
 
 
 # ------------------------------------------------------------------- validate
@@ -422,14 +504,23 @@ def main():
     r.add_argument("--n-near", type=int, default=3000)
     r.add_argument("--seed", type=int, default=1)
     r.add_argument("--out", required=True)
+    r.add_argument("--per-game", type=int, default=3)
+    r.add_argument("--max-games", type=int, default=700)
+    r.add_argument("--focus", action="store_true", help="only situations involving stateful abilities / Terapagos")
+    r.add_argument("--no-ability-state", action="store_true", help="do not pass ability state to calc (original behaviour)")
     r.add_argument("--engine-gi", type=int, default=300, help="cross-check this many cases with generate_instructions")
+    ab = sub.add_parser("abilities")
+    ab.add_argument("path")
+    ab.add_argument("--worst", type=int, default=0)
     an = sub.add_parser("analyze")
     an.add_argument("path")
     args = ap.parse_args()
     if args.cmd == "validate":
         validate()
     elif args.cmd == "run":
-        sits = collect(args.n, args.n_near, args.seed)
+        global NO_STATE
+        NO_STATE = args.no_ability_state
+        sits = collect(args.n, args.n_near, args.seed, per_game=args.per_game, max_games=args.max_games, focus=args.focus)
         recs = evaluate(sits, check_gi=False)
         if args.engine_gi:
             chk = [s for s, r in zip(sits, recs) if r["excluded"] is None and 0 < r["engine_k"] < 16][: args.engine_gi]
@@ -443,6 +534,8 @@ def main():
                 fh.write(json.dumps(r) + "\n")
         print(f"wrote {len(recs)} -> {args.out}")
         analyze(args.out)
+    elif args.cmd == "abilities":
+        ability_table(args.path, args.worst)
     else:
         analyze(args.path)
 

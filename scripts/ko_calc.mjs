@@ -41,7 +41,8 @@ function mkMon(m) {
   if (!sp) throw new Error("species " + m.species);
   const o = {
     level: m.level,
-    ability: name(gen.abilities, m.ability),
+    // calc re-applies Download boosts unconditionally and assumes Analytic moves last; neither is knowable from the state
+    ability: ["download", "analytic"].includes(toID(m.ability)) ? "Pressure" : name(gen.abilities, m.ability),
     item: name(gen.items, m.item),
     status: STATUS[m.status],
     boosts: m.boosts,
@@ -50,6 +51,9 @@ function mkMon(m) {
     overrides: { types: m.types.map(cap) },
   };
   if (m.tera) o.teraType = cap(m.tera);
+  if (m.boostedStat) o.boostedStat = m.boostedStat;
+  if (m.abilityOn) o.abilityOn = true;
+  if (m.alliesFainted) o.alliesFainted = m.alliesFainted;
   const p = new Pokemon(gen, sp.name, o);
   p.rawStats = { ...m.stats };
   p.stats = { ...m.stats };

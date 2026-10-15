@@ -4648,6 +4648,33 @@ mod tests {
         PokemonStatus, SideReference, State,
     };
 
+    #[cfg(feature = "terastallization")]
+    #[test]
+    fn test_acrobatics_without_item_is_110_bp_even_when_tera_floored() {
+        let bp_after_before_move = |tera: bool, item: Items| {
+            let mut state: State = State::default();
+            {
+                let a = state.side_one.get_active();
+                a.item = item;
+                a.terastallized = tera;
+                a.tera_type = PokemonType::FLYING;
+            }
+            let mut choice = MOVES.get(&Choices::ACROBATICS).unwrap().to_owned();
+            let mut instructions = StateInstructions::default();
+            before_move(
+                &mut state,
+                &mut choice,
+                &MOVES.get(&Choices::SPLASH).unwrap().to_owned(),
+                &SideReference::SideOne,
+                &mut instructions,
+            );
+            choice.base_power
+        };
+        assert_eq!(bp_after_before_move(false, Items::NONE), 110.0);
+        assert_eq!(bp_after_before_move(true, Items::NONE), 110.0); // not 60 * 2
+        assert_eq!(bp_after_before_move(true, Items::LEFTOVERS), 60.0); // floor still applies with an item
+    }
+
     #[test]
     fn test_drag_move_as_second_move_exits_early_if_opponent_used_drag_move() {
         let mut state: State = State::default();
