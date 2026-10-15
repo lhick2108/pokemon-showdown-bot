@@ -25,3 +25,6 @@ data/
 
 # Trained value nets (.pev)
 models/
+
+# Scratch tooling (npm installs etc.)
+scratch/
