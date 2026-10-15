@@ -440,6 +440,116 @@ def hindsight_team(
     return team
 
 
+
+# --- aux targets ----------------------------------------------------------------------
+
+
+@dataclass
+class GameFacts:
+    """Whole-game outcome facts read off the protocol log (for the ``aux`` targets).
+
+    Keys are ``"p1:<ident name>"`` (side + the log's ident name, e.g. ``"p2:kingambit"``).
+    """
+
+    final_turn: int
+    fainted: set[str]  # mons that fainted at some point (nothing revives in randbats)
+    faint_count: dict[str, int]  # side -> number fainted
+    ko_turns: dict[str, list[int]]  # killer key -> turn number of each KO it scored
+
+
+def game_facts(events: list[list[str]], final_turn: int) -> GameFacts:
+    """Faints and KO credit from the event list.
+
+    KO credit goes to the mon that dealt the fatal damage: the user of the latest ``|move|``
+    (when it is on the other side) for plain damage, or the ``[of]`` mon of a ``[from]`` damage
+    (Rocky Helmet, Rough Skin, ...). Fatal status / weather / hazard / recoil damage and self-KOs
+    credit nobody; Future Sight / Doom Desire are credited to the latest mover (can be wrong).
+    """
+    fainted: set[str] = set()
+    ko_turns: dict[str, list[int]] = {}
+    last_mover: str | None = None
+    cause: dict[str, str | None] = {}  # victim key -> killer key for its pending faint
+    turn = 0
+
+    def key(ref: str) -> str:
+        return f"{_side_of(ref)}:{_name_of(ref)}"
+
+    for event in events:
+        kind = event[1]
+        if kind == "turn":
+            turn = int(event[2])
+        elif kind == "move" and len(event) > 2 and ":" in event[2]:
+            last_mover = event[2]
+        elif kind == "-damage" and len(event) > 3 and event[3].endswith("fnt") and ":" in event[2]:
+            victim = event[2]
+            killer: str | None = None
+            from_tag = next((p for p in event[4:] if p.startswith("[from]")), None)
+            of_tag = next((p for p in event[4:] if p.startswith("[of]")), None)
+            if from_tag is None:
+                if last_mover is not None and _side_of(last_mover) != _side_of(victim):
+                    killer = last_mover
+            elif of_tag is not None:
+                ref = of_tag[4:].strip()
+                if ":" in ref and _side_of(ref) != _side_of(victim):
+                    killer = ref
+            cause[key(victim)] = key(killer) if killer else None
+        elif kind == "faint" and len(event) > 2 and ":" in event[2]:
+            victim_key = key(event[2])
+            if victim_key in fainted:
+                continue
+            fainted.add(victim_key)
+            killer_key = cause.pop(victim_key, None)
+            if killer_key:
+                ko_turns.setdefault(killer_key, []).append(turn)
+    counts = {"p1": 0, "p2": 0}
+    for k in fainted:
+        counts[k[:2]] += 1
+    return GameFacts(final_turn, fainted, counts, ko_turns)
+
+
+def _side_aux(
+    facts: GameFacts, role: str, idents: list[str | None], turn: int, none_alive: int = -1
+) -> dict[str, Any]:
+    """Per-slot aux arrays for one side, in the state's slot order (``idents`` aligned to it).
+
+    A slot with ident ``None`` is a filler for a Pokemon that is not identified: its
+    ``alive_end`` is ``none_alive`` (1 when the filler is known to be a never-seen member of the
+    team, which cannot have fainted; -1 = unknown) and it has zero KOs.
+    """
+    alive, kos, kos_after = [], [], []
+    for ident in idents:
+        if ident is None:
+            alive.append(none_alive)
+            kos.append(0)
+            kos_after.append(0)
+            continue
+        k = f"{role}:{ident}"
+        alive.append(0 if k in facts.fainted else 1)
+        turns = facts.ko_turns.get(k, [])
+        kos.append(len(turns))
+        kos_after.append(sum(1 for t in turns if t >= turn))
+    return {"ident": idents, "alive_end": alive, "kos": kos, "kos_after": kos_after}
+
+
+def build_aux(
+    facts: GameFacts, role: str, turn: int, own_idents: list[str | None],
+    opp_idents: list[str | None], opp_none_alive: int = -1,
+) -> dict[str, Any]:
+    """The ``aux`` record field of one decision (layout documented in docs/human-replays.md).
+
+    ``opp_none_alive``: ``alive_end`` of an unidentified opponent slot. Hindsight mode: such a
+    slot is a never-revealed member of the real team, so 1. First-person mode: the slot may be a
+    Pokemon revealed (and maybe fainted) later, so -1.
+    """
+    other = "p2" if role == "p1" else "p1"
+    return {
+        "turns_left": facts.final_turn - turn,
+        "final_alive": [6 - facts.faint_count[role], 6 - facts.faint_count[other]],
+        "own": _side_aux(facts, role, own_idents, turn),
+        "opp": _side_aux(facts, other, opp_idents, turn, opp_none_alive),
+    }
+
+
 # --- states ---------------------------------------------------------------------------
 
 
@@ -450,6 +560,7 @@ class TurnState:
     legal: list[str]
     chosen: str | None
     choice_ok: bool | None  # chosen action is among the engine-derived legal options
+    aux: dict[str, Any] | None = None  # aux targets (see build_aux)
 
 
 def legal_choices(built: es.BuiltState) -> list[str]:
@@ -501,7 +612,7 @@ class FirstPerson:
 def states_for_role(
     events: list[list[str]], role: str, own: list[HMon], opp: list[HMon] | None,
     actions: dict[int, dict[str, Action | None]], stats: Counter,
-    fp: FirstPerson | None = None,
+    fp: FirstPerson | None = None, facts: GameFacts | None = None,
 ) -> list[TurnState]:
     """Replay the log as ``role`` (own = hindsight team) and build the state at every turn.
 
@@ -537,17 +648,27 @@ def states_for_role(
             turn = int(event[2])
             if fp is None:
                 assert opp is not None
-                built = _build(battle, other, opp)
+                built, slots, slot_idents = _build(battle, other, opp)
             else:
                 _lock_active_moves(battle)
                 trackers = fp.model.update(battle)
                 slots = es.sample_opponent_team(battle, trackers, fp.sampler, fp.rng)
                 built = es.build_state(battle, slots)
+                names = {id(m): str(k)[4:] for k, m in battle.opponent_team.items()}
+                slot_idents = [names.get(id(sl.mon)) if sl.mon is not None else None
+                               for sl in slots]
             chosen = _choice_string(actions.get(turn, {}).get(role), built, battle, role)
             legal = legal_choices(built)
+            aux = None
+            if facts is not None:
+                own_names = {id(m): str(k)[4:] for k, m in battle.team.items()}
+                aux = build_aux(
+                    facts, role, turn, [own_names.get(id(m)) for m in built.our_mons],
+                    slot_idents[: es.TEAM_SIZE], 1 if fp is None else -1,
+                )
             out.append(TurnState(
                 turn, built.to_string(), legal, chosen,
-                None if chosen is None else chosen in legal,
+                None if chosen is None else chosen in legal, aux,
             ))
     finally:
         sleep_module._TRACKERS.pop(tag, None)
@@ -576,15 +697,20 @@ def _lock_active_moves(battle: Battle) -> None:
     }
 
 
-def _build(battle: Battle, other: str, opp: list[HMon]) -> es.BuiltState:
+def _build(
+    battle: Battle, other: str, opp: list[HMon]
+) -> tuple[es.BuiltState, list[es.OpponentSlot], list[str | None]]:
     _lock_active_moves(battle)
     active = battle.opponent_active_pokemon
-    slots = []
+    pairs = []
     for hmon in opp:
         mon = battle.opponent_team.get(f"{other}: {hmon.ident}") if hmon.ident else None
-        slots.append(es.OpponentSlot(hmon.species_id, hmon.sampled, mon))
-    slots.sort(key=lambda s: 0 if (s.mon is not None and s.mon is active) else 1)
-    return es.build_state(battle, slots)
+        pairs.append((es.OpponentSlot(hmon.species_id, hmon.sampled, mon), hmon.ident))
+    pairs.sort(key=lambda p: 0 if (p[0].mon is not None and p[0].mon is active) else 1)
+    slots = [p[0] for p in pairs]
+    # hindsight team: every slot is a real member of the opponent's team, so its ident is
+    # known even before it has been seen
+    return es.build_state(battle, slots), slots, [p[1] for p in pairs]
 
 
 # --- one game ------------------------------------------------------------------------
@@ -637,6 +763,7 @@ class Converter:
             )
         actions = extract_actions(events)
         stats: Counter = Counter()
+        facts = game_facts(events, log.turns)
         states = {}
         for role in ("p1", "p2"):
             fp = None
@@ -644,7 +771,7 @@ class Converter:
                 assert self.fp_model is not None
                 fp = FirstPerson(self.fp_model, self.sampler, random.Random(rng.getrandbits(64)))
             states[role] = states_for_role(
-                events, role, teams[role], teams["p2" if role == "p1" else "p1"], actions, stats, fp
+                events, role, teams[role], teams["p2" if role == "p1" else "p1"], actions, stats, fp, facts
             )
         assert log.winner is not None
         return GameOutput(
@@ -676,6 +803,7 @@ def write_game(
                 "turn": ts.turn, "side": "one", "worlds": [], "policy": None,
                 "chosen": ts.chosen, "order": None, "compute": {},
                 "truth": {"state": ts.state}, "truth_status": "ok", "legal": ts.legal,
+                **({"aux": ts.aux} if ts.aux is not None else {}),
             })
             if ts.chosen is not None:
                 policy_rows.append({
