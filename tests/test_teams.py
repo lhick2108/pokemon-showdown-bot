@@ -11,7 +11,7 @@ from showdown_bot.league import Game, paired_head_to_head
 def test_fixed_format_maps_to_randbats_data(monkeypatch):
     seen = []
 
-    def fake_read(path, url, refresh):
+    def fake_read(path, url, refresh, max_age=None):
         seen.append(url)
         if "full" in url:
             raise OSError("no full file")

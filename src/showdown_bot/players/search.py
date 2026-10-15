@@ -72,6 +72,8 @@ only poke-env options), these environment variables:
                                  wall-clock cap the endgame plan must fit under (default 4000)
     SHOWDOWN_BELIEF_REWEIGHT     "1" turns on soft Bayesian belief reweighting of the opponent's
                                  candidate sets (default off; see showdown_bot.belief)
+    SHOWDOWN_STRAT_WORLDS        "1" stratifies each revealed opponent's set across the K worlds
+                                 (systematic resampling of the posterior; default off)
     SHOWDOWN_BELIEF_TAU          tempering exponent for action evidence (default 0.5)
     SHOWDOWN_BELIEF_FLOOR        no set drops below this share of the likeliest (default 0.05)
     SHOWDOWN_RECORD_DIR          record every searched decision here (default: off;
@@ -247,6 +249,12 @@ class SearchConfig:
     belief_reweight: bool = False
     belief_tau: float = belief_module.DEFAULT_TAU  # tempering exponent of the action evidence
     belief_floor: float = belief_module.DEFAULT_FLOOR  # min share of the likeliest set
+    # Stratified (systematic) sampling of each revealed opponent's set across the K worlds
+    # (bead showdown-bot-589.54; default off).  Same posterior as i.i.d. sampling (including
+    # belief weights when belief_reweight is on), but the K draws cover it evenly, so a 53/47
+    # posterior gives 2/2 worlds instead of 3/1 or 4/0.  Worlds stay equal-weighted: the
+    # posterior is applied once, by the sampling, never again in the aggregation.
+    strat_worlds: bool = False
     # 589.47 decision quality (all default off)
     escalate: bool = False  # flat-root escalation: re-search longer when the top two are close
     escalate_gap: float = 0.02  # ...flat when the top two options' mean scores differ by less
@@ -342,6 +350,8 @@ class SearchConfig:
             in ("1", "on", "true", "yes"),
             belief_tau=_env_float("SHOWDOWN_BELIEF_TAU", belief_module.DEFAULT_TAU, 0.0, 10.0),
             belief_floor=_env_float("SHOWDOWN_BELIEF_FLOOR", belief_module.DEFAULT_FLOOR, 0.0, 1.0),
+            strat_worlds=os.environ.get("SHOWDOWN_STRAT_WORLDS", "0").strip().lower()
+            in ("1", "on", "true", "yes"),
         )
 
     def world_evaluators(self, n_worlds: int) -> list[tuple[str | None, float]]:
@@ -934,6 +944,8 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         # Separate stream for the Illusion roll so worlds are unchanged at P = 0.
         self._illusion_rng = random.Random(None if seed is None else f"illusion-{seed}")
         self._cap_rng = random.Random(None if seed is None else f"cap-{seed}")
+        # Own stream for the stratification grid so the world sampling is unchanged when off.
+        self._strat_rng = random.Random(None if seed is None else f"strat-{seed}")
         self._sampler = engine_state.TeamSampler(data)
         self.last_policy: dict[str, float] = {}
         self.last_tendency: dict[str, Any] | None = None  # diagnostics of the last exploit
@@ -1126,10 +1138,15 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         if illusion is not None and illusion.total <= 0:
             illusion = None
         world_slots: list[list[engine_state.OpponentSlot]] = []
-        for _ in range(n_worlds):
+        quantiles: list[dict[str, float]] | None = None
+        if self.config.strat_worlds and n_worlds > 1:
+            ids = [str(k) for k in battle.opponent_team if str(k) in trackers]
+            quantiles = engine_state.stratified_quantiles(ids, n_worlds, self._strat_rng)
+        for w in range(n_worlds):
             slots = engine_state.sample_opponent_team(
                 battle, trackers, self._sampler, self._rng,
                 illusion=illusion, illusion_rng=self._illusion_rng,
+                quantiles=quantiles[w] if quantiles else None,
             )
             world_slots.append(slots)
             if slots and slots[0].disguised:

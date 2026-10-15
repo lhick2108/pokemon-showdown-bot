@@ -511,6 +511,7 @@ def sample_opponent_team(
     team_size: int = TEAM_SIZE,
     illusion: Any | None = None,
     illusion_rng: random.Random | None = None,
+    quantiles: Mapping[str, float] | None = None,
 ) -> list[OpponentSlot]:
     """Build one determinized opponent team for ``battle``.
 
@@ -521,6 +522,10 @@ def sample_opponent_team(
     Pokemon as a disguised Zoroark with the estimated probability, drawn from
     ``illusion_rng`` (a separate stream, so the world sampling is unchanged
     whenever the probability is zero): see ``_apply_illusion``.
+
+    ``quantiles`` (stratified world sampling) maps a revealed Pokemon's identifier to a
+    pre-drawn quantile ``u`` in [0, 1); that Pokemon's set is then the ``u``-quantile of its
+    posterior instead of an i.i.d. draw (see ``stratified_quantiles``).
     """
     revealed = list(battle.opponent_team.items())
     active = battle.opponent_active_pokemon
@@ -533,7 +538,8 @@ def sample_opponent_team(
             if slot is None:
                 continue
         else:
-            sampled = tracker.sample(rng)
+            u = quantiles.get(str(identifier)) if quantiles else None
+            sampled = tracker.sample(rng) if u is None else tracker.sample(rng, u)
             slot = OpponentSlot(to_id(sampled.species), sampled, mon)
         slots.append(slot)
     if illusion is not None and illusion_rng is not None and slots:
@@ -551,6 +557,26 @@ def sample_opponent_team(
         if info:
             team.append(info)
     return slots
+
+
+def stratified_quantiles(
+    identifiers: Sequence[str], n_worlds: int, rng: random.Random
+) -> list[dict[str, float]]:
+    """Per-world quantiles for low-variance (systematic) sampling of each identifier's set.
+
+    For every identifier the grid ``(offset + k) / n_worlds`` (one uniform offset) is shuffled
+    over the worlds, so each world's marginal is still the posterior but the ``n_worlds``
+    draws cover it evenly: a 53/47 split gives 2/2 (not 3/1 or 4/0), 75/25 gives 3/1.
+    Shuffles are independent across identifiers, so teams stay decorrelated.
+    """
+    out: list[dict[str, float]] = [{} for _ in range(n_worlds)]
+    for identifier in identifiers:
+        offset = rng.random()
+        grid = [((offset + k) / n_worlds) % 1.0 for k in range(n_worlds)]
+        rng.shuffle(grid)
+        for world, u in zip(out, grid):
+            world[identifier] = u
+    return out
 
 
 def sampled_set_key(slot: OpponentSlot) -> tuple:

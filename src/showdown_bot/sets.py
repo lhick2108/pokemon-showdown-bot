@@ -40,6 +40,9 @@ INFERENCE_SECONDS = [0.0]
 
 _DATA_URL = "https://pkmn.github.io/randbats/data"
 _DEFAULT_CACHE_DIR = Path(".cache") / "randbats"
+# A cached data file older than this is re-downloaded on load (bead showdown-bot-589.60);
+# any network/parse failure keeps the old cache.  0 or None disables the age check.
+MAX_CACHE_AGE_SECONDS: float | None = 24 * 3600.0
 
 _TERA_TYPE_IDS = frozenset(
     {
@@ -307,6 +310,7 @@ class RandbatsData:
         format: str = "gen9randombattle",
         refresh: bool = False,
         cache_dir: str | Path = _DEFAULT_CACHE_DIR,
+        max_age: float | None = None,
     ) -> RandbatsData:
         """Load a format's sets and stats, fetching either missing cache file.
 
@@ -316,7 +320,12 @@ class RandbatsData:
         sampling simply has nothing to match and ``SetTracker.sample``
         falls back to the role-based sampler, so loading never crashes a
         battle for lack of (or stale/unreachable) full data.
+
+        A cache file older than ``max_age`` seconds (default ``MAX_CACHE_AGE_SECONDS``, 24 h;
+        0 disables) is re-downloaded; if that fails for any reason the cached file is used.
         """
+        if max_age is None:
+            max_age = MAX_CACHE_AGE_SECONDS
         cache_path = Path(cache_dir)
         format = data_format(format)  # gen9randombattlefixed plays with gen9randombattle data
         sets_path = cache_path / f"{format}.json"
@@ -326,10 +335,10 @@ class RandbatsData:
         stats_url = f"{_DATA_URL}/stats/{format}.json"
         full_url = f"{_DATA_URL}/full/{format}.json"
 
-        sets_payload = _read_cached_json(sets_path, sets_url, refresh)
-        stats_payload = _read_cached_json(stats_path, stats_url, refresh)
+        sets_payload = _read_cached_json(sets_path, sets_url, refresh, max_age)
+        stats_payload = _read_cached_json(stats_path, stats_url, refresh, max_age)
         try:
-            full_payload = _read_cached_json(full_path, full_url, refresh)
+            full_payload = _read_cached_json(full_path, full_url, refresh, max_age)
         except (OSError, ValueError) as exc:
             logger.warning(
                 "Could not load full randbats sets for %s (%s); full-set "
@@ -448,15 +457,37 @@ class RandbatsData:
         return self._species[to_id(species)].roles
 
 
-def _read_cached_json(path: Path, url: str, refresh: bool) -> Any:
-    if refresh or not path.exists():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        request = urllib.request.Request(
-            url, headers={"User-Agent": "showdown-bot randbats data loader"}
-        )
-        with urllib.request.urlopen(request, timeout=60) as response:
-            payload = response.read()
-        path.write_bytes(payload)
+def _download(url: str, path: Path) -> None:
+    """Fetch ``url`` into ``path`` atomically; the file is only replaced by valid JSON."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "showdown-bot randbats data loader"}
+    )
+    with urllib.request.urlopen(request, timeout=60) as response:
+        payload = response.read()
+    json.loads(payload)  # never replace a good cache with a truncated / non-JSON body
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_bytes(payload)
+    tmp.replace(path)
+
+
+def _is_stale(path: Path, max_age: float | None) -> bool:
+    if not max_age or max_age <= 0:
+        return False
+    try:
+        return time.time() - path.stat().st_mtime > max_age
+    except OSError:
+        return False
+
+
+def _read_cached_json(path: Path, url: str, refresh: bool, max_age: float | None = None) -> Any:
+    if not path.exists():
+        _download(url, path)
+    elif refresh or _is_stale(path, max_age):
+        try:
+            _download(url, path)
+        except Exception as exc:  # offline / bad body: keep serving the cache, never crash
+            logger.warning("Could not refresh %s from %s (%s); using the cached copy", path, url, exc)
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -815,7 +846,7 @@ class SetTracker:
         normalized = _normalized_weights(names, raw)
         return dict(zip(names, normalized))
 
-    def sample(self, rng: Any) -> SampledSet:
+    def sample(self, rng: Any, u: float | None = None) -> SampledSet:
         """Sample a whole set, preferring real joint data over role marginals.
 
         Draws from the full randbats sets (level, item, ability, all moves
@@ -841,7 +872,10 @@ class SetTracker:
             weights = self._belief_weights(matches)
         else:
             weights = [full_set.count for _, full_set in matches]
-        index = _weighted_index(rng, weights)
+        if u is None:
+            index = _weighted_index(rng, weights)
+        else:  # stratified world sampling: a pre-drawn quantile of the same distribution
+            index = self._quantile_index(matches, weights, u)
         species_id, full_set = matches[index]
         return SampledSet(
             species=self.data.species_name(species_id),
@@ -852,6 +886,29 @@ class SetTracker:
             item=full_set.item,
             tera_type=full_set.tera_type,
         )
+
+    def _quantile_index(
+        self, matches: list[tuple[str, FullSet]], weights: Sequence[float], u: float
+    ) -> int:
+        """Index at quantile ``u`` of the weight distribution, sets grouped by role.
+
+        Grouping by role makes a quantile grid allocate worlds to roles in proportion to the
+        role's posterior mass first (the set within a role is then the next stratum).
+        """
+        clean = [_weight(w) for w in weights]
+        if sum(clean) <= 0:
+            clean = [1.0] * len(clean)
+        order = sorted(
+            range(len(matches)),
+            key=lambda i: (self._best_matching_role_name(*matches[i]), i),
+        )
+        target = min(max(float(u), 0.0), 1.0 - 1e-12) * sum(clean)
+        acc = 0.0
+        for i in order:
+            acc += clean[i]
+            if target < acc:
+                return i
+        return order[-1]
 
     def _matching_full_sets(self) -> list[tuple[str, FullSet]]:
         """Full sets, across every candidate species id, legal given evidence.

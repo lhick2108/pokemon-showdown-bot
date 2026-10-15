@@ -82,7 +82,7 @@ SPEC_KEYS = {
     "search": {"evaluator": str, "scale": float, "time_ms": int, "worlds": int,
                "selection": str, "gamma": float, "mode": str,
                "tendency": str, "tkappa": float, "tdelta": float,
-               "belief": int, "btau": float, "bfloor": float,
+               "belief": int, "btau": float, "bfloor": float, "strat": int,
                 "escalate": int, "escalate_gap": float, "escalate_factor": float,
                 "escalate_steps": int, "escalate_cap_ms": int, "prune_noop": int, "noop_switches": int,
                 "tera_margin": float, "ev2": str, "scale2": float,
@@ -91,7 +91,7 @@ SPEC_KEYS = {
     "humansearch": {"evaluator": str, "scale": float, "time_ms": int, "worlds": int,
                     "selection": str, "gamma": float, "mode": str,
                     "tendency": str, "tkappa": float, "tdelta": float,
-                    "belief": int, "btau": float, "bfloor": float,
+                    "belief": int, "btau": float, "bfloor": float, "strat": int,
                     "escalate": int, "escalate_gap": float, "escalate_factor": float,
                     "escalate_steps": int, "escalate_cap_ms": int, "prune_noop": int, "noop_switches": int,
                     "tera_margin": float, "ev2": str, "scale2": float,
@@ -99,7 +99,7 @@ SPEC_KEYS = {
     "search-net": {"evaluator": str, "scale": float, "time_ms": int, "worlds": int,
                    "selection": str, "gamma": float, "mode": str,
                "tendency": str, "tkappa": float, "tdelta": float,
-               "belief": int, "btau": float, "bfloor": float,
+               "belief": int, "btau": float, "bfloor": float, "strat": int,
                 "escalate": int, "escalate_gap": float, "escalate_factor": float,
                 "escalate_steps": int, "escalate_cap_ms": int, "prune_noop": int, "noop_switches": int,
                 "tera_margin": float, "ev2": str, "scale2": float,
@@ -224,6 +224,8 @@ def parse_spec(text: str) -> BotSpec:
                 raise ValueError(f"tendency must be on or off in bot spec {raw!r}")
             if key == "belief" and parsed not in (0, 1):
                 raise ValueError(f"belief must be 0 or 1 in bot spec {raw!r}")
+            if key == "strat" and parsed not in (0, 1):
+                raise ValueError(f"strat must be 0 or 1 in bot spec {raw!r}")
             if key == "btau" and not (math.isfinite(parsed) and parsed >= 0):
                 raise ValueError(f"btau must be >= 0 in bot spec {raw!r}")
             if key == "bfloor" and not (math.isfinite(parsed) and 0 <= parsed < 1):
@@ -715,6 +717,8 @@ def _quality_kwargs(spec: BotSpec) -> dict:
         out["evaluator2_scale"] = spec.param("scale2", 1.0)
     if spec.param("belief") is not None:  # bead showdown-bot-1wu
         out["belief_reweight"] = bool(spec.param("belief"))
+    if spec.param("strat") is not None:  # bead showdown-bot-589.54
+        out["strat_worlds"] = bool(spec.param("strat"))
     if spec.param("btau") is not None:
         out["belief_tau"] = spec.param("btau")
     if spec.param("bfloor") is not None:
