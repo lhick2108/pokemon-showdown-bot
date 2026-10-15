@@ -173,6 +173,7 @@ class Data:
     residual: bool = False
     e_sep: np.ndarray | None = None
     feature_version: int = 1
+    didx: np.ndarray | None = None  # decision index within its game record (turn - 1 for human data)
 
     @property
     def e(self) -> np.ndarray:
@@ -217,6 +218,7 @@ class Data:
             self.residual,
             None if self.e_sep is None else self.e_sep[idx],
             self.feature_version,
+            None if self.didx is None else self.didx[idx],
         )
 
 
@@ -508,7 +510,7 @@ def load_data(
     return Data(
         x, y, sample_weights(tags, weighting, mult), tags, strings, q,
         None if value_target == "outcome" else target,
-        np.asarray(evals, dtype=np.float32), residual, e_sep, feature_version,
+        np.asarray(evals, dtype=np.float32), residual, e_sep, feature_version, didx,
     )
 
 
