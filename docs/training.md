@@ -374,3 +374,19 @@ captures most of the benefit; the lever that is left is more games. Models
 kept: `models/gen0-aug-best-plain.pev` (bench) and
 `models/gen0-aug-best-res.pev` (residual, bench, lr 1e-3); the unaugmented
 plain baseline is still the best plain val BCE.
+
+## Auxiliary targets (`--aux on`, bead 589.56)
+
+KataGo-style extra heads on the value net's hidden layer, training only (the `.pev` export is
+byte-identical in format; the Rust evaluator is unchanged). `--aux-weight` (default 0.5) scales
+the aux loss added to the value BCE. Mlp + v1 features only; incompatible with `--augment-*`
+and `--nodes`. Code: `auxtargets.py`.
+
+* Survival: 12 logits (own slots 0..5 then opp slots 0..5, feature slot order: active first, rest
+  in team order), BCE, masked for empty / already-fainted slots, ties, and opposing slots that are
+  not on the real team (sampled, never-revealed worlds).
+* Remaining-Pokemon difference (own alive - opp alive at the end) / 6, tanh output, MSE.
+* The recordings store no terminal state, so the end of the game is reconstructed: the loser has
+  nobody left; the winner keeps the Pokemon alive in the LAST stored decision state (truth state if
+  any). This can overcount the winner's survivors by those that faint in the last unrecorded turns.
+* `--aux-metrics` prints the same val baselines for a run with `--aux off`.
