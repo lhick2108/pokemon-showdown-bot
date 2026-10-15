@@ -1,4 +1,4 @@
-use super::abilities::Abilities;
+use super::abilities::{attacker_ignores_target_ability, Abilities};
 use super::state::{PokemonVolatileStatus, Terrain, Weather};
 use crate::choices::{Choice, MoveCategory};
 use crate::choices::{Choices, MOVES};
@@ -377,6 +377,14 @@ fn get_attacking_and_defending_stats(
                 should_calc_defender_boost = false;
             }
 
+            // Sacred Sword / Darkest Lariat / Chip Away ignore the target's Defense stat changes
+            if matches!(
+                choice.move_id,
+                Choices::SACREDSWORD | Choices::DARKESTLARIAT | Choices::CHIPAWAY
+            ) {
+                should_calc_defender_boost = false;
+            }
+
             // Get the attacking stat
 
             // checks for moves that change which stat is used for the attacking_stat
@@ -544,6 +552,15 @@ fn common_pkmn_damage_calc(
             &choice.move_type,
             &get_defending_types(&defending_side, defender, attacker, choice),
         );
+    }
+    // Tera Shell (Terapagos-Terastal): at full HP every neutral or super-effective hit becomes not
+    // very effective (x0.5 total, whatever the matchup); resisted and immune hits are unchanged.
+    if defender.ability == Abilities::TERASHELL
+        && defender.hp >= defender.maxhp
+        && !attacker_ignores_target_ability(attacker, choice)
+        && damage_modifier >= 1.0
+    {
+        damage_modifier = 0.5;
     }
 
     if attacker.ability != Abilities::CLOUDNINE
@@ -1078,5 +1095,89 @@ mod tests {
             Choices::NONE,
             0
         ),
+    }
+
+    fn tera_shell_dmg(mutate: impl Fn(&mut State), move_type: PokemonType) -> i16 {
+        let mut state = State::default();
+        state.side_two.get_active().ability = Abilities::TERASHELL;
+        mutate(&mut state);
+        let mut choice = Choice {
+            ..Default::default()
+        };
+        choice.move_id = Choices::NONE;
+        choice.category = MoveCategory::Physical;
+        choice.move_type = move_type;
+        choice.base_power = 40.0;
+        calculate_damage(&state, &SideReference::SideOne, &choice, DamageRolls::Max)
+            .unwrap()
+            .0
+    }
+
+    #[test]
+    fn test_tera_shell_halves_neutral_damage_at_full_hp() {
+        let plain = tera_shell_dmg(|s| s.side_two.get_active().ability = Abilities::NONE, PokemonType::TYPELESS);
+        let shell = tera_shell_dmg(|_| {}, PokemonType::TYPELESS);
+        assert_eq!(plain / 2, shell);
+    }
+
+    #[test]
+    fn test_tera_shell_makes_super_effective_not_very_effective() {
+        // default defender is Normal; Fighting is super effective (2x). Tera Shell: 0.5x total.
+        let plain = tera_shell_dmg(|s| s.side_two.get_active().ability = Abilities::NONE, PokemonType::FIGHTING);
+        let shell = tera_shell_dmg(|_| {}, PokemonType::FIGHTING);
+        assert_eq!(plain / 4, shell);
+    }
+
+    #[test]
+    fn test_tera_shell_inactive_when_not_full_hp() {
+        let plain = tera_shell_dmg(|s| s.side_two.get_active().ability = Abilities::NONE, PokemonType::TYPELESS);
+        let shell = tera_shell_dmg(|s| s.side_two.get_active().hp -= 1, PokemonType::TYPELESS);
+        assert_eq!(plain, shell);
+    }
+
+    #[test]
+    fn test_tera_shell_does_not_double_resist() {
+        // Rock is resisted by... default defender is Normal, which does not resist Rock; use Steel
+        // defender: Fighting is not resisted; instead check Ghost -> Normal is immune: stays 0.
+        let shell = tera_shell_dmg(|_| {}, PokemonType::GHOST);
+        assert_eq!(shell, 0);
+        let shell = tera_shell_dmg(|s| s.side_two.get_active().types = (PokemonType::STEEL, PokemonType::TYPELESS), PokemonType::NORMAL);
+        let plain = tera_shell_dmg(
+            |s| {
+                s.side_two.get_active().types = (PokemonType::STEEL, PokemonType::TYPELESS);
+                s.side_two.get_active().ability = Abilities::NONE;
+            },
+            PokemonType::NORMAL,
+        );
+        assert_eq!(plain, shell); // already resisted: Tera Shell does not stack
+    }
+
+    #[test]
+    fn test_tera_shell_ignored_by_mold_breaker() {
+        let plain = tera_shell_dmg(|s| s.side_two.get_active().ability = Abilities::NONE, PokemonType::TYPELESS);
+        let broken = tera_shell_dmg(|s| s.side_one.get_active().ability = Abilities::MOLDBREAKER, PokemonType::TYPELESS);
+        assert_eq!(plain, broken);
+    }
+
+    #[test]
+    fn test_sacred_sword_ignores_defense_boosts() {
+        let dmg = |move_id: Choices, def_boost: i8| {
+            let mut state = State::default();
+            state.side_two.defense_boost = def_boost;
+            let mut choice = Choice {
+                ..Default::default()
+            };
+            choice.move_id = move_id;
+            choice.category = MoveCategory::Physical;
+            choice.move_type = PokemonType::TYPELESS;
+            choice.base_power = 90.0;
+            calculate_damage(&state, &SideReference::SideOne, &choice, DamageRolls::Max)
+                .unwrap()
+                .0
+        };
+        assert_eq!(dmg(Choices::SACREDSWORD, 3), dmg(Choices::SACREDSWORD, 0));
+        assert_eq!(dmg(Choices::SACREDSWORD, -3), dmg(Choices::SACREDSWORD, 0));
+        assert_eq!(dmg(Choices::DARKESTLARIAT, 2), dmg(Choices::DARKESTLARIAT, 0));
+        assert!(dmg(Choices::NONE, 3) < dmg(Choices::NONE, 0)); // ordinary moves still see the boost
     }
 }

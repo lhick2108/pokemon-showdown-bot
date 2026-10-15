@@ -17,7 +17,8 @@ use crate::instruction::{
 };
 use crate::pokemon::PokemonName;
 use crate::state::{
-    PokemonBoostableStat, PokemonMoveIndex, PokemonSideCondition, PokemonStatus, PokemonType, Side, SideReference,
+    Pokemon, PokemonBoostableStat, PokemonMoveIndex, PokemonSideCondition, PokemonStatus, PokemonType, Side,
+    SideReference,
     State,
 };
 use std::cmp;
@@ -2423,6 +2424,17 @@ pub fn ability_modify_attack_being_used(
         }
         _ => {}
     }
+}
+
+/// True if the attacker's move ignores the target's (breakable) ability: Mold Breaker, Teravolt,
+/// Turboblaze and the Mold-Breaker-like signature moves.
+pub fn attacker_ignores_target_ability(attacking_pkmn: &Pokemon, choice: &Choice) -> bool {
+    attacking_pkmn.ability == Abilities::MOLDBREAKER
+        || attacking_pkmn.ability == Abilities::TERAVOLT
+        || attacking_pkmn.ability == Abilities::TURBOBLAZE
+        || choice.move_id == Choices::MOONGEISTBEAM
+        || choice.move_id == Choices::PHOTONGEYSER
+        || choice.move_id == Choices::SUNSTEELSTRIKE
 }
 
 pub fn ability_modify_attack_against(

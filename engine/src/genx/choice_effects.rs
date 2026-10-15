@@ -508,8 +508,15 @@ pub fn modify_choice(
         }
 
         Choices::ACROBATICS => {
-            if attacking_side.get_active_immutable().item == Items::NONE {
-                attacker_choice.base_power *= 2.0;
+            let attacker = attacking_side.get_active_immutable();
+            if attacker.item == Items::NONE {
+                if attacker.terastallized && attacker_choice.move_type == attacker.tera_type {
+                    // The Tera 60-BP floor was already applied to the base 55; Showdown floors the
+                    // callback result (110), so it must not be doubled to 120.
+                    attacker_choice.base_power = 110.0;
+                } else {
+                    attacker_choice.base_power *= 2.0;
+                }
             }
         }
         Choices::FOCUSPUNCH => {
