@@ -188,11 +188,7 @@ dependencies = [
 
 [[package]]
 name = "poke-engine"
-<<<<<<< HEAD
-version = "0.0.48+sdb.12"
-=======
-version = "0.0.48+sdb.13"
->>>>>>> worktree-agent-a78b9aeba1285d961
+version = "0.0.48+sdb.14"
 dependencies = [
  "clap",
  "dashmap",
@@ -201,11 +197,7 @@ dependencies = [
 
 [[package]]
 name = "poke_engine"
-<<<<<<< HEAD
-version = "0.0.48+sdb.12"
-=======
-version = "0.0.48+sdb.13"
->>>>>>> worktree-agent-a78b9aeba1285d961
+version = "0.0.48+sdb.14"
 dependencies = [
  "poke-engine",
  "pyo3",

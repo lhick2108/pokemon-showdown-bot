@@ -8,9 +8,5 @@ build-backend = "maturin"
 
 [project]
 name = "poke-engine"
-<<<<<<< HEAD
-version = "0.0.48+sdb.12"
-=======
-version = "0.0.48+sdb.13"
->>>>>>> worktree-agent-a78b9aeba1285d961
+version = "0.0.48+sdb.14"
 readme = "readme.md"
