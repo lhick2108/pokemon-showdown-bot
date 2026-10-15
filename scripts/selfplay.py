@@ -162,6 +162,8 @@ def _parser() -> argparse.ArgumentParser:
                    help="bead rnm: also record up to K sampled interior MCTS nodes per searched world "
                         "(visit-weighted; state, visits, search value) as extra value targets "
                         "(needs --threads 1 and an engine with export_nodes, 0.0.48+sdb.9; 0 = off)")
+    p.add_argument("--prior", default=None, help="policy prior .ppol for PUCT selection (both sides)")
+    p.add_argument("--c-puct", type=float, default=1.0, help="PUCT exploration constant with --prior")
     p.add_argument("--export-min-visits", type=int, default=16,
                    help="--export-nodes: only nodes with at least this many visits are eligible")
     p.add_argument("--connect-timeout", type=bench._positive_seconds, default=30)
@@ -196,6 +198,8 @@ async def _selfplay_pair(
         fast_time_ms=args.fast_time_ms,
         export_nodes=args.export_nodes,
         export_min_visits=args.export_min_visits,
+        prior=args.prior,
+        c_puct=args.c_puct,
         label="main",
     )
     entries = parse_pool(args.pool) if args.pool else [PoolEntry("main", args.evaluator, args.leaf_scale)]
