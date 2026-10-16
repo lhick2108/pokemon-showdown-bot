@@ -390,3 +390,76 @@ and `--nodes`. Code: `auxtargets.py`.
   nobody left; the winner keeps the Pokemon alive in the LAST stored decision state (truth state if
   any). This can overcount the winner's survivors by those that faint in the last unrecorded turns.
 * `--aux-metrics` prints the same val baselines for a run with `--aux off`.
+
+## Human pretraining, self-play fine-tuning and the human-test metric
+
+Idea: pretrain the value net on first-person human ladder positions (outcome labels, no search
+values), then warm-start (`--init`) a self-play fine-tune on `--value-target search`. The human
+data is `data\human\pc1-fp-aux\{train,test}` (100k / 35.7k games, see `docs/human-replays.md`).
+
+`--init MODEL.pev` copies the weights of an existing `.pev` into the model being trained. It
+needs the same `--model`, `--hidden`, `--features` and `--residual`-ness (otherwise it exits 2
+naming the mismatch). Carried over: all layer weights and biases and, for residual nets, the stock
+coefficient `a = stock_coef / 0.0125` (still trainable unless `--freeze-stock-coef`) and the output
+bias. Not applied with `--init`: the logistic fit of `a, b` on the new train split
+(`--stock-coef-init` is ignored; the fit is still printed as the stock-only reference). The net
+has no input normalisation, so there are no other statistics to carry. Learning rate and its
+schedule are unchanged (AdamW, early stopping); pass `--lr` (about `3e-4` for a fine-tune).
+
+`scripts/human_eval.py MODEL.pev [MODEL2.pev ...] --data DIR [--max-games N] [--per-game K]
+[--seed S] [--json OUT]` scores nets exactly as the engine reads them at a search root
+(`Evaluator.logit(state)`: absolute logit for side one, residual stock term included; the leaf
+scale does not matter for an absolute probability). It reports BCE and decisive accuracy vs the
+game outcome overall and per turn bucket (1-5, 6-10, 11-15, 16-20, 21-30, 31+) next to the
+constant predictor, on a fixed subsample (default 4 truth decisions per game, seed 0) so numbers
+compare across models. It streams one game file at a time (a few MB RAM).
+
+Feature version: the deployed gen7/gen8 nets (`gen7-res-root-mlp16.pev`, `gen8-res-root-mlp16.pev`)
+are **features v1** (738 inputs), not v2, so the commands below use `--features v1` to stay
+warm-startable from them and comparable. Swap in `--features v2` for a v2 run (rows are 3x wider:
+2,191 columns, 4.4 KB per float16 row, so RAM scales 3x).
+
+Smoke tests (single process, CPU; pretrain on 456 human battles with `--max-per-game 3`, then a
+fine-tune on 50 gen7 records with `--init`, `--lr 3e-4`; human_eval on 300 test games = 1,178
+positions). BCE: pretrained 0.593 (v1) / 0.593 (v2), after the 50-game fine-tune 0.594 / 0.595,
+`gen7-res-root-mlp16` 0.666, `gen2-res-searchabs-mlp16` 0.648, constant 0.693. human_eval costs
+about 0.65 s per 1,000 positions per model, i.e. about 2.5 s per 1,000 games for one model at 4
+per game (state parsing dominates, so extra models are cheaper).
+
+Full-scale commands (PowerShell, from the repo root; hidden 16, residual, features v1):
+
+```powershell
+# (a) pretrain on all of pc1-fp-aux/train: outcome targets, truth states, <= 6 decisions per game
+python -m showdown_bot.train --data data\human\pc1-fp-aux\train --states truth `
+    --value-target outcome --model mlp --residual --hidden 16 --features v1 --x-dtype float16 `
+    --max-per-game 6 --load-workers 8 --out models\human-pre-res16.pev `
+    --val-data data\human\pc1-fp-aux\test@4
+
+# (b) fine-tune on gen8 + gen9 self-play, warm-started, search-value targets
+python -m showdown_bot.train --data data\selfplay\gen8 --data data\selfplay\gen9 `
+    --init models\human-pre-res16.pev --states truth --value-target search --q-kind absolute `
+    --model mlp --residual --hidden 16 --features v1 --x-dtype float16 --lr 3e-4 `
+    --load-workers 8 --out models\human-ft-gen89-res16.pev `
+    --val-data data\human\pc1-fp-aux\test@4
+
+# (c) evaluate on first-person human test positions (the references use the same subsample)
+python scripts\human_eval.py models\human-pre-res16.pev models\human-ft-gen89-res16.pev `
+    models\gen7-res-root-mlp16.pev models\gen8-res-root-mlp16.pev `
+    --data data\human\pc1-fp-aux\test --json human-eval.json
+```
+
+For (b) use the same `--states` / `--weighting` flags as the recipe that produced the reference
+net if it differs from `truth`. `--init` only takes nets of the same feature version and hidden
+size.
+
+Estimates, extrapolated from the smoke tests (about 1,200 samples/s single-process loading,
+60 us per sample-epoch for the h16 MLP on one CPU core; the 3080 is much faster per epoch; float16
+rows are 1.5 KB for v1, 4.4 KB for v2). Treat as +-50%:
+
+| step | rows | RAM (peak) | time |
+| --- | --- | --- | --- |
+| (a) pretrain, 185,906 records (100k games), cap 6 | about 1.1M train rows | v1 about 2-3 GB (v2 about 6 GB), plus the `@4` val set (about 0.5 GB v1) | load about 15 min single-process (2-3 min with 8 workers); about 1 min per epoch on CPU, up to 60 epochs with patience 6, so about 30-60 min CPU, a few minutes on the GPU |
+| (b) fine-tune, 6,684 gen8 + gen9 records | about 230k truth rows | about 1 GB | load about 3 min single-process; about 15 s per epoch on CPU |
+| (c) human_eval, 35.7k games x 4 | about 140k positions per model | below 0.5 GB | about 1.5 min per model |
+
+Uncapped (`--max-per-game 0`) the pretrain set is about 2.6M rows (about 4 GB v1, 12 GB v2).

@@ -902,6 +902,84 @@ def export_pev(model: nn.Module, out: Path, feature_version: int = 1) -> None:
     )
 
 
+def read_pev(path: str | Path) -> dict:
+    """Parse a ``.pev`` weights file (format in ``engine/src/learned.rs``) into plain arrays.
+
+    Returns ``feature_version``, ``kind`` ("linear" | "mlp"), ``n_in``, ``hidden``,
+    ``stock_coef`` (None = not residual) and the torch-layout weights ``w1`` ``[hidden, n_in]``,
+    ``b1``, ``w2`` ``[hidden]``, ``b2`` (linear: ``w1`` is ``[1, n_in]``, ``b1`` / ``w2`` unused).
+    """
+    import struct
+
+    raw = Path(path).read_bytes()
+    if len(raw) < 24 or raw[:4] != b"PEVN":
+        raise ValueError(f"{path}: not a poke-engine evaluator file (bad magic)")
+    fmt, feat_ver, kind, n_in, hidden = struct.unpack_from("<5I", raw, 4)
+    off, stock_coef = 24, None
+    if fmt == 2:
+        flags, coef = struct.unpack_from("<If", raw, 24)
+        stock_coef = float(coef) if flags & 1 else None
+        off = 32
+    elif fmt != 1:
+        raise ValueError(f"{path}: unsupported weights format {fmt}")
+    if kind not in (1, 2):
+        raise ValueError(f"{path}: unknown model kind {kind}")
+    body = np.frombuffer(raw, dtype="<f4", offset=off).astype(np.float32)
+    need = n_in + 1 if kind == 1 else hidden * n_in + 2 * hidden + 1
+    if len(body) != need:
+        raise ValueError(f"{path}: weights body has {len(body)} floats, expected {need}")
+    out = {"feature_version": feat_ver, "kind": "linear" if kind == 1 else "mlp", "n_in": n_in,
+           "hidden": hidden, "stock_coef": stock_coef}
+    if kind == 1:
+        out.update(w1=body[:n_in].reshape(1, n_in), b1=None, w2=None, b2=float(body[n_in]))
+    else:
+        a = hidden * n_in
+        out.update(w1=body[:a].reshape(hidden, n_in), b1=body[a:a + hidden],
+                   w2=body[a + hidden:a + 2 * hidden], b2=float(body[a + 2 * hidden]))
+    return out
+
+
+def load_init(model: nn.Module, path: str | Path, *, model_kind: str, n_feat: int, hidden: int,
+              feature_version: int, residual: bool) -> None:
+    """Warm start: copy the weights of ``path`` into ``model`` (as built by ``build_model``).
+
+    Raises ``ValueError`` naming the mismatch if the file's kind, feature version, input width,
+    hidden size or residual-ness differ from the model being trained. For a residual model the
+    stock coefficient ``a`` is set to ``stock_coef / 0.0125`` of the file (still trainable unless
+    ``--freeze-stock-coef``) and the output bias is the file's, so the fit of ``a, b`` on this
+    run's training split is NOT applied. The net has no input normalisation, so there are no
+    other statistics to carry over.
+    """
+    pev = read_pev(path)
+    problems = []
+    if pev["kind"] != model_kind:
+        problems.append(f"model kind {pev['kind']} (training {model_kind})")
+    if pev["feature_version"] != feature_version:
+        problems.append(f"feature version {pev['feature_version']} (training {feature_version})")
+    if pev["n_in"] != n_feat:
+        problems.append(f"{pev['n_in']} inputs (training {n_feat})")
+    if model_kind == "mlp" and pev["hidden"] != hidden:
+        problems.append(f"hidden {pev['hidden']} (training {hidden})")
+    if (pev["stock_coef"] is not None) != residual:
+        problems.append("file is residual but training without --residual" if pev["stock_coef"]
+                        is not None else "file is not residual but training with --residual")
+    if problems:
+        raise ValueError(f"--init {path} does not match this run: " + "; ".join(problems))
+    net = model.net if isinstance(model, ResidualNet) else model
+    with torch.no_grad():
+        if model_kind == "linear":
+            net.weight.copy_(torch.from_numpy(pev["w1"]))
+            net.bias.fill_(pev["b2"])
+        else:
+            l1, l2 = net[0], net[-1]
+            l1.weight.copy_(torch.from_numpy(pev["w1"]))
+            l1.bias.copy_(torch.from_numpy(pev["b1"]))
+            l2.weight.copy_(torch.from_numpy(pev["w2"]).reshape(1, -1))
+            l2.bias.fill_(pev["b2"])
+        if isinstance(model, ResidualNet):
+            model.a.fill_(pev["stock_coef"] / STOCK_SCALE)
+
+
 def verify_export(model: nn.Module, path: Path, states: list[str], tol: float = 1e-3) -> float:
     """Load ``path`` with ``Evaluator.load`` and compare ``evaluate`` to the torch logits.
 
@@ -1172,6 +1250,11 @@ def _parser() -> argparse.ArgumentParser:
                    help="weight of the auxiliary loss added to the value BCE (default 0.5)")
     p.add_argument("--aux-metrics", action="store_true",
                    help="load the aux targets and print the baselines even with --aux off")
+    p.add_argument("--init", type=Path, default=None, metavar="MODEL.pev",
+                   help="warm start: initialise weights (and the residual stock coefficient a "
+                        "and output bias) from an existing .pev with the same model/hidden/"
+                        "features/--residual; errors on mismatch. Typical: pretrain on human data, "
+                        "then fine-tune on self-play with a lower --lr")
     p.add_argument("--val-fraction", type=float, default=0.1)
     p.add_argument("--epochs", type=int, default=60)
     p.add_argument("--patience", type=int, default=6)
@@ -1290,6 +1373,15 @@ def main(argv=None) -> int:
         return 2
     model = build_model(args.model, n_feat, args.hidden, res_init, args.freeze_stock_coef,
                         args.dropout)
+    if args.init is not None:
+        try:
+            load_init(model, args.init, model_kind=args.model, n_feat=n_feat, hidden=args.hidden,
+                      feature_version=feature_version, residual=args.residual)
+        except (ValueError, OSError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        print(f"warm start from {args.init}"
+              + (f" (a = {float(model.a.item()):.4f})" if args.residual else ""))
     if args.aux == "on":
         if args.model != "mlp" or args.augment_bench or args.augment_sides or args.aux_weight <= 0 \
                 or feature_version != 1 or args.nodes != "off":
