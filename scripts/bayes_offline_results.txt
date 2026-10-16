@@ -1,0 +1,146 @@
+178 decisions (28 from the Incineroar game)
+search: 712 world searches (0 cached), 4 workers, 1000 ms
+  40/712
+  80/712
+  120/712
+  160/712
+  200/712
+  240/712
+  280/712
+  320/712
+  360/712
+  400/712
+  440/712
+  480/712
+  520/712
+  560/712
+  600/712
+  640/712
+  680/712
+
+=== 150 decisions analysed ===
+  argmax != nash :  25/150 = 16.7%
+  argmax != bayes:  35/150 = 23.3%
+    nash != bayes:  29/150 = 19.3%
+  row-set mismatch across worlds in 0 decisions
+  Bayes-objective gap, bayes mixed minus argmax PURE pick:
+     all     : mean 0.0311  median 0.0134  p90 0.0893  max 0.2338
+     disagree: n=35  mean 0.0504  median 0.0348  p90 0.1111  max 0.2338
+     vs argmax full mixed policy: median 0.0150  p90 0.0346  max 0.0726
+  Bayes-objective gap, bayes mixed minus nash PURE pick:
+     all     : mean 0.0321  median 0.0143  p90 0.0893  max 0.2603
+     disagree: n=29  mean 0.0617  median 0.0496  p90 0.1246  max 0.1542
+     vs nash full mixed policy: median 0.0089  p90 0.0315  max 0.1000
+  bayes mixed minus bayes PURE argmax pick (cost of not mixing): median 0.0131 p90 0.0811
+  cell visits (raw, per world root matrix):
+     cells total 57708, never visited 28.2%
+     visited cells: median 32  p10 1  p90 2089
+     share of ALL cells with <5 visits (pseudocount-dominated): 45.4%
+     share of ALL cells with <50 visits: 68.3%
+     row visit totals: median 1112  p10 56
+     matrix size: median 9 x 11
+
+=== pseudocount sensitivity (same matrices, bayes pick) ===
+  pc=    5: bayes pick changed vs pc=5: 0/150 (0.0%); bayes!=argmax 35 (23.3%), bayes!=nash 29 (19.3%)
+  pc=    1: bayes pick changed vs pc=5: 1/150 (0.7%); bayes!=argmax 34 (22.7%), bayes!=nash 28 (18.7%)
+  pc=   20: bayes pick changed vs pc=5: 4/150 (2.7%); bayes!=argmax 37 (24.7%), bayes!=nash 30 (20.0%)
+
+=== disagreements (bayes != argmax), largest Bayes-objective gaps ===
+  gen9randombattle-2699000543#20 T18: argmax=switch arcaninehisui (0.189) nash=fireblast (0.423) bayes=fireblast (pure 0.423, mixed 0.423) world values [0.47, 0.46, 0.39, 0.38]
+  -gen9randombattle-2698968115#4 T3: argmax=knockoff (0.341) nash=bulkup-tera (0.453) bayes=bulkup-tera (pure 0.453, mixed 0.501) world values [0.43, 0.61, 0.37, 0.61]
+  -gen9randombattle-2698916774#6 T6: argmax=highhorsepower-tera (0.476) nash=ironhead (0.484) bayes=ironhead (pure 0.484, mixed 0.591) world values [0.51, 0.61, 0.61, 0.63]
+  -gen9randombattle-2698922141#4 T4: argmax=switch spectrier (0.289) nash=switch spectrier (0.289) bayes=spikes (pure 0.393, mixed 0.402) world values [0.34, 0.28, 0.45, 0.53]
+  gen9randombattle-2699010413#10 T8: argmax=knockoff (0.386) nash=knockoff (0.386) bayes=uturn (pure 0.408, mixed 0.495) world values [0.48, 0.51, 0.49, 0.5]
+  gen9randombattle-2698935668#18 T16: argmax=switch scrafty (0.269) nash=strengthsap (0.365) bayes=strengthsap (pure 0.365, mixed 0.367) world values [0.39, 0.38, 0.32, 0.38]
+  -gen9randombattle-2698920460#8 T8: argmax=drainpunch (0.351) nash=drainpunch (0.351) bayes=switch stantler (pure 0.422, mixed 0.440) world values [0.52, 0.38, 0.49, 0.37]
+  gen9randombattle-2698932274#11 T10: argmax=switch keldeoresolute (0.430) nash=switch keldeoresolute (0.430) bayes=switch regidrago (pure 0.376, mixed 0.506) world values [0.52, 0.47, 0.51, 0.52]
+  gen9randombattle-2699000543#16 T15: argmax=earthquake (0.304) nash=switch arcaninehisui (0.118) bayes=switch arcaninehisui (pure 0.118, mixed 0.378) world values [0.38, 0.38, 0.38, 0.37]
+  -gen9randombattle-2699011586#6 T5: argmax=switch weezinggalar (0.276) nash=switch weezinggalar (0.276) bayes=megahorn (pure 0.261, mixed 0.342) world values [0.35, 0.35, 0.32, 0.34]
+
+=== Incineroar game: summary of the same statistics (all decisions of that game) ===
+
+=== Incineroar game, turn by turn ===
+T 1 opp=slitherwing incin_in_play=False played=stealthrock  argmax=switch sylveon nash=switch sylveon bayes=stealthrock  <-- DIFFER
+      bayes value 0.387 worlds [0.38, 0.43, 0.335, 0.402]; bayes x [('stealthrock', 1.0)]
+      pure-pick values: argmax 0.341 nash 0.341 bayes 0.387; top pure [('stealthrock', 0.387), ('earthquake', 0.365), ('switch sylveon', 0.341)]
+T 2 opp=slitherwing incin_in_play=False played=switch sylveon  argmax=switch sylveon nash=switch sylveon bayes=switch sylveon
+      bayes value 0.358 worlds [0.483, 0.37, 0.416, 0.165]; bayes x [('switch sylveon', 0.52), ('icebeam', 0.48)]
+      pure-pick values: argmax 0.274 nash 0.274 bayes 0.274; top pure [('icebeam', 0.344), ('earthquake', 0.337), ('roar', 0.323)]
+T 3 opp=slitherwing incin_in_play=False played=protect  argmax=protect nash=protect bayes=hypervoice  <-- DIFFER
+      bayes value 0.315 worlds [0.318, 0.218, 0.347, 0.378]; bayes x [('hypervoice', 0.52), ('protect', 0.31), ('switch blastoise', 0.13)]
+      pure-pick values: argmax 0.237 nash 0.237 bayes 0.288; top pure [('hypervoice', 0.288), ('calmmind', 0.272), ('wish', 0.262)]
+T 4 opp=weezinggalar incin_in_play=False played=switch gothitelle  argmax=switch gothitelle nash=hypervoice bayes=hypervoice  <-- DIFFER
+      bayes value 0.448 worlds [0.476, 0.408, 0.407, 0.501]; bayes x [('hypervoice', 0.71), ('calmmind-tera', 0.25), ('wish', 0.04)]
+      pure-pick values: argmax 0.322 nash 0.425 bayes 0.425; top pure [('hypervoice', 0.425), ('wish', 0.416), ('calmmind', 0.39)]
+T 5 opp=weezinggalar incin_in_play=False played=thunderbolt  argmax=thunderbolt nash=thunderbolt bayes=thunderbolt
+      bayes value 0.613 worlds [0.573, 0.578, 0.661, 0.64]; bayes x [('thunderbolt', 0.79), ('psychicnoise', 0.21)]
+      pure-pick values: argmax 0.607 nash 0.607 bayes 0.607; top pure [('thunderbolt', 0.607), ('calmmind', 0.584), ('psychicnoise', 0.575)]
+T 6 opp=weezinggalar incin_in_play=False played=psychicnoise  argmax=psychicnoise nash=darkpulse bayes=thunderbolt  <-- DIFFER
+      bayes value 0.586 worlds [0.57, 0.682, 0.661, 0.43]; bayes x [('thunderbolt', 0.52), ('psychicnoise', 0.37), ('darkpulse', 0.1)]
+      pure-pick values: argmax 0.553 nash 0.552 bayes 0.565; top pure [('thunderbolt', 0.565), ('psychicnoise', 0.553), ('darkpulse', 0.552)]
+T 7 opp=slitherwing incin_in_play=False played=switch sylveon  argmax=switch sylveon nash=switch sylveon bayes=switch sylveon
+      bayes value 0.340 worlds [0.379, 0.363, 0.278, 0.341]; bayes x [('switch sylveon', 0.85), ('psychicnoise', 0.11), ('thunderbolt', 0.03)]
+      pure-pick values: argmax 0.312 nash 0.312 bayes 0.312; top pure [('switch swampert', 0.333), ('switch sylveon', 0.312), ('darkpulse', 0.268)]
+T 8 opp=spectrier incin_in_play=False played=calmmind  argmax=calmmind nash=calmmind bayes=calmmind
+      bayes value 0.544 worlds [0.42, 0.585, 0.563, 0.606]; bayes x [('calmmind', 0.78), ('hypervoice', 0.22)]
+      pure-pick values: argmax 0.485 nash 0.485 bayes 0.485; top pure [('wish', 0.501), ('calmmind', 0.485), ('hypervoice', 0.423)]
+T 9 opp=spectrier incin_in_play=False played=wish  argmax=wish nash=wish bayes=wish
+      bayes value 0.536 worlds [0.516, 0.591, 0.445, 0.59]; bayes x [('wish', 0.81), ('protect', 0.19)]
+      pure-pick values: argmax 0.505 nash 0.505 bayes 0.505; top pure [('wish', 0.505), ('hypervoice', 0.416), ('wish-tera', 0.344)]
+T10 opp=spectrier incin_in_play=False played=protect  argmax=protect nash=protect bayes=protect
+      bayes value 0.433 worlds [0.449, 0.375, 0.453, 0.453]; bayes x [('protect', 0.56), ('calmmind', 0.44)]
+      pure-pick values: argmax 0.140 nash 0.140 bayes 0.140; top pure [('protect-tera', 0.24), ('hypervoice', 0.186), ('wish-tera', 0.167)]
+T11 opp=spectrier incin_in_play=False played=hypervoice  argmax=hypervoice nash=hypervoice bayes=hypervoice
+      bayes value 0.106 worlds [0.113, 0.092, 0.119, 0.099]; bayes x [('hypervoice', 1.0)]
+      pure-pick values: argmax 0.106 nash 0.106 bayes 0.106; top pure [('hypervoice', 0.106), ('protect', 0.099), ('protect-tera', 0.089)]
+T12 opp=spectrier incin_in_play=False played=hypervoice  argmax=hypervoice nash=hypervoice bayes=hypervoice
+      bayes value 0.075 worlds [0.08, 0.113, 0.033, 0.076]; bayes x [('hypervoice', 1.0)]
+      pure-pick values: argmax 0.075 nash 0.075 bayes 0.075; top pure [('hypervoice', 0.075), ('protect', 0.046), ('wish', 0.042)]
+T12 opp=spectrier incin_in_play=False played=switch reuniclus  argmax=switch reuniclus nash=switch reuniclus bayes=switch reuniclus
+      bayes value 0.063 worlds [0.066, 0.092, 0.052, 0.042]; bayes x [('switch reuniclus', 1.0)]
+      pure-pick values: argmax 0.063 nash 0.063 bayes 0.063; top pure [('switch reuniclus', 0.063), ('switch gothitelle', 0.057), ('switch swampert', 0.045)]
+T13 opp=spectrier incin_in_play=False played=psyshock-tera  argmax=psyshock-tera nash=psyshock-tera bayes=switch swampert  <-- DIFFER
+      bayes value 0.092 worlds [0.134, 0.072, 0.063, 0.101]; bayes x [('switch swampert', 0.63), ('psyshock-tera', 0.37)]
+      pure-pick values: argmax 0.011 nash 0.011 bayes 0.041; top pure [('switch swampert', 0.041), ('switch gothitelle', 0.022), ('recover', 0.02)]
+T14 opp=slitherwing incin_in_play=False played=switch excadrill  argmax=switch excadrill nash=switch excadrill bayes=calmmind  <-- DIFFER
+      bayes value 0.133 worlds [0.122, 0.249, 0.07, 0.09]; bayes x [('calmmind', 0.68), ('switch excadrill', 0.32)]
+      pure-pick values: argmax 0.090 nash 0.090 bayes 0.125; top pure [('calmmind', 0.125), ('psyshock', 0.124), ('focusblast', 0.124)]
+T15 opp=slitherwing incin_in_play=False played=switch reuniclus  argmax=switch reuniclus nash=switch reuniclus bayes=switch reuniclus
+      bayes value 0.289 worlds [0.317, 0.253, 0.317, 0.271]; bayes x [('switch reuniclus', 0.6), ('ironhead', 0.4)]
+      pure-pick values: argmax 0.216 nash 0.216 bayes 0.216; top pure [('ironhead', 0.269), ('switch swampert', 0.247), ('switch gothitelle', 0.241)]
+T15 opp=slitherwing incin_in_play=False played=switch excadrill  argmax=switch excadrill nash=switch excadrill bayes=switch excadrill
+      bayes value 0.317 worlds [0.195, 0.359, 0.267, 0.448]; bayes x [('switch excadrill', 1.0)]
+      pure-pick values: argmax 0.317 nash 0.317 bayes 0.317; top pure [('switch excadrill', 0.317), ('switch blastoise', 0.265), ('switch swampert', 0.205)]
+T16 opp=slitherwing incin_in_play=False played=ironhead  argmax=ironhead nash=switch swampert bayes=ironhead  <-- DIFFER
+      bayes value 0.336 worlds [0.158, 0.369, 0.453, 0.363]; bayes x [('ironhead', 0.57), ('switch swampert', 0.43)]
+      pure-pick values: argmax 0.314 nash 0.251 bayes 0.314; top pure [('ironhead', 0.314), ('switch swampert', 0.251), ('switch gothitelle', 0.223)]
+T17 opp=incineroar incin_in_play=True played=ironhead  argmax=ironhead nash=rapidspin bayes=ironhead  <-- DIFFER
+      bayes value 0.246 worlds [0.185, 0.2, 0.187, 0.414]; bayes x [('ironhead', 1.0)]
+      pure-pick values: argmax 0.246 nash 0.240 bayes 0.246; top pure [('ironhead', 0.246), ('rapidspin', 0.24), ('earthquake', 0.198)]
+T17 opp=incineroar incin_in_play=True played=switch blastoise  argmax=switch blastoise nash=switch blastoise bayes=switch blastoise
+      bayes value 0.446 worlds [0.679, 0.111, 0.682, 0.313]; bayes x [('switch blastoise', 1.0)]
+      pure-pick values: argmax 0.446 nash 0.446 bayes 0.446; top pure [('switch blastoise', 0.446), ('switch swampert', 0.266), ('switch gothitelle', 0.215)]
+T18 opp=incineroar incin_in_play=True played=shellsmash  argmax=shellsmash nash=shellsmash bayes=shellsmash
+      bayes value 0.380 worlds [0.363, 0.261, 0.413, 0.482]; bayes x [('shellsmash', 1.0)]
+      pure-pick values: argmax 0.380 nash 0.380 bayes 0.380; top pure [('shellsmash', 0.38), ('icebeam', 0.213), ('switch swampert', 0.191)]
+T19 opp=incineroar incin_in_play=True played=icebeam  argmax=icebeam nash=hydropump bayes=hydropump  <-- DIFFER
+      bayes value 0.468 worlds [0.301, 0.676, 0.725, 0.17]; bayes x [('hydropump', 0.63), ('earthquake', 0.23), ('icebeam', 0.14)]
+      pure-pick values: argmax 0.435 nash 0.455 bayes 0.455; top pure [('hydropump', 0.455), ('earthquake', 0.449), ('icebeam', 0.435)]
+T20 opp=emboar incin_in_play=True played=hydropump  argmax=hydropump nash=hydropump bayes=hydropump
+      bayes value 0.330 worlds [0.045, 0.612, 0.089, 0.573]; bayes x [('hydropump', 1.0)]
+      pure-pick values: argmax 0.330 nash 0.330 bayes 0.330; top pure [('hydropump', 0.33), ('icebeam', 0.184), ('earthquake', 0.165)]
+T21 opp=emboar incin_in_play=True played=earthquake  argmax=earthquake nash=earthquake bayes=earthquake
+      bayes value 0.190 worlds [0.185, 0.226, 0.144, 0.206]; bayes x [('earthquake', 0.58), ('hydropump', 0.22), ('shellsmash', 0.21)]
+      pure-pick values: argmax 0.167 nash 0.167 bayes 0.167; top pure [('hydropump', 0.171), ('earthquake', 0.167), ('icebeam', 0.097)]
+T21 opp=emboar incin_in_play=True played=switch gothitelle  argmax=switch gothitelle nash=switch gothitelle bayes=switch gothitelle
+      bayes value 0.062 worlds [0.016, 0.133, 0.018, 0.08]; bayes x [('switch gothitelle', 1.0)]
+      pure-pick values: argmax 0.062 nash 0.062 bayes 0.062; top pure [('switch gothitelle', 0.062), ('switch swampert', 0.057)]
+T22 opp=emboar incin_in_play=True played=darkpulse  argmax=darkpulse nash=darkpulse bayes=darkpulse
+      bayes value 0.077 worlds [0.165, 0.027, 0.012, 0.103]; bayes x [('darkpulse', 1.0)]
+      pure-pick values: argmax 0.077 nash 0.077 bayes 0.077; top pure [('darkpulse', 0.077), ('psychicnoise', 0.066), ('thunderbolt', 0.064)]
+T23 opp=incineroar incin_in_play=True played=switch swampert  argmax=switch swampert nash=switch swampert bayes=switch swampert
+      bayes value 0.114 worlds [0.236, 0.128, 0.04, 0.05]; bayes x [('switch swampert', 1.0)]
+      pure-pick values: argmax 0.114 nash 0.114 bayes 0.114; top pure [('switch swampert', 0.114), ('darkpulse', 0.082), ('thunderbolt', 0.068)]
+T24 opp=incineroar incin_in_play=True played=darkpulse  argmax=darkpulse nash=darkpulse bayes=darkpulse
+      bayes value 0.043 worlds [0.003, 0.087, 0.08, 0.003]; bayes x [('darkpulse', 1.0)]
+      pure-pick values: argmax 0.043 nash 0.043 bayes 0.043; top pure [('darkpulse', 0.043), ('thunderbolt', 0.031), ('calmmind', 0.0)]

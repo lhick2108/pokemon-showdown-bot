@@ -208,3 +208,159 @@ def aggregate_strategies(
         norm = sum(policy.values())
         policy = {c: p / norm for c, p in policy.items()}
     return policy
+
+
+# ---------------------------------------------------------------------------
+# Bayesian (cross-world) root solve
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BayesResult:
+    x: np.ndarray  # our single mixed strategy over the shared rows
+    value: float  # sum_w p_w min_j (x^T M_w)_j : guaranteed expected win prob
+    world_values: tuple  # per-world min_j (x^T M_w)_j
+    ys: tuple  # per-world opponent best-response (mixed) strategies from the LP dual / BR
+
+
+def bayes_world_values(x: np.ndarray, matrices: Sequence[np.ndarray]) -> list[float]:
+    """Each world's value ``min_j (x^T M_w)_j`` of our strategy ``x`` (opponent best-responds)."""
+    return [float((np.asarray(x) @ M).min()) for M in matrices]
+
+
+def bayes_value(
+    x: np.ndarray, matrices: Sequence[np.ndarray], weights: Sequence[float] | None = None
+) -> float:
+    """Bayesian objective ``sum_w p_w min_j (x^T M_w)_j`` (weights normalised)."""
+    vals = np.array(bayes_world_values(x, matrices))
+    p = _norm_weights(weights, len(matrices))
+    return float(p @ vals)
+
+
+def _norm_weights(weights: Sequence[float] | None, n: int) -> np.ndarray:
+    p = np.ones(n) if weights is None else np.asarray(weights, dtype=float)
+    if p.shape != (n,) or np.any(p < 0) or p.sum() <= 0:
+        raise ValueError("weights must be non-negative, one per world, with a positive sum")
+    return p / p.sum()
+
+
+def _check_worlds(matrices: Sequence[np.ndarray]) -> list[np.ndarray]:
+    mats = [np.asarray(M, dtype=float) for M in matrices]
+    if not mats:
+        raise ValueError("need at least one world")
+    m = mats[0].shape[0]
+    for M in mats:
+        if M.ndim != 2 or M.size == 0 or M.shape[0] != m:
+            raise ValueError("every world needs a non-empty matrix with the same row count")
+        if not np.all(np.isfinite(M)):
+            raise ValueError("payoff matrix has non-finite entries")
+    return mats
+
+
+def solve_bayes_lp(
+    matrices: Sequence[np.ndarray], weights: Sequence[float] | None = None
+) -> BayesResult | None:
+    """Exact solve of ``max_x sum_w p_w min_j (x^T M_w)_j`` by the simplex method.
+
+    We commit to one strategy ``x`` over the shared rows; each world's opponent knows
+    its own set and best-responds separately. LP over ``z = [x, v_1..v_W]``: maximise
+    ``sum p_w v_w`` s.t. ``v_w - (x^T B_w)_j <= 0`` for every world column and
+    ``sum x <= 1`` (``B_w = M_w - min + 1 > 0``, so the sum constraint is tight and all
+    right-hand sides are >= 0: the slack basis is feasible). Bland's rule. ``None`` if the
+    simplex fails to converge.
+    """
+    mats = _check_worlds(matrices)
+    p = _norm_weights(weights, len(mats))
+    m, W = mats[0].shape[0], len(mats)
+    lo = min(M.min() for M in mats)
+    Bs = [M - lo + 1.0 for M in mats]
+    rows = sum(M.shape[1] for M in Bs) + 1
+    nv = m + W
+    T = np.zeros((rows + 1, nv + rows + 1))
+    r = 0
+    owner = []
+    for w, B in enumerate(Bs):
+        for j in range(B.shape[1]):
+            T[r, :m] = -B[:, j]
+            T[r, m + w] = 1.0
+            owner.append((w, j))
+            r += 1
+    T[r, :m] = 1.0
+    T[:rows, nv : nv + rows] = np.eye(rows)
+    T[:rows, -1] = 0.0
+    T[r, -1] = 1.0
+    T[rows, m:nv] = -p  # objective row
+    basis = list(range(nv, nv + rows))
+    for _ in range(200 * (rows + nv) + 1000):
+        negative = np.flatnonzero(T[rows, :-1] < -1e-10)
+        if negative.size == 0:
+            break
+        col = int(negative[0])
+        column = T[:rows, col]
+        positive = column > 1e-10
+        if not positive.any():
+            return None
+        ratios = np.full(rows, np.inf)
+        ratios[positive] = T[:rows, -1][positive] / column[positive]
+        best = ratios.min()
+        ties = np.flatnonzero(ratios <= best + 1e-12)
+        pr = int(min(ties, key=lambda k: basis[k]))
+        T[pr] /= T[pr, col]
+        for k in range(rows + 1):
+            if k != pr and T[k, col] != 0.0:
+                T[k] -= T[k, col] * T[pr]
+        basis[pr] = col
+    else:
+        return None
+    z = np.zeros(nv + rows)
+    for k, b in enumerate(basis):
+        z[b] = T[k, -1]
+    x = np.maximum(z[:m], 0.0)
+    if x.sum() <= _EPS:
+        return None
+    x = x / x.sum()
+    duals = np.maximum(T[rows, nv : nv + rows - 1], 0.0)  # one per world column row
+    ys, off = [], 0
+    for B in Bs:
+        d = duals[off : off + B.shape[1]]
+        off += B.shape[1]
+        ys.append(d / d.sum() if d.sum() > _EPS else np.full(B.shape[1], 1.0 / B.shape[1]))
+    wv = bayes_world_values(x, mats)
+    return BayesResult(x, float(p @ np.array(wv)), tuple(wv), tuple(ys))
+
+
+def solve_bayes_rm(
+    matrices: Sequence[np.ndarray],
+    weights: Sequence[float] | None = None,
+    iterations: int = 20000,
+) -> BayesResult:
+    """Regret matching+ on ``x`` against per-world best responses (linear averaging)."""
+    mats = _check_worlds(matrices)
+    p = _norm_weights(weights, len(mats))
+    m = mats[0].shape[0]
+    reg = np.zeros(m)
+    x = np.full(m, 1.0 / m)
+    sx = np.zeros(m)
+    for t in range(1, iterations + 1):
+        u = np.zeros(m)
+        for pw, M in zip(p, mats):
+            u += pw * M[:, int(np.argmin(x @ M))]
+        reg = np.maximum(reg + u - x @ u, 0.0)
+        s = reg.sum()
+        x = reg / s if s > 0 else np.full(m, 1.0 / m)
+        sx += t * x
+    x = sx / sx.sum()
+    wv = bayes_world_values(x, mats)
+    ys = tuple(np.eye(M.shape[1])[int(np.argmin(x @ M))] for M in mats)
+    return BayesResult(x, float(p @ np.array(wv)), tuple(wv), ys)
+
+
+def solve_bayes(
+    matrices: Sequence[np.ndarray], weights: Sequence[float] | None = None
+) -> BayesResult:
+    """Bayesian cross-world solve: exact LP, regret matching if the simplex fails."""
+    mats = _check_worlds(matrices)
+    result = solve_bayes_lp(mats, weights)
+    if result is None:
+        result = solve_bayes_rm(mats, weights)
+    return result

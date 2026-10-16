@@ -29,7 +29,7 @@ only poke-env options), these environment variables:
     SHOWDOWN_SEARCH_PARALLELISM  pool processes (default 1)
     SHOWDOWN_SEARCH_WORLDS       fixed world count (default 2 x parallelism, 4x early)
     SHOWDOWN_SEARCH_THREADS      engine threads per world (default 1)
-    SHOWDOWN_SEARCH_MODE         "mixed" (default), "argmax" or "nash" (needs threads == 1)
+    SHOWDOWN_SEARCH_MODE         "mixed" (default), "argmax", "nash" or "bayes" (the last two need threads == 1)
     SHOWDOWN_SEARCH_NASH_PSEUDOCOUNT
                                  shrinkage pseudo-count c >= 0 for the joint matrix (default 5)
     SHOWDOWN_SEARCH_NASH_FLOOR   drop Nash actions below this share, in [0, 1) (default 0.03)
@@ -128,7 +128,8 @@ _DEFAULT_CACHE_DIR = _REPO_ROOT / ".cache" / "randbats"
 MIXED = "mixed"
 ARGMAX = "argmax"
 NASH = "nash"
-MODES = (MIXED, ARGMAX, NASH)
+BAYES = "bayes"
+MODES = (MIXED, ARGMAX, NASH, BAYES)
 NASH_PSEUDOCOUNT_ENV = "SHOWDOWN_SEARCH_NASH_PSEUDOCOUNT"
 NASH_FLOOR_ENV = "SHOWDOWN_SEARCH_NASH_FLOOR"
 DEFAULT_NASH_FLOOR = 0.03
@@ -237,6 +238,7 @@ class SearchConfig:
     prior_human: str | None = None  # human-policy .npz for prior_opp=human (default: opp_model)
     nash_pseudocount: float = nash_module.DEFAULT_PSEUDOCOUNT  # mode="nash": cell shrinkage c
     nash_floor: float = DEFAULT_NASH_FLOOR  # mode="nash": drop actions below this share
+    bayes_argmax: bool = False  # mode="bayes": play the strategy's best move instead of sampling it
     tendency: bool = False  # 589.40 opponent tendency model (implies nash-style root solve)
     tendency_kappa: float = tendency_module.DEFAULT_KAPPA  # prior pseudo-observations
     tendency_delta: float = tendency_module.DEFAULT_DELTA  # safe-exploitation loss bound
@@ -669,6 +671,53 @@ def aggregate_nash(
     return nash_module.aggregate_strategies(weighted, floor), records
 
 
+def aggregate_bayes(
+    results: list[WorldResult], pseudocount: float, floor: float = 0.0,
+    argmax: bool = False,
+) -> tuple[dict[str, float], dict[str, Any] | None]:
+    """One Bayesian root solve across worlds (mode ``bayes``).
+
+    We commit to a single mixed strategy over our root options (the same in every world,
+    since we cannot tell them apart); each world's opponent knows its own set and
+    best-responds separately: ``max_x sum_w p_w min_j (x^T M_w)_j`` with ``M_w`` the
+    shrunk root matrix and ``p_w`` uniform over the worlds that carried a matrix. Rows
+    are aligned by choice name over the choices every world offers. Returns the policy
+    (after the Nash floor; a one-hot best move when ``argmax``) and an info dict, or
+    ``({}, None)`` if no world carried a matrix (the caller falls back).
+    """
+    mats: list[Any] = []
+    names: list[list[str]] = []
+    for result in results:
+        if result[0] <= 0 or len(result) < 4 or result[3] is None or not result[1]:
+            continue
+        k2, cells = result[3]
+        options = result[1]
+        mats.append(nash_module.shrunk_matrix(len(options), int(k2), cells, pseudocount))
+        names.append([c for c, _v, _s in options])
+    if not mats:
+        return {}, None
+    common = [c for c in names[0] if all(c in n for n in names)]
+    if not common:
+        return {}, None
+    mismatch = any(set(n) != set(common) for n in names)
+    aligned = [M[[n.index(c) for c in common], :] for M, n in zip(mats, names)]
+    solved = nash_module.solve_bayes(aligned)
+    policy = {c: float(p) for c, p in zip(common, solved.x) if p > 0}
+    if floor > 0 and policy:
+        best = max(policy.values())
+        policy = {c: p for c, p in policy.items() if p >= floor or p == best}
+    if argmax and policy:
+        top = max(policy, key=policy.get)
+        policy = {top: 1.0}
+    norm = sum(policy.values())
+    policy = {c: p / norm for c, p in policy.items()}
+    info = {
+        "value": solved.value, "world_values": list(solved.world_values),
+        "rows": common, "row_mismatch": mismatch, "worlds": len(mats),
+    }
+    return policy, info
+
+
 def select_choice(
     policy: dict[str, float],
     mode: str,
@@ -686,7 +735,7 @@ def select_choice(
     ranked = sorted(policy.items(), key=lambda item: item[1], reverse=True)
     if mode == ARGMAX:
         return ranked[0][0]
-    if mode == NASH:
+    if mode in (NASH, BAYES):
         if ranked[0][1] <= 0:
             return ranked[0][0]
         return rng.choices([c for c, _ in ranked], weights=[m for _, m in ranked])[0]
@@ -766,8 +815,8 @@ def mode_for_record(config: SearchConfig) -> str:
 
 
 def needs_joint(config: SearchConfig) -> bool:
-    """Whether workers must return the root joint matrix (nash / tendency / human-model exploit)."""
-    return mode_for_record(config) == NASH or bool(config.opp_model)
+    """Whether workers must return the root joint matrix (nash / bayes / tendency / human-model exploit)."""
+    return mode_for_record(config) in (NASH, BAYES) or bool(config.opp_model)
 
 
 _HUMAN_MODELS: dict[str, Any] = {}
@@ -802,6 +851,7 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         mode: str | None = None,
         nash_pseudocount: float | None = None,
         nash_floor: float | None = None,
+        bayes_argmax: bool | None = None,
         tendency: bool | None = None,
         tendency_kappa: float | None = None,
         tendency_delta: float | None = None,
@@ -835,6 +885,8 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             self.config = dataclasses.replace(self.config, nash_pseudocount=float(nash_pseudocount))
         if nash_floor is not None:
             self.config = dataclasses.replace(self.config, nash_floor=float(nash_floor))
+        if bayes_argmax is not None:
+            self.config = dataclasses.replace(self.config, bayes_argmax=bool(bayes_argmax))
         if tendency is not None:
             self.config = dataclasses.replace(self.config, tendency=bool(tendency))
         if tendency_kappa is not None:
@@ -874,7 +926,7 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             self.config = cfg = dataclasses.replace(cfg, opp_model=str(Path(cfg.opp_model).resolve()))
             if cfg.threads > 1:
                 raise ValueError("opp_model needs threads == 1 (it uses the root joint matrix)")
-            if cfg.tendency or cfg.mode == NASH:
+            if cfg.tendency or cfg.mode in (NASH, BAYES):
                 raise ValueError("opp_model works on top of mode mixed or argmax (not nash / tendency)")
             if not (math.isfinite(cfg.exploit_delta) and 0 <= cfg.exploit_delta < 1):
                 raise ValueError(f"exploit_delta must be in [0, 1), got {cfg.exploit_delta}")
@@ -891,8 +943,8 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         if self.config.export_nodes and self.config.threads > 1:
             raise ValueError("export_nodes needs threads == 1 (the shared-tree search cannot export)")
         self._export_now = False
-        if self.config.mode == NASH and self.config.threads > 1:
-            raise ValueError("mode nash needs threads == 1 (the shared-tree search has no joint matrix)")
+        if self.config.mode in (NASH, BAYES) and self.config.threads > 1:
+            raise ValueError("mode nash / bayes needs threads == 1 (the shared-tree search has no joint matrix)")
         if not (math.isfinite(self.config.nash_pseudocount) and self.config.nash_pseudocount >= 0):
             raise ValueError(f"nash_pseudocount must be finite and >= 0, got {self.config.nash_pseudocount}")
         if not (math.isfinite(self.config.nash_floor) and 0 <= self.config.nash_floor < 1):
@@ -968,6 +1020,7 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         self.tendency_decisions = 0  # decisions where evidence moved the strategy
         self.last_choice: str | None = None
         self.last_changes: dict[str, Any] = {}
+        self.last_bayes: dict[str, Any] | None = None  # diagnostics of the last mode=bayes solve
         self.last_exploit: dict[str, Any] | None = None  # diagnostics of the last human-model exploit
         self._human_model = load_human_model(self.config.opp_model) if self.config.opp_model else None
         self._adapters: dict[str, human_exploit.ClassAdapter] = {}
@@ -1416,10 +1469,18 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             if not policy:  # no world carried a joint matrix: use the visit-share rule
                 logger.warning("No Nash policy in %s; using the mixed rule", battle.battle_tag)
                 mode = MIXED
+        elif mode == BAYES:
+            policy, info = aggregate_bayes(
+                results, self.config.nash_pseudocount, self.config.nash_floor, self.config.bayes_argmax
+            )
+            self.last_bayes = info
+            if not policy:
+                logger.warning("No Bayes policy in %s; using the mixed rule", battle.battle_tag)
+                mode = MIXED
         if not policy:
             policy = aggregate_policy(results)
         self.last_exploit = None
-        if self._human_model is not None and mode != NASH and states is not None:
+        if self._human_model is not None and mode not in (NASH, BAYES) and states is not None:
             try:
                 policy = self._exploit_policy(results, policy, battle, states)
             except Exception:  # the model must never cost a decision

@@ -87,6 +87,7 @@ SPEC_KEYS = {
                 "escalate_steps": int, "escalate_cap_ms": int, "prune_noop": int, "noop_switches": int,
                 "tera_margin": float, "ev2": str, "scale2": float,
                 "material": float, "ko_tiebreak": float,
+                "npc": float, "bargmax": int,
                 **ENDGAME_KEYS, **EXPLOIT_KEYS, **PRIOR_KEYS},
     # search + final move blended with the human model: p ~ search^(1-w) * human^w (players.humansearch)
     "humansearch": {"evaluator": str, "scale": float, "time_ms": int, "worlds": int,
@@ -97,6 +98,7 @@ SPEC_KEYS = {
                     "escalate_steps": int, "escalate_cap_ms": int, "prune_noop": int, "noop_switches": int,
                     "tera_margin": float, "ev2": str, "scale2": float,
                 "material": float, "ko_tiebreak": float,
+                    "npc": float, "bargmax": int,
                     **ENDGAME_KEYS, **EXPLOIT_KEYS, **PRIOR_KEYS, **HUMAN_BLEND_KEYS},
     "search-net": {"evaluator": str, "scale": float, "time_ms": int, "worlds": int,
                    "selection": str, "gamma": float, "mode": str,
@@ -106,6 +108,7 @@ SPEC_KEYS = {
                 "escalate_steps": int, "escalate_cap_ms": int, "prune_noop": int, "noop_switches": int,
                 "tera_margin": float, "ev2": str, "scale2": float,
                 "material": float, "ko_tiebreak": float,
+                "npc": float, "bargmax": int,
                 **ENDGAME_KEYS, **EXPLOIT_KEYS, **PRIOR_KEYS},
 }
 
@@ -195,8 +198,12 @@ def parse_spec(text: str) -> BotSpec:
                 raise ValueError(f"selection must be ucb1, exp3 or rm in bot spec {raw!r}")
             if key == "gamma" and not (math.isfinite(parsed) and 0 < parsed <= 1):
                 raise ValueError(f"gamma must be in (0, 1] in bot spec {raw!r}")
-            if key == "mode" and parsed.lower() not in ("mixed", "argmax", "nash"):
-                raise ValueError(f"mode must be mixed, argmax or nash in bot spec {raw!r}")
+            if key == "mode" and parsed.lower() not in ("mixed", "argmax", "nash", "bayes"):
+                raise ValueError(f"mode must be mixed, argmax, nash or bayes in bot spec {raw!r}")
+            if key == "bargmax" and parsed not in (0, 1):
+                raise ValueError(f"bargmax must be 0 or 1 in bot spec {raw!r}")
+            if key == "npc" and not (math.isfinite(parsed) and parsed >= 0):
+                raise ValueError(f"npc must be >= 0 in bot spec {raw!r}")
             if key == "endgame" and parsed.lower() not in ("off", "safest", "nash"):
                 raise ValueError(f"endgame must be off, safest or nash in bot spec {raw!r}")
             if key in ("eg_alive", "eg_ms", "eg_worlds", "eg_cap") and parsed < 1:
@@ -756,6 +763,10 @@ def _quality_kwargs(spec: BotSpec) -> dict:
     for key in ("escalate", "prune_noop"):
         if spec.param(key) is not None:
             out[key] = bool(spec.param(key))
+    if spec.param("npc") is not None:  # nash / bayes matrix pseudocount
+        out["nash_pseudocount"] = spec.param("npc")
+    if spec.param("bargmax") is not None:  # mode=bayes: play the best move instead of sampling
+        out["bayes_argmax"] = bool(spec.param("bargmax"))
     if spec.param("ev2") is not None:  # evaluator ensemble over worlds
         out["evaluator2"] = spec.param("ev2")
         out["evaluator2_scale"] = spec.param("scale2", 1.0)
@@ -1389,7 +1400,7 @@ def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     p.add_argument("--bots", help="comma-separated label=type[:key=value...] or plain type. Types: "
                    + ", ".join(sorted(bench.PLAYER_REGISTRY)) + ", foulplay. search keys: "
-                   "evaluator, scale, time_ms, worlds, selection (ucb1|exp3|rm), gamma, mode (mixed|argmax|nash), tendency (on|off), tkappa, tdelta, endgame (off|safest|nash), eg_alive, eg_side, eg_ms, eg_worlds, eg_cap, opp_model, opp_elo, exploit_delta, exploit_weight, exploit_kappa, exploit_gain (docs/human-policy.md), prior, prior_opp (self|none|human|path), c_puct, prior_eps, fpu, prior_human (docs/policy-prior.md). human keys: model, pick (sample|argmax), temp, elo. humansearch: search keys + model, w (human weight 0..1), pick, blend (geo|mix), temp, elo. e.g. net=search-net:evaluator=m.pev:scale=4:endgame=safest:eg_alive=5:eg_ms=1500")
+                   "evaluator, scale, time_ms, worlds, selection (ucb1|exp3|rm), gamma, mode (mixed|argmax|nash|bayes), npc (matrix pseudocount), bargmax (0|1, bayes picks its best move), tendency (on|off), tkappa, tdelta, endgame (off|safest|nash), eg_alive, eg_side, eg_ms, eg_worlds, eg_cap, opp_model, opp_elo, exploit_delta, exploit_weight, exploit_kappa, exploit_gain (docs/human-policy.md), prior, prior_opp (self|none|human|path), c_puct, prior_eps, fpu, prior_human (docs/policy-prior.md). human keys: model, pick (sample|argmax), temp, elo. humansearch: search keys + model, w (human weight 0..1), pick, blend (geo|mix), temp, elo. e.g. net=search-net:evaluator=m.pev:scale=4:endgame=safest:eg_alive=5:eg_ms=1500")
     p.add_argument("--games-per-pair", type=bench._positive_int, default=20)
     p.add_argument("--out", type=Path, help="output dir, e.g. data/league/<run-id>")
     p.add_argument("--rate-only", type=Path, metavar="DIR", help="recompute results from DIR/games.jsonl")
