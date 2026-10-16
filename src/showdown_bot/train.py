@@ -176,6 +176,7 @@ class Data:
     # auxiliary targets (--aux on): (N, aux.N_AUX) targets and 0/1 masks, see auxtargets.py
     aux_y: np.ndarray | None = None
     aux_m: np.ndarray | None = None
+    didx: np.ndarray | None = None  # decision index within its game record (turn - 1 for human data)
 
     @property
     def e(self) -> np.ndarray:
@@ -222,6 +223,7 @@ class Data:
             self.feature_version,
             None if self.aux_y is None else self.aux_y[idx],
             None if self.aux_m is None else self.aux_m[idx],
+            None if self.didx is None else self.didx[idx],
         )
 
 
@@ -531,7 +533,7 @@ def load_data(
         x, y, sample_weights(tags, weighting, mult), tags, strings, q,
         None if value_target == "outcome" else target,
         np.asarray(evals, dtype=np.float32), residual, e_sep, feature_version,
-        aux_y if aux_targets else None, aux_m if aux_targets else None,
+        aux_y if aux_targets else None, aux_m if aux_targets else None, didx,
     )
 
 

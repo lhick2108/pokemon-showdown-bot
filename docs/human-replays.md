@@ -145,3 +145,28 @@ legal sets are unchanged; write to a separate `--out` (e.g. `data/human/pc1-fp`)
 not mixed. Test: `tests/test_human_replays.py::test_first_person_states_do_not_leak_later_events`
 re-runs the sampler on a log cut at `|turn|k` and requires the identical state at turn k.
 Throughput is about 2.4x slower than the hindsight mode.
+
+## Aux targets (`aux` field of each decision)
+
+Every value-record decision carries `aux`, derived from the protocol log (`game_facts`, `build_aux`):
+
+```
+{"turns_left": T_last - turn,            # last |turn|N of the game minus this decision turn
+ "final_alive": [own, opp],              # alive count at game end, actor side first
+ "own": {"ident": [6 x str|null], "alive_end": [6 x 0|1|-1], "kos": [6 x int], "kos_after": [6 x int]},
+ "opp": {same four arrays}}
+```
+
+Arrays are aligned with the decision's engine `State` string: index i = `side_one.pokemon[i]` (own) /
+`side_two.pokemon[i]` (opp), so slot 0 is the active Pokemon (the feature slot order). `ident` is the log's
+ident name (the species id in randbats) and is `null` for an unidentified slot. `alive_end` is 1 if the
+Pokemon never fainted, 0 if it did, -1 unknown; `kos` is the whole-game count of KOs the Pokemon scored,
+`kos_after` those scored at turn >= this decision turn (the future part). Own side: all six are always
+identified (the hindsight team). Opp side, hindsight mode: revealed Pokemon are identified, the never-
+revealed slots have `ident` null and `alive_end` 1 (never entered, so never fainted). Opp side,
+first-person mode: only Pokemon seen by that turn are identified; filler slots have `ident` null and
+`alive_end` -1 (they may stand for a Pokemon revealed, and possibly fainted, later). KO credit: user of the
+latest `|move|` for plain fatal damage, `[of]` mon for `[from]` damage (Rocky Helmet, ...); status,
+weather, hazards, recoil and self-KOs credit nobody (Future Sight is credited to the latest mover).
+
+Baseline: `scripts/hindsight_gap.py` trains the MLP on one conversion mode and scores it on both.
