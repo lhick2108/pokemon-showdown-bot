@@ -34,7 +34,7 @@ from poke_env import to_id_str
 from poke_env.player import Player
 from poke_env.ps_client import AccountConfiguration, LocalhostServerConfiguration
 
-from showdown_bot import bench, compute
+from showdown_bot import bench, compute, sprt
 from showdown_bot import teams as teams_module
 from showdown_bot.bench import FOULPLAY_NAME
 
@@ -669,9 +669,38 @@ class LeagueConfig:
     team_seed: int = 0
     port: int = 8000
     strict_compute: bool = False  # refuse to start when search_workers > cores - 2
+    strict_workers: bool = False  # cap concurrency so peak world-job demand <= search workers
+    sprt: sprt.SprtConfig | None = None  # sequential paired-game test (two bots, bot 1 = candidate)
     stall_dump_s: float = 180.0  # no game finished for this long: dump stacks + pool state (0: off)
     specs: dict = field(default_factory=dict)  # label -> BotSpec
     compute: dict = field(default_factory=dict)  # filled by run_league: preflight + throughput
+
+
+@dataclass
+class SprtState:
+    """Pentanomial counts of a running SPRT matchup (bot ``a`` is the candidate)."""
+
+    cfg: sprt.SprtConfig
+    counts: list = field(default_factory=lambda: [0] * 5)
+    verdict: str | None = None  # H1 | H0 | max once decided
+
+    def add_pair(self, points: float) -> str | None:
+        """Count a finished pair; the first verdict reached is kept."""
+        if self.verdict is None:
+            self.counts[sprt.pair_index(points)] += 1
+            self.verdict = sprt.decide(self.counts, self.cfg)
+        return self.verdict
+
+    def to_dict(self) -> dict:
+        elo, lo, hi = sprt.elo_estimate(self.counts)
+        return {"elo0": self.cfg.elo0, "elo1": self.cfg.elo1, "alpha": self.cfg.alpha,
+                "beta": self.cfg.beta, "max_games": self.cfg.max_games,
+                "min_pairs": self.cfg.min_pairs, "pairs": sum(self.counts),
+                "counts": list(self.counts),
+                "llr": sprt.llr(self.counts, self.cfg.elo0, self.cfg.elo1),
+                "bounds": list(self.cfg.bounds), "verdict": self.verdict or "max",
+                "verdict_text": sprt.VERDICTS[self.verdict or "max"],
+                "elo": elo, "elo_ci": [lo, hi]}
 
 
 class Tracker:
@@ -683,6 +712,8 @@ class Tracker:
         self.by_label: dict[str, list[Player]] = {}  # bot label -> its players (throughput)
         self.live: dict[tuple[str, str], tuple[Player, Player]] = {}  # running matchups
         self.finished: dict[tuple[str, str], list[Game]] = {}  # completed matchups
+        self.lanes: dict[tuple[str, str], list[tuple[Player, Player]]] = {}  # SPRT player lanes
+        self.sprt: dict[tuple[str, str], SprtState] = {}
 
     def add(self, label: str, player: Player) -> None:
         self.players.append(player)
@@ -699,6 +730,12 @@ class Tracker:
                 continue
             ties = pa.n_tied_battles
             rows.append((a, b, pa.n_won_battles, pb.n_won_battles, ties))
+        for (a, b), lanes in self.lanes.items():
+            if (a, b) in self.finished:
+                continue
+            rows.append((a, b, sum(pa.n_won_battles for pa, _ in lanes),
+                         sum(pb.n_won_battles for _, pb in lanes),
+                         sum(pa.n_tied_battles for pa, _ in lanes)))
         return rows
 
     def open_connections(self) -> list[str]:
@@ -879,6 +916,8 @@ async def play_matchup(a: str, b: str, cfg: LeagueConfig, tracker: Tracker, reco
         if cfg.teams != "random":  # Foul Play brings its own team in a normal random battle
             cfg = replace(cfg, teams="random", battle_format=cfg.requested_format)
         return await _play_foulplay_matchup(a, b, cfg, tracker, recorder, games_path, pair_index)
+    if cfg.sprt is not None:
+        return await _play_sprt_matchup(a, b, cfg, tracker, recorder, games_path, pair_index)
     plans = None
     if cfg.teams != "random":
         if cfg.concurrency != 1:
@@ -927,6 +966,78 @@ async def play_matchup(a: str, b: str, cfg: LeagueConfig, tracker: Tracker, reco
     finally:
         await asyncio.gather(*(bench._disconnect_player(p) for p in players),
                              return_exceptions=True)
+    return games
+
+
+async def _play_sprt_matchup(a, b, cfg, tracker, recorder, games_path, pair_index):
+    """Paired games until the SPRT decides (or ``cfg.sprt.max_games``).
+
+    ``cfg.concurrency`` lanes each own a player for ``a`` and one for ``b`` (poke-env keeps one
+    team per player) and play whole pairs (two games, same teams, seats swapped) one after the
+    other. ``a`` (the candidate) scores each pair 0..2; the verdict is frozen at the first
+    crossing and pairs still in flight are cancelled.
+    """
+    state = SprtState(cfg.sprt)
+    tracker.sprt[(a, b)] = state
+    seed = cfg.team_seed * 1000 + pair_index
+    plans = teams_module.plan_games(cfg.teams, 2 * cfg.sprt.max_pairs, seed)
+    pairs = [plans[i:i + 2] for i in range(0, len(plans), 2)]
+    next_pair = iter(range(len(pairs)))
+    players: list[Player] = []
+    games: list[Game] = []
+
+    async def lane(i: int) -> None:
+        pa = _make_player(cfg.specs[a], cfg, recorder, 1, 2 * (64 * pair_index + i))
+        players.append(pa)
+        tracker.add(a, pa)
+        pb = _make_player(cfg.specs[b], cfg, recorder, 1, 2 * (64 * pair_index + i) + 1)
+        players.append(pb)
+        tracker.add(b, pb)
+        tracker.lanes.setdefault((a, b), []).append((pa, pb))
+        await bench._wait_for_player_logins([pa, pb], cfg.connect_timeout)
+        by_name = {a: pa, b: pb}
+        seen: set = set()
+        while state.verdict is None:
+            k = next(next_pair, None)
+            if k is None:
+                return
+            points = 0.0
+            for plan in pairs[k]:
+                try:
+                    p1_player, _ = await teams_module.play_plan(
+                        plan, pa, pb, cfg.game_timeout, mode=cfg.teams, seed=seed)
+                except TimeoutError:
+                    raise RuntimeError(f"{a} vs {b}: game {plan.index} timed out") from None
+                p1_name, p2_name = (a, b) if plan.a_is_p1 else (b, a)
+                for g in _new_games(p1_name, p1_player, p2_name, by_name[p2_name].username,
+                                    seen, cfg, cfg.seed, plan):
+                    append_game(games_path, g)
+                    games.append(g)
+                    points += g.score_for(a)
+            state.add_pair(points)
+
+    tasks = [asyncio.ensure_future(lane(i)) for i in range(cfg.concurrency)]
+    try:
+        pending = set(tasks)
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for t in done:
+                t.result()  # a failed lane aborts the matchup
+            if state.verdict is not None:
+                break
+        for t in pending:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    except BaseException:
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+    finally:
+        await asyncio.gather(*(bench._disconnect_player(p) for p in players),
+                             return_exceptions=True)
+    if state.verdict is None:  # every lane ran out of pairs
+        state.verdict = "max"
     return games
 
 
@@ -1017,6 +1128,29 @@ def load_report(pairs: Sequence[tuple[BotSpec, BotSpec]], cfg: LeagueConfig,
     return line, warning
 
 
+def _worlds(spec: BotSpec) -> int:
+    from showdown_bot.players.search import SearchConfig
+
+    return spec.param("worlds") or SearchConfig().plan(True)[0]
+
+
+def strict_concurrency(specs: Sequence[BotSpec], cfg: LeagueConfig) -> int:
+    """Largest games-in-flight count <= ``cfg.concurrency`` whose peak world-job demand
+    (both players of a game search ``worlds`` worlds at once, over the busiest
+    ``parallel_pairs`` matchups) fits in the worker pool; at least 1."""
+    from showdown_bot.players.search import SearchConfig
+
+    by = {s.label: s for s in specs}
+    per_game = sorted(
+        (sum(_worlds(x) for x in (by[a], by[b]) if x.type in SEARCH_BOTS)
+         for a, b in roundrobin_pairs(list(by))), reverse=True)
+    demand = sum(per_game[: cfg.parallel_pairs])
+    if demand == 0:
+        return cfg.concurrency
+    workers = cfg.search_workers or SearchConfig().parallelism
+    return max(1, min(cfg.concurrency, workers // demand))
+
+
 def league_preflight(specs: Sequence[BotSpec], cfg: LeagueConfig,
                      cpu_count: int | None = None) -> tuple[dict, list[str], bool]:
     """Compute preflight: pool workers vs cores and peak concurrent world jobs vs workers.
@@ -1027,12 +1161,9 @@ def league_preflight(specs: Sequence[BotSpec], cfg: LeagueConfig,
     """
     from showdown_bot.players.search import SearchConfig
 
-    def worlds(spec: BotSpec) -> int:
-        return spec.param("worlds") or SearchConfig().plan(True)[0]
-
     by = {s.label: s for s in specs}
     per_pair = sorted(
-        (sum(worlds(x) * cfg.concurrency for x in (by[a], by[b]) if x.type in SEARCH_BOTS)
+        (sum(_worlds(x) * cfg.concurrency for x in (by[a], by[b]) if x.type in SEARCH_BOTS)
          for a, b in roundrobin_pairs(list(by))), reverse=True)
     demand = sum(per_pair[: cfg.parallel_pairs])
     workers = cfg.search_workers or SearchConfig().parallelism  # per-player default pool
@@ -1077,6 +1208,11 @@ def emit_progress(tracker: Tracker, printer: compute.ProgressPrinter) -> None:
         return
     a, b, w1, w2, t = pick[0]
     others = "; ".join(f"{x} {p}-{q} {y}" for x, y, p, q, _ in pick[1:4])
+    state = tracker.sprt.get((a, b))
+    if state is not None:
+        elo, lo, hi = sprt.elo_estimate(state.counts)
+        others = (f"{sprt.status_text(state.counts, state.cfg)} Elo {elo:+.1f} "
+                  f"[{lo:+.1f}, {hi:+.1f}]")
     printer.update(done, f"{a} v {b}", w1, w2, t, others or None)
 
 
@@ -1151,6 +1287,17 @@ async def run_league(specs: Sequence[BotSpec], cfg: LeagueConfig) -> tuple[list[
     (cfg.out / "replays").mkdir(exist_ok=True)
     cfg.specs = {s.label: s for s in specs}
     labels = [s.label for s in specs]
+    if cfg.sprt is not None:
+        if len(specs) != 2 or any(s.type == FOULPLAY_NAME for s in specs):
+            raise ValueError("--sprt needs exactly two of our own bots (candidate first, then "
+                             "baseline); Foul Play is not supported")
+        if cfg.teams == "random":
+            raise ValueError("--sprt plays paired games: use --teams swap or mirror")
+    if cfg.strict_workers:
+        chosen = strict_concurrency(specs, cfg)
+        logger.info("strict workers: concurrency %d (requested %d), search workers %s",
+                    chosen, cfg.concurrency, cfg.search_workers or "default")
+        cfg.concurrency = chosen
     games_path = cfg.out / "games.jsonl"
     games_path.write_text("", encoding="utf-8")
     recorder = None
@@ -1187,6 +1334,10 @@ async def run_league(specs: Sequence[BotSpec], cfg: LeagueConfig) -> tuple[list[
         return job
 
     total = len(pairs) * cfg.games_per_pair
+    if cfg.sprt is not None:
+        logger.info("SPRT: elo0 %g elo1 %g alpha %g beta %g, bounds [%.2f, %.2f], max %d games, "
+                    "%d lane(s)", cfg.sprt.elo0, cfg.sprt.elo1, cfg.sprt.alpha, cfg.sprt.beta,
+                    *cfg.sprt.bounds, cfg.sprt.max_games, cfg.concurrency)
     ticker = asyncio.ensure_future(_progress(tracker, total, stall_s=cfg.stall_dump_s))
     try:
         results = await run_limited(
@@ -1202,6 +1353,8 @@ async def run_league(specs: Sequence[BotSpec], cfg: LeagueConfig) -> tuple[list[
             escalations=r["escalations"], fallbacks=r["fallbacks"],
             world_errors=r["world_errors"]))
     all_games = [g for got in results for g in got]
+    if tracker.sprt:
+        cfg.compute["sprt"] = next(iter(tracker.sprt.values())).to_dict()
     await asyncio.sleep(0.2)
     leaks = tracker.open_connections()
     leaks += [f"pending asyncio task: {t.get_coro()}" for t in asyncio.all_tasks()
@@ -1269,6 +1422,16 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--strict-compute", action="store_true",
                    help="refuse to start when --search-workers > cores - 2 (room for the main "
                         "process and the node server); otherwise only warn")
+    p.add_argument("--sprt", metavar="ELO0,ELO1[,ALPHA,BETA]", default=None,
+                   help="sequential test on paired games (two bots: candidate first, then "
+                        "baseline): H0 elo0 vs H1 elo1 in logistic Elo, default alpha=beta=0.05. "
+                        "Implies --teams swap and --strict-workers; stops at the verdict or "
+                        "--max-games. --concurrency is then the number of pair lanes")
+    p.add_argument("--max-games", type=bench._positive_int, default=2000,
+                   help="with --sprt: game budget (even; 2 per pair)")
+    p.add_argument("--strict-workers", action=argparse.BooleanOptionalAction, default=None,
+                   help="cap --concurrency so concurrency x 2 x worlds <= --search-workers "
+                        "(default on with --sprt)")
     p.add_argument("--bootstrap", type=int, default=1000)
     p.add_argument("--anchor", default=None, help="bot whose rating is 0 (default: mean 0)")
     return p
@@ -1295,6 +1458,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    sprt_cfg = None
+    if args.sprt is not None:
+        if args.max_games % 2:
+            print("error: --max-games must be even with --sprt", file=sys.stderr)
+            return 2
+        try:
+            sprt_cfg = sprt.parse_sprt(args.sprt, args.max_games)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        if args.teams == "random":
+            args.teams = "swap"
+        args.games_per_pair = args.max_games
     cfg = LeagueConfig(
         out=args.out, battle_format=args.format, games_per_pair=args.games_per_pair,
         concurrency=args.concurrency, connect_timeout=args.connect_timeout,
@@ -1304,6 +1480,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         search_workers=args.search_workers, parallel_pairs=args.parallel_pairs,
         teams=args.teams, team_seed=args.team_seed, port=args.port,
         strict_compute=args.strict_compute, stall_dump_s=args.stall_dump_s,
+        strict_workers=(sprt_cfg is not None) if args.strict_workers is None
+        else args.strict_workers,
+        sprt=sprt_cfg,
     )
     if args.teams != "random" and args.games_per_pair % 2:
         print(f"error: --teams {args.teams} needs an even --games-per-pair", file=sys.stderr)
@@ -1324,6 +1503,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                "specs": {s.label: s.text for s in specs}},
     )
     print(format_markdown(res))
+    verdict = cfg.compute.get("sprt")
+    if verdict:
+        print(verdict["verdict_text"])
+        print(sprt.summary_text(verdict["counts"], sprt_cfg))
     if leaks:
         print(f"WARNING: {len(leaks)} leaked resources: {leaks}", file=sys.stderr)
         return 3

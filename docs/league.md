@@ -113,3 +113,38 @@ Search-net spec keys for positions the evaluator rates as decided:
   has mean score within eps, play the KO option. Counted as `ko_tiebreaks` in the search stats.
 
 e.g. `net=search-net:evaluator=m.pev:scale=4:material=0.05:ko_tiebreak=0.01`
+
+## SPRT duel (`--sprt`)
+
+Instead of a fixed number of games, play paired games until a sequential probability ratio test
+decides, as Fishtest does for chess engines. Exactly two of our bots: the candidate first, the
+baseline second.
+
+```
+python -m showdown_bot.league \
+    --bots "cand=search-net:evaluator=models/new.pev:scale=1.5:mode=argmax:time_ms=1000:worlds=4,best=search-net:evaluator=models/gen2-res-searchabs-mlp16.pev:scale=1.5:mode=argmax:time_ms=1000:worlds=4" \
+    --sprt 0,21 --max-games 2000 --search-workers 32 --concurrency 4 \
+    --out data/league/sprt-new-vs-best --seed 1
+```
+
+- `--sprt elo0,elo1[,alpha,beta]` (defaults alpha = beta = 0.05; `0,21` is about +3 points).
+  Implies `--teams swap` (a pair = two games, same two generated teams, seats swapped, see
+  `showdown_bot/teams.py`; `--teams mirror` also works) and `--strict-workers`. `--max-games`
+  (even, default 2000) is the budget; `--games-per-pair` is ignored.
+- `--concurrency` is the number of pair lanes. Each lane owns a candidate and a baseline player
+  and plays its pairs back to back; the lanes share the `--search-workers` pool.
+- `--strict-workers` (`--no-strict-workers` to disable): lowers `--concurrency` so that
+  `concurrency x (worlds of both players) <= --search-workers`; the chosen value is logged
+  (`strict workers: concurrency N (requested M)`). Without it the league only warns
+  ("peak demand ... > workers") and games queue for the pool, which inflates decision time.
+- Test: each finished pair gives the candidate 0, 0.5, 1, 1.5 or 2 points; counts are kept as
+  the pentanomial `[0, 0.5, 1, 1.5, 2]`. LLR = `N (s1-s0)(2s-s0-s1) / (2 var)` (the normal GSPRT
+  approximation of Fishtest and fastchess, `src/showdown_bot/sprt.py`), `s` the mean pair
+  score in [0, 1], `s0, s1` the logistic scores of elo0 and elo1, zero counts regularised to
+  1e-3. Bounds: `ln(beta/(1-alpha))` and `ln((1-beta)/alpha)` (about +-2.94). No verdict is
+  given before 20 pairs. The verdict is frozen at the first crossing; pairs in flight are
+  cancelled (their games stay in `games.jsonl` but are not counted).
+- Every progress line shows `SPRT LLR x [lo, hi] pairs [n0, n1, n2, n3, n4] Elo +e [lo, hi]`.
+  The run ends with `SPRT: H1 accepted`, `SPRT: H0 accepted` or `SPRT: inconclusive at max games`
+  and the Elo estimate with its 95% CI. The same is stored in `results.json` under
+  `compute.sprt`.

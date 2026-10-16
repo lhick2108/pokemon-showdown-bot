@@ -251,3 +251,86 @@ def test_parse_spec_mode_key():
     assert spec.param("mode") == "nash" and spec.param("time_ms") == 50
     with pytest.raises(ValueError):
         league.parse_spec("x=search:mode=bogus")
+
+
+def test_strict_concurrency_caps_to_workers(tmp_path):
+    specs = league.parse_bots("a=search:worlds=4,b=search:worlds=4")
+    cfg = league.LeagueConfig(out=tmp_path, concurrency=8, search_workers=32)
+    assert league.strict_concurrency(specs, cfg) == 4  # 32 // (4 + 4)
+    cfg = league.LeagueConfig(out=tmp_path, concurrency=2, search_workers=32)
+    assert league.strict_concurrency(specs, cfg) == 2  # never raised above the request
+    cfg = league.LeagueConfig(out=tmp_path, concurrency=8, search_workers=5)
+    assert league.strict_concurrency(specs, cfg) == 1  # at least one lane
+    cfg = league.LeagueConfig(out=tmp_path, concurrency=6, search_workers=16, parallel_pairs=1)
+    mixed = league.parse_bots("a=search:worlds=2,b=random")
+    assert league.strict_concurrency(mixed, cfg) == 6  # 16 // 2 = 8 >= 6
+    plain = league.parse_bots("random,maxpower")
+    assert league.strict_concurrency(plain, cfg) == 6  # no search demand
+
+
+def test_sprt_state_counts_pairs_and_freezes_verdict():
+    from showdown_bot import sprt
+
+    state = league.SprtState(sprt.SprtConfig(max_games=40, min_pairs=5))
+    for pts in (2, 1.5, 2, 2, 1.5, 2, 2, 2):
+        state.add_pair(pts)
+    assert state.verdict == "H1"
+    frozen = list(state.counts)
+    state.add_pair(0)
+    assert state.counts == frozen and state.verdict == "H1"
+    d = state.to_dict()
+    assert d["verdict_text"] == "SPRT: H1 accepted" and d["pairs"] == sum(frozen)
+
+
+def test_tally_sums_sprt_lanes():
+    class P:
+        def __init__(self, w, t=0):
+            self.n_won_battles, self.n_tied_battles = w, t
+
+    tr = league.Tracker()
+    tr.lanes[("a", "b")] = [(P(2), P(1)), (P(3, 1), P(0))]
+    assert tr.tally() == [("a", "b", 5, 1, 1)]
+
+
+def test_play_sprt_matchup_stops_at_verdict(tmp_path, monkeypatch):
+    import asyncio
+
+    from showdown_bot import bench, sprt, teams
+
+    class FakePlayer:
+        n_won_battles = n_tied_battles = 0
+        username = "u"
+
+    async def noop(*a, **k):
+        return None
+
+    plans = [teams.GamePlan(i, i // 2, "t", "t", 0, 1, i % 2 == 0) for i in range(400)]
+    monkeypatch.setattr(league, "_make_player", lambda *a, **k: FakePlayer())
+    monkeypatch.setattr(bench, "_wait_for_player_logins", noop)
+    monkeypatch.setattr(bench, "_disconnect_player", noop)
+    monkeypatch.setattr(teams, "plan_games", lambda *a, **k: plans)
+
+    async def play_plan(plan, a, b, timeout, **k):
+        await asyncio.sleep(0)
+        return a, b
+
+    monkeypatch.setattr(teams, "play_plan", play_plan)
+
+    def new_games(p1, player, p2, user, seen, cfg, seed, plan):  # candidate "cand" always wins
+        winner = "cand"
+        return [Game(f"g{plan.index}", p1, p2, winner, 10, team_mode="swap", team_pair=plan.pair)]
+
+    monkeypatch.setattr(league, "_new_games", new_games)
+    specs = league.parse_bots("cand=random,base=maxpower")
+    cfg = league.LeagueConfig(out=tmp_path, concurrency=3, teams="swap",
+                              sprt=sprt.SprtConfig(max_games=400, min_pairs=5))
+    cfg.specs = {s.label: s for s in specs}
+    tracker = league.Tracker()
+    (tmp_path / "games.jsonl").write_text("")
+    games = asyncio.run(league.play_matchup("cand", "base", cfg, tracker, None,
+                                            tmp_path / "games.jsonl", 0))
+    state = tracker.sprt[("cand", "base")]
+    assert state.verdict == "H1"
+    assert state.counts[4] >= 5 and sum(state.counts) == state.counts[4]
+    assert len(games) < 400  # stopped early
+    assert len(tracker.lanes[("cand", "base")]) == 3
