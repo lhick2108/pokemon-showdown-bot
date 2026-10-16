@@ -343,3 +343,46 @@ def write_mlp(
             _pack(2, hidden, w1f, b1f, w2f, [float(b2)], stock_coef=stock_coef,
                   feature_version=feature_version)
         )
+
+
+def write_mlp_embed(
+    path, w1, b1, w2, b2: float, tables, dims, stock_coef: float = 0.0
+) -> None:
+    """Write a feature-version-4 MLP evaluator with learned identity embeddings (format 3).
+
+    ``w1`` is ``[hidden][FEATURE_LENGTH_V4 + 12 * sum(dims)]`` (torch ``nn.Linear`` layout: the
+    dense columns, then per Pokemon slot -- own 0..5, opp 0..5 -- the species, item, ability and
+    mean-pooled move embeddings). ``tables`` are the four embedding matrices (species, item,
+    ability, move), each ``[identity_vocab_sizes()[t]][dims[t]]`` row-major; ``dims`` the four
+    embedding widths. The vocabulary fingerprint of this engine is recorded in the file. See
+    ``docs/features-v4.md``.
+    """
+    dims = [int(d) for d in dims]
+    if len(dims) != 4 or len(tables) != 4:
+        raise ValueError("dims and tables need 4 entries (species, item, ability, move)")
+    w1f, b1f, w2f = _flat(w1), _flat(b1), _flat(w2)
+    hidden = len(b1f)
+    n_dense = feature_length(4)
+    n_total = n_dense + 12 * sum(dims)
+    if hidden == 0 or len(w1f) != hidden * n_total or len(w2f) != hidden:
+        raise ValueError(
+            f"inconsistent shapes: w1={len(w1f)} (want {hidden}*{n_total}), "
+            f"b1={hidden}, w2={len(w2f)}"
+        )
+    tabs = [_flat(t) for t in tables]
+    for t, (tab, d, rows) in enumerate(zip(tabs, dims, identity_vocab_sizes())):
+        if d <= 0 or len(tab) != rows * d:
+            raise ValueError(f"table {t}: {len(tab)} floats, want {rows}*{d}")
+    flags = 1 if stock_coef != 0.0 else 0
+    header = (
+        _MAGIC
+        + struct.pack("<5I", 3, 4, 2, n_dense, hidden)
+        + struct.pack("<If", flags, float(stock_coef))
+        + struct.pack("<Q", identity_vocab_hash())
+        + struct.pack("<4I", *dims)
+    )
+    body = b"".join(
+        struct.pack(f"<{len(a)}f", *a) for a in (w1f, b1f, w2f, [float(b2)], *tabs)
+    )
+    with open(path, "wb") as f:
+        f.write(header + body)

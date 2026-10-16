@@ -97,6 +97,17 @@ Augmentation and regularisation (training batches only; validation is never touc
     See ``showdown_bot.augment``. ``--dropout P`` adds dropout between the hidden
     ReLU and the output layer during training only; the export is unaffected.
 
+Feature version 4 and identity embeddings (``--features v4``, bead showdown-bot-589.65)
+    The row is the dense v2 ++ v3 features (2379 values) followed by the 84 identity indices
+    (species, item, ability, 4 moves for each of the 12 Pokemon slots, see
+    ``docs/features-v4.md``) stored as numbers in the same matrix. ``EmbedMLP`` looks each index
+    up in a learned table (``--embed-dim`` 8 or ``S,I,A,M``; the 4 moves are mean-pooled) and
+    feeds ``[dense, concatenated slot embeddings]`` to ``Linear(., --hidden) -> ReLU ->
+    Linear(hidden, 1)``. ``--residual``, ``--init``, ``--dropout`` and every ``--value-target``
+    work as for v1-v3; ``--augment-*`` and ``--aux`` do not. The export is a format-3 ``.pev``
+    (engine ``Evaluator.load``) plus ``<out>.vocab.json`` recording the vocabulary fingerprint.
+    Human pretrain, then self-play fine-tune: see docs/training.md.
+
 Device: cuda when available, else cpu (``--device`` overrides).
 """
 
@@ -562,13 +573,79 @@ def split_by_battle(
 # ---------------------------------------------------------------------------
 
 
+N_SLOTS = 12  # identity slots: own 0..5, opp 0..5
+IDS_PER_SLOT = 7  # species, item, ability, move0..3
+N_IDS = N_SLOTS * IDS_PER_SLOT
+EMBED_TABLES = ("species", "item", "ability", "move")
+
+
+def parse_embed_dims(spec: str | int | tuple | list) -> tuple[int, int, int, int]:
+    """``8`` -> (8, 8, 8, 8); ``"8"`` likewise; ``"16,8,8,8"`` -> species, item, ability, move."""
+    if isinstance(spec, int):
+        parts = [spec]
+    elif isinstance(spec, (tuple, list)):
+        parts = [int(v) for v in spec]
+    else:
+        parts = [int(v) for v in str(spec).split(",")]
+    if len(parts) == 1:
+        parts = parts * 4
+    if len(parts) != 4 or any(v < 1 or v > 1024 for v in parts):
+        raise ValueError(f"--embed-dim needs 1 or 4 integers in 1..1024, got {spec!r}")
+    return tuple(parts)  # type: ignore[return-value]
+
+
+class EmbedMLP(nn.Module):
+    """Feature version 4 value net: ``relu(l1([dense, slot embeddings])) -> out``.
+
+    Input row: ``n_dense`` dense features followed by the ``N_IDS`` identity indices (floats).
+    Per slot the species, item and ability embeddings and the MEAN of the four move embeddings
+    are concatenated (slot-major, own 0..5 then opp 0..5) after the dense part: exactly the
+    column order of the engine's first layer (``learned.rs``, ``Embed::fill_inputs``). Index 0
+    = pad (fainted), 1 = unknown, else engine enum id + 2.
+    """
+
+    def __init__(self, n_dense: int, hidden: int, dims: tuple[int, ...], vocab: tuple[int, ...],
+                 dropout: float = 0.0):
+        super().__init__()
+        self.n_dense = n_dense
+        self.dims = tuple(dims)
+        self.vocab = tuple(vocab)
+        self.emb = nn.ModuleList([nn.Embedding(v, d) for v, d in zip(vocab, dims)])
+        for e in self.emb:
+            nn.init.normal_(e.weight, std=0.1)
+        self.l1 = nn.Linear(n_dense + N_SLOTS * sum(dims), hidden)
+        self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.out = nn.Linear(hidden, 1)
+
+    def embed_inputs(self, ids: torch.Tensor) -> torch.Tensor:
+        ids = ids.round().long().view(-1, N_SLOTS, IDS_PER_SLOT)
+        sp, it, ab = (self.emb[t](ids[:, :, t]) for t in range(3))
+        mv = self.emb[3](ids[:, :, 3:]).mean(dim=2)
+        return torch.cat([sp, it, ab, mv], dim=2).flatten(1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dense, ids = x[:, :self.n_dense], x[:, self.n_dense:self.n_dense + N_IDS]
+        h = torch.relu(self.l1(torch.cat([dense, self.embed_inputs(ids)], dim=1)))
+        return self.out(self.drop(h))
+
+
 def build_model(
     kind: str, n_in: int, hidden: int, residual: tuple[float, float] | None = None,
     freeze_a: bool = False, dropout: float = 0.0,
+    embed_dims: tuple[int, ...] | None = None,
 ) -> nn.Module:
-    """``n_in`` counts feature columns only. ``residual=(a, b)`` wraps the net in a ResidualNet."""
-    if kind == "linear":
-        net: nn.Module = nn.Linear(n_in, 1)
+    """``n_in`` counts feature columns only (with ``embed_dims``: dense + the ``N_IDS`` identity
+    columns). ``residual=(a, b)`` wraps the net in a ResidualNet. ``embed_dims`` (species, item,
+    ability, move) builds the version-4 ``EmbedMLP``."""
+    if embed_dims is not None:
+        if kind != "mlp":
+            raise ValueError("identity embeddings need --model mlp")
+        import poke_engine
+
+        net: nn.Module = EmbedMLP(n_in - N_IDS, hidden, embed_dims,
+                                  tuple(poke_engine.identity_vocab_sizes()), dropout)
+    elif kind == "linear":
+        net = nn.Linear(n_in, 1)
     elif kind == "mlp":
         layers: list[nn.Module] = [nn.Linear(n_in, hidden), nn.ReLU()]
         if dropout > 0:
@@ -621,7 +698,7 @@ class ResidualNet(nn.Module):
         self.net = net
         self.a = nn.Parameter(torch.tensor(float(a)), requires_grad=not freeze_a)
         # zero output layer + intercept: the untrained model is the stock logistic fit
-        out = net if isinstance(net, nn.Linear) else net[-1]
+        out = net if isinstance(net, nn.Linear) else net.out if isinstance(net, EmbedMLP) else net[-1]
         nn.init.zeros_(out.weight)
         nn.init.constant_(out.bias, float(intercept))
 
@@ -885,6 +962,14 @@ def export_pev(model: nn.Module, out: Path, feature_version: int = 1) -> None:
         if stock_coef == 0.0:
             raise ValueError("residual model with stock_coef 0 cannot be exported as residual")
         model = model.net
+    if isinstance(model, EmbedMLP):
+        poke_engine.write_mlp_embed(
+            str(out), model.l1.weight.detach().numpy(), model.l1.bias.detach().numpy(),
+            model.out.weight.detach().numpy(), float(model.out.bias.item()),
+            [e.weight.detach().numpy() for e in model.emb], model.dims, stock_coef=stock_coef,
+        )
+        write_vocab_record(out, model.dims)
+        return
     if isinstance(model, nn.Linear):
         poke_engine.write_linear(
             str(out), model.weight.detach().reshape(-1).tolist(), float(model.bias.item()),
@@ -902,6 +987,27 @@ def export_pev(model: nn.Module, out: Path, feature_version: int = 1) -> None:
     )
 
 
+def write_vocab_record(pev_path: Path, dims) -> Path:
+    """``<pev>.vocab.json``: the vocabulary fingerprint, table sizes, embedding dims and the
+    entry names (row order) the net was trained with, so a trained file can be audited against
+    any engine build (the same hash is inside the ``.pev``)."""
+    import json
+
+    import poke_engine
+
+    rec = {
+        "feature_version": 4,
+        "vocab_hash": f"{poke_engine.identity_vocab_hash():#018x}",
+        "tables": list(EMBED_TABLES),
+        "embed_dims": [int(d) for d in dims],
+        "vocab_sizes": list(poke_engine.identity_vocab_sizes()),
+        "vocab": {t: poke_engine.identity_vocab(i) for i, t in enumerate(EMBED_TABLES)},
+    }
+    out = Path(str(pev_path) + ".vocab.json")
+    out.write_text(json.dumps(rec), encoding="utf-8")
+    return out
+
+
 def read_pev(path: str | Path) -> dict:
     """Parse a ``.pev`` weights file (format in ``engine/src/learned.rs``) into plain arrays.
 
@@ -916,6 +1022,8 @@ def read_pev(path: str | Path) -> dict:
         raise ValueError(f"{path}: not a poke-engine evaluator file (bad magic)")
     fmt, feat_ver, kind, n_in, hidden = struct.unpack_from("<5I", raw, 4)
     off, stock_coef = 24, None
+    if fmt == 3:
+        return _read_pev_embed(path, raw, feat_ver, kind, n_in, hidden)
     if fmt == 2:
         flags, coef = struct.unpack_from("<If", raw, 24)
         stock_coef = float(coef) if flags & 1 else None
@@ -939,6 +1047,39 @@ def read_pev(path: str | Path) -> dict:
     return out
 
 
+def _read_pev_embed(path, raw: bytes, feat_ver: int, kind: int, n_dense: int, hidden: int) -> dict:
+    """Format 3 (feature version 4 with identity embeddings), see ``engine/src/learned.rs``."""
+    import struct
+
+    if kind != 2 or feat_ver != 4:
+        raise ValueError(f"{path}: format 3 needs an MLP of feature version 4")
+    flags, coef = struct.unpack_from("<If", raw, 24)
+    (vhash,) = struct.unpack_from("<Q", raw, 32)
+    dims = struct.unpack_from("<4I", raw, 40)
+    off = 56
+    n_total = n_dense + N_SLOTS * sum(dims)
+    body = np.frombuffer(raw, dtype="<f4", offset=off).astype(np.float32)
+    a = hidden * n_total
+    pos = a + 2 * hidden + 1
+    tables = []
+    # table row counts are not stored (the vocabulary hash pins them): use this engine's sizes
+    import poke_engine
+
+    sizes = poke_engine.identity_vocab_sizes()
+    if sum(s * d for s, d in zip(sizes, dims)) != len(body) - pos:
+        raise ValueError(f"{path}: embedding tables do not match this engine's vocabulary sizes")
+    for s, d in zip(sizes, dims):
+        tables.append(body[pos:pos + s * d].reshape(s, d))
+        pos += s * d
+    return {
+        "feature_version": feat_ver, "kind": "mlp", "n_in": n_dense, "hidden": hidden,
+        "stock_coef": float(coef) if flags & 1 else None,
+        "w1": body[:a].reshape(hidden, n_total), "b1": body[a:a + hidden],
+        "w2": body[a + hidden:a + 2 * hidden], "b2": float(body[a + 2 * hidden]),
+        "embed_dims": tuple(dims), "tables": tables, "vocab_hash": vhash,
+    }
+
+
 def load_init(model: nn.Module, path: str | Path, *, model_kind: str, n_feat: int, hidden: int,
               feature_version: int, residual: bool) -> None:
     """Warm start: copy the weights of ``path`` into ``model`` (as built by ``build_model``).
@@ -956,7 +1097,19 @@ def load_init(model: nn.Module, path: str | Path, *, model_kind: str, n_feat: in
         problems.append(f"model kind {pev['kind']} (training {model_kind})")
     if pev["feature_version"] != feature_version:
         problems.append(f"feature version {pev['feature_version']} (training {feature_version})")
-    if pev["n_in"] != n_feat:
+    net_ = model.net if isinstance(model, ResidualNet) else model
+    is_embed = isinstance(net_, EmbedMLP)
+    if (pev.get("embed_dims") is not None) != is_embed:
+        problems.append("file has identity embeddings but training without them" if is_embed is False
+                        else "training with identity embeddings but the file has none")
+    elif is_embed:
+        import poke_engine
+
+        if tuple(pev["embed_dims"]) != tuple(net_.dims):
+            problems.append(f"embed dims {tuple(pev['embed_dims'])} (training {tuple(net_.dims)})")
+        if pev["vocab_hash"] != poke_engine.identity_vocab_hash():
+            problems.append("embedding vocabulary differs from this engine's")
+    if pev["n_in"] + (N_IDS if is_embed else 0) != n_feat:
         problems.append(f"{pev['n_in']} inputs (training {n_feat})")
     if model_kind == "mlp" and pev["hidden"] != hidden:
         problems.append(f"hidden {pev['hidden']} (training {hidden})")
@@ -967,7 +1120,14 @@ def load_init(model: nn.Module, path: str | Path, *, model_kind: str, n_feat: in
         raise ValueError(f"--init {path} does not match this run: " + "; ".join(problems))
     net = model.net if isinstance(model, ResidualNet) else model
     with torch.no_grad():
-        if model_kind == "linear":
+        if is_embed:
+            net.l1.weight.copy_(torch.from_numpy(pev["w1"]))
+            net.l1.bias.copy_(torch.from_numpy(pev["b1"]))
+            net.out.weight.copy_(torch.from_numpy(pev["w2"]).reshape(1, -1))
+            net.out.bias.fill_(pev["b2"])
+            for e, t in zip(net.emb, pev["tables"]):
+                e.weight.copy_(torch.from_numpy(t))
+        elif model_kind == "linear":
             net.weight.copy_(torch.from_numpy(pev["w1"]))
             net.bias.fill_(pev["b2"])
         else:
@@ -991,11 +1151,7 @@ def verify_export(model: nn.Module, path: Path, states: list[str], tol: float = 
     model = model.to("cpu")
     parsed = [poke_engine.State.from_string(s) for s in states]
     version = getattr(evaluator, "feature_version", 1)
-    rows = [
-        poke_engine.state_features(s, 1) if version == 1
-        else poke_engine.state_features(s, 1, version)
-        for s in parsed
-    ]
+    rows = [dataset.state_row(poke_engine, s, 1, version) for s in parsed]
     if isinstance(model, ResidualNet):
         rows = [r + [poke_engine.evaluate(s)] for r, s in zip(rows, parsed)]
         if not evaluator.residual or abs(evaluator.stock_coef - model.stock_coef) > 1e-7:
@@ -1263,10 +1419,15 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="auto", help="auto (cuda if available), cpu or cuda")
-    p.add_argument("--features", choices=("v1", "v2", "v3", "1", "2", "3"), default="v1",
+    p.add_argument("--embed-dim", default="8", metavar="D|S,I,A,M",
+                   help="--features v4: learned identity embedding width, one value for all four "
+                        "tables or species,item,ability,move (default 8); moves are mean-pooled")
+    p.add_argument("--features", choices=("v1", "v2", "v3", "v4", "1", "2", "3", "4"), default="v1",
                    help="engine feature layout: v1 (738 values) or v2 (v1 + item / ability / "
                         "move-property features, see docs/features-v2.md) or v3 (v1 + pairwise "
-                        "speed / damage / revenge-kill matchup features, 926 values; '3' = 'v3')")
+                        "speed / damage / revenge-kill matchup features, 926 values; '3' = 'v3') or v4 "
+                        "(v2 + v3 features, 2379 values, plus per-slot species/item/ability/move "
+                        "identity indices for learned embeddings, docs/features-v4.md)")
     p.add_argument("--x-dtype", choices=("float32", "float16"), default=None,
                    help="in-memory dtype of the feature matrix (default float32 for v1, "
                         "float16 for v2: halves RAM / GPU memory)")
@@ -1323,7 +1484,19 @@ def main(argv=None) -> int:
     if feature_version != 1 and (args.augment_bench or args.augment_sides):
         print("--augment-* supports only --features v1", file=sys.stderr)
         return 2
-    print(f"features: {args.features}, x dtype {x_dtype}")
+    embed_dims = None
+    if feature_version == 4:
+        try:
+            embed_dims = parse_embed_dims(args.embed_dim)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        if args.model != "mlp":
+            print("--features v4 needs --model mlp", file=sys.stderr)
+            return 2
+    print(f"features: {args.features}, x dtype {x_dtype}"
+          + (f", identity embeddings (species,item,ability,move) dims {parse_embed_dims(args.embed_dim)}"
+             if feature_version == 4 else ""))
     data = load_data(
         args.data, args.states, args.weighting, args.value_target, args.blend_lambda, args.q_source,
         args.q_kind, args.q_eval_scale, residual=args.residual,
@@ -1372,7 +1545,7 @@ def main(argv=None) -> int:
         print("--dropout must be in [0, 1)", file=sys.stderr)
         return 2
     model = build_model(args.model, n_feat, args.hidden, res_init, args.freeze_stock_coef,
-                        args.dropout)
+                        args.dropout, embed_dims)
     if args.init is not None:
         try:
             load_init(model, args.init, model_kind=args.model, n_feat=n_feat, hidden=args.hidden,

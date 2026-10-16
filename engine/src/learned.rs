@@ -37,16 +37,30 @@
 //! flags      u32  bit0 = residual
 //! stock_coef f32  multiplier applied to the raw stock evaluate()
 //! ```
+//! Format 3 (feature version 4 only: dense features + learned identity embeddings, see
+//! `features_v4.rs` / `docs/features-v4.md`; MLP only). The 24-byte header has `feat_ver` = 4,
+//! `kind` = 2 and `n_in` = the DENSE length (2379); then:
+//! ```text
+//! flags      u32      bit0 = residual
+//! stock_coef f32      (0 when not residual)
+//! vocab_hash u64      features_v4::vocab_hash() of the engine that trained it
+//! dims       4 x u32  embedding dims: species, item, ability, move
+//! W1[n_hidden][n_in + 12 * sum(dims)] f32 row-major: dense columns, then per slot (own 0..5,
+//!            opp 0..5) species | item | ability | mean-pooled move embedding
+//! b1[n_hidden], w2[n_hidden], b2
+//! tables     species, item, ability, move: f32 row-major [vocab_size(t)][dims[t]]
+//! ```
 
 use crate::engine::evaluate::evaluate;
 use crate::engine::items::Items;
 use crate::engine::state::{PokemonVolatileStatus as V, Terrain, Weather};
 use crate::features::{
-    feature_len, features_versioned_into, FEATURE_LEN, FEATURE_LEN_V2, FEATURE_VERSION_1,
-    FEATURE_VERSION_2, FEATURE_VERSION_3, PER_POKEMON, PER_SIDE, TEAM_SLOTS,
+    feature_len, features_versioned_into, FEATURE_LEN, FEATURE_LEN_V4, FEATURE_VERSION_1,
+    FEATURE_VERSION_2, FEATURE_VERSION_3, FEATURE_VERSION_4, PER_POKEMON, PER_SIDE, TEAM_SLOTS,
 };
 use crate::features_v2::{self, Sink};
 use crate::features_v3;
+use crate::features_v4::{self, IDS_PER_SLOT, N_IDS, N_SLOTS, N_TABLES};
 use crate::state::{PokemonStatus, PokemonType, Side, SideReference, State};
 use std::convert::TryInto;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -58,6 +72,8 @@ pub const MAGIC: &[u8; 4] = b"PEVN";
 pub const FORMAT_VERSION: u32 = 1;
 /// Format written for residual evaluators.
 pub const FORMAT_VERSION_RESIDUAL: u32 = 2;
+/// Format written for evaluators with embedding tables (feature version 4); see the module doc.
+pub const FORMAT_VERSION_EMBED: u32 = 3;
 const FLAG_RESIDUAL: u32 = 1;
 const KIND_LINEAR: u32 = 1;
 const KIND_MLP: u32 = 2;
@@ -75,7 +91,110 @@ enum Model {
         b1: Vec<f32>,
         w2: Vec<f32>,
         b2: f32,
+        /// learned identity embeddings (feature version 4 only); the first layer then reads
+        /// `n_dense + emb.input_len()` inputs
+        emb: Option<Embed>,
     },
+}
+
+/// Learned embedding tables of feature version 4: species, item, ability and move identity of
+/// the 12 Pokemon slots (see `features_v4.rs`). The four moves of a slot are mean-pooled; the
+/// per-slot vectors are concatenated (slot-major: own 0..5, opp 0..5; per slot species, item,
+/// ability, pooled move) and appended to the dense features as the input of the first layer.
+#[derive(Debug, Clone)]
+pub struct Embed {
+    dims: [usize; N_TABLES],
+    /// `tables[t]` is row-major `[vocab_size(t)][dims[t]]`
+    tables: [Vec<f32>; N_TABLES],
+}
+
+impl Embed {
+    pub fn new(dims: [usize; N_TABLES], tables: [Vec<f32>; N_TABLES]) -> Result<Embed, String> {
+        for t in 0..N_TABLES {
+            if dims[t] == 0 || dims[t] > 1024 {
+                return Err(format!("embedding dim of {} must be in 1..=1024, got {}", features_v4::TABLE_NAMES[t], dims[t]));
+            }
+            let want = features_v4::vocab_size(t) * dims[t];
+            if tables[t].len() != want {
+                return Err(format!(
+                    "{} table has {} floats, expected vocab {} x dim {} = {}",
+                    features_v4::TABLE_NAMES[t],
+                    tables[t].len(),
+                    features_v4::vocab_size(t),
+                    dims[t],
+                    want
+                ));
+            }
+        }
+        Ok(Embed { dims, tables })
+    }
+
+    pub fn dims(&self) -> [usize; N_TABLES] {
+        self.dims
+    }
+
+    pub fn table(&self, t: usize) -> &[f32] {
+        &self.tables[t]
+    }
+
+    /// Embedding inputs per Pokemon slot (species + item + ability + pooled move dims).
+    pub fn slot_width(&self) -> usize {
+        self.dims.iter().sum()
+    }
+
+    /// Total embedding inputs of the first layer (`12 * slot_width`).
+    pub fn input_len(&self) -> usize {
+        N_SLOTS * self.slot_width()
+    }
+
+    #[inline(always)]
+    fn row(&self, t: usize, idx: u16) -> &[f32] {
+        let d = self.dims[t];
+        &self.tables[t][idx as usize * d..(idx as usize + 1) * d]
+    }
+
+    /// Dense reference input (`input_len()` long) for the identity indices `ids` (`N_IDS` long).
+    pub fn fill_inputs(&self, ids: &[u16], out: &mut [f32]) {
+        let w = self.slot_width();
+        for s in 0..N_SLOTS {
+            let ids = &ids[s * IDS_PER_SLOT..(s + 1) * IDS_PER_SLOT];
+            let o = &mut out[s * w..(s + 1) * w];
+            let mut off = 0;
+            for t in 0..3 {
+                let d = self.dims[t];
+                o[off..off + d].copy_from_slice(self.row(t, ids[t]));
+                off += d;
+            }
+            let d = self.dims[features_v4::MOVE];
+            o[off..off + d].fill(0.0);
+            for m in 0..4 {
+                for (a, b) in o[off..off + d].iter_mut().zip(self.row(features_v4::MOVE, ids[3 + m])) {
+                    *a += 0.25 * b;
+                }
+            }
+        }
+    }
+
+    /// Adds the first-layer contribution of one slot's identity (`ids`: 7 indices) to `acc`.
+    /// `n_dense` is the dense input length (embedding inputs follow it), `pos` the slot
+    /// (0..11, own first).
+    #[inline(always)]
+    fn add_slot<const H: usize>(&self, acc: &mut [f32; H], w1t: &[f32], n_dense: usize, pos: usize, ids: &[u16; IDS_PER_SLOT]) {
+        let mut feat = n_dense + pos * self.slot_width();
+        for t in 0..3 {
+            let row = self.row(t, ids[t]);
+            for (c, v) in row.iter().enumerate() {
+                axpy_row::<H>(acc, *v, w1t, feat + c);
+            }
+            feat += self.dims[t];
+        }
+        for m in 0..4 {
+            let row = self.row(features_v4::MOVE, ids[3 + m]);
+            for (c, v) in row.iter().enumerate() {
+                axpy_row::<H>(acc, 0.25 * *v, w1t, feat + c);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -114,7 +233,7 @@ pub struct Scratch {
     /// the life of a search, so a `Scratch` must not be reused for states whose
     /// team stats differ without calling `Scratch::reset()` (every search and
     /// `Evaluator::logit` wrapper in this crate uses a fresh one).
-    cache_keys: Vec<[u64; 2]>,
+    cache_keys: Vec<[u64; 3]>,
     /// 1 / max(maxhp, 1) per line (hp fraction = hp * recip, no division per leaf).
     cache_recip: Vec<f32>,
     /// Next way to evict, per set.
@@ -133,7 +252,7 @@ impl Scratch {
 
     pub fn new() -> Scratch {
         Scratch {
-            feats: vec![0.0; FEATURE_LEN_V2],
+            feats: vec![0.0; FEATURE_LEN_V4],
             hidden: Vec::new(),
             cache_model: 0,
             cache_vals: Vec::new(),
@@ -170,10 +289,11 @@ unsafe fn mlp_avx2<const H: usize, const V2: bool>(
     b1: &[f32],
     w2: &[f32],
     b2: f32,
+    emb: Option<&Embed>,
     state: &State,
     scratch: &mut Scratch,
 ) -> f32 {
-    ev.mlp_fast::<H, V2>(w1t, b1, w2, b2, state, scratch)
+    ev.mlp_fast::<H, V2>(w1t, b1, w2, b2, emb, state, scratch)
 }
 
 /// Adds first-layer weight rows for the (absolute-index) features it receives.
@@ -263,6 +383,7 @@ fn mlp_side<const H: usize, const V2: bool>(
     w1t: &[f32],
     side: &Side,
     side_no: usize,
+    emb: Option<&Embed>,
     sc: &mut Scratch,
 ) {
     let side_base = side_no * PER_SIDE;
@@ -284,8 +405,10 @@ fn mlp_side<const H: usize, const V2: bool>(
             let p = &side.pokemon.pkmn[k];
             let base = side_base + slot * PER_POKEMON;
             // slow-changing part, cached per (side, team index, slot) set
-            let key: [u64; 2] = if V2 {
-                features_v2::static_key(p)
+            let key: [u64; 3] = if V2 {
+                let k = features_v2::static_key(p);
+                // v4: the species (item, ability and moves are already in the v2 key)
+                [k[0], k[1], if emb.is_some() { p.id as u64 } else { 0 }]
             } else {
                 [
                     (p.types.0 as u64)
@@ -293,6 +416,7 @@ fn mlp_side<const H: usize, const V2: bool>(
                         | (p.tera_type as u64) << 16
                         | (p.terastallized as u64) << 24
                         | ((p.item != Items::NONE) as u64) << 25,
+                    0,
                     0,
                 ]
             };
@@ -316,7 +440,16 @@ fn mlp_side<const H: usize, const V2: bool>(
                     );
                 }
                 let o = line * 2 * H;
-                sc.cache_vals[o..o + H].copy_from_slice(&v);
+                if let Some(e) = emb {
+                    // fainted variant sees the pad identity, the alive one the real identity
+                    let pos = side_no * TEAM_SLOTS + slot;
+                    let mut v0 = v;
+                    e.add_slot::<H>(&mut v0, w1t, FEATURE_LEN_V4, pos, &[features_v4::IDX_PAD; IDS_PER_SLOT]);
+                    sc.cache_vals[o..o + H].copy_from_slice(&v0);
+                    e.add_slot::<H>(&mut v, w1t, FEATURE_LEN_V4, pos, &features_v4::slot_ids_alive(p));
+                } else {
+                    sc.cache_vals[o..o + H].copy_from_slice(&v);
+                }
                 add_row::<H>(&mut v, w1t, base + 1);
                 sc.cache_vals[o + H..o + 2 * H].copy_from_slice(&v);
                 sc.cache_keys[line] = key;
@@ -448,12 +581,27 @@ pub(crate) fn hidden_acc<const H: usize, const V2: bool>(
     own: SideReference,
     scratch: &mut Scratch,
 ) -> [f32; H] {
+    hidden_acc_emb::<H, V2>(model_id, w1t, b1, state, own, scratch, None)
+}
+
+/// `hidden_acc` with optional identity embeddings (feature version 4; `V2` must be true).
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn hidden_acc_emb<const H: usize, const V2: bool>(
+    model_id: u64,
+    w1t: &[f32],
+    b1: &[f32],
+    state: &State,
+    own: SideReference,
+    scratch: &mut Scratch,
+    emb: Option<&Embed>,
+) -> [f32; H] {
     if scratch.cache_model != model_id || scratch.cache_vals.len() != CACHE_SETS * CACHE_WAYS * 2 * H {
         scratch.cache_model = model_id;
         scratch.cache_vals.clear();
         scratch.cache_vals.resize(CACHE_SETS * CACHE_WAYS * 2 * H, 0.0);
         scratch.cache_keys.clear();
-        scratch.cache_keys.resize(CACHE_SETS * CACHE_WAYS, [u64::MAX; 2]);
+        scratch.cache_keys.resize(CACHE_SETS * CACHE_WAYS, [u64::MAX; 3]);
         scratch.cache_recip.clear();
         scratch.cache_recip.resize(CACHE_SETS * CACHE_WAYS, 1.0);
         scratch.cache_next.clear();
@@ -465,8 +613,8 @@ pub(crate) fn hidden_acc<const H: usize, const V2: bool>(
         SideReference::SideOne => (&state.side_one, &state.side_two),
         SideReference::SideTwo => (&state.side_two, &state.side_one),
     };
-    mlp_side::<H, V2>(&mut acc, w1t, own_side, 0, scratch);
-    mlp_side::<H, V2>(&mut acc, w1t, opp_side, 1, scratch);
+    mlp_side::<H, V2>(&mut acc, w1t, own_side, 0, emb, scratch);
+    mlp_side::<H, V2>(&mut acc, w1t, opp_side, 1, emb, scratch);
 
     let field = 2 * PER_SIDE;
     let weather = state.get_weather();
@@ -519,6 +667,9 @@ impl Evaluator {
     /// value = w . features + b over the features of `feat_ver` (1, 2 or 3).
     pub fn linear_v(feat_ver: u32, w: Vec<f32>, b: f32) -> Result<Evaluator, String> {
         let n_in = feature_len(feat_ver).ok_or_else(|| format!("unknown feature version {feat_ver}"))?;
+        if feat_ver == FEATURE_VERSION_4 {
+            return Err("feature version 4 needs embedding tables (use a MLP with Embed)".to_string());
+        }
         if w.len() != n_in {
             return Err(format!(
                 "linear weights have length {}, expected {} (feature version {feat_ver})",
@@ -559,6 +710,37 @@ impl Evaluator {
         b2: f32,
     ) -> Result<Evaluator, String> {
         let n_in = feature_len(feat_ver).ok_or_else(|| format!("unknown feature version {feat_ver}"))?;
+        if feat_ver == FEATURE_VERSION_4 {
+            return Err("feature version 4 needs embedding tables (use Evaluator::mlp_embed)".to_string());
+        }
+        Evaluator::mlp_inner(feat_ver, n_in, hidden, w1, b1, w2, b2, None)
+    }
+
+    /// Feature version 4 MLP: `w1` is row-major `[hidden][FEATURE_LEN_V4 + emb.input_len()]`
+    /// (dense features, then the concatenated slot embeddings, see `Embed`).
+    pub fn mlp_embed(
+        hidden: usize,
+        w1: Vec<f32>,
+        b1: Vec<f32>,
+        w2: Vec<f32>,
+        b2: f32,
+        emb: Embed,
+    ) -> Result<Evaluator, String> {
+        let n_in = FEATURE_LEN_V4 + emb.input_len();
+        Evaluator::mlp_inner(FEATURE_VERSION_4, n_in, hidden, w1, b1, w2, b2, Some(emb))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mlp_inner(
+        feat_ver: u32,
+        n_in: usize,
+        hidden: usize,
+        w1: Vec<f32>,
+        b1: Vec<f32>,
+        w2: Vec<f32>,
+        b2: f32,
+        emb: Option<Embed>,
+    ) -> Result<Evaluator, String> {
         if hidden == 0 {
             return Err("hidden size must be > 0".to_string());
         }
@@ -590,6 +772,7 @@ impl Evaluator {
                 b1,
                 w2,
                 b2,
+                emb,
             },
             id: NEXT_MODEL_ID.fetch_add(1, Ordering::Relaxed),
             feat_ver,
@@ -601,7 +784,15 @@ impl Evaluator {
         })
     }
 
-    /// Feature version of the weights (1, 2 or 3).
+    /// The identity embedding tables (feature version 4 only).
+    pub fn embed(&self) -> Option<&Embed> {
+        match &self.model {
+            Model::Mlp { emb, .. } => emb.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Feature version of the weights (1, 2, 3 or 4).
     pub fn feature_version(&self) -> u32 {
         self.feat_ver
     }
@@ -609,6 +800,11 @@ impl Evaluator {
     /// Length of the feature vector the weights consume.
     pub fn n_in(&self) -> usize {
         feature_len(self.feat_ver).unwrap_or(FEATURE_LEN)
+    }
+
+    /// Inputs of the first layer: `n_in()` dense features plus the embedding inputs (v4).
+    pub fn n_total(&self) -> usize {
+        self.n_in() + self.embed().map_or(0, |e| e.input_len())
     }
 
     pub fn with_relative_to_root(mut self, relative: bool) -> Evaluator {
@@ -663,7 +859,8 @@ impl Evaluator {
     }
 
     /// Net output (without the stock term of a residual evaluator) from an
-    /// already computed feature vector (length `FEATURE_LEN`).
+    /// already computed input vector (length `n_total()`: the dense features, then for
+    /// feature version 4 the concatenated slot embeddings, see `Embed::fill_inputs`).
     /// Inputs that are exactly 0.0 are skipped (the encoding is sparse).
     pub fn logit_from_features(&self, x: &[f32], hidden_buf: &mut Vec<f32>) -> f32 {
         match &self.model {
@@ -682,6 +879,7 @@ impl Evaluator {
                 b1,
                 w2,
                 b2,
+                ..
             } => {
                 let h = *hidden;
                 hidden_buf.clear();
@@ -710,38 +908,41 @@ impl Evaluator {
     /// feature vector); results match `logit_reference` to f32 rounding.
     pub fn logit(&self, state: &State, scratch: &mut Scratch) -> f32 {
         let net = match &self.model {
-            Model::Mlp { hidden, w1t, b1, w2, b2 } => {
-                let v2 = self.feat_ver == FEATURE_VERSION_2;
+            Model::Mlp { hidden, w1t, b1, w2, b2, emb } => {
+                let v2 = self.feat_ver == FEATURE_VERSION_2 || self.feat_ver == FEATURE_VERSION_4;
+                let emb = emb.as_ref();
                 #[cfg(target_arch = "x86_64")]
                 {
                     if self.avx2 {
                         // SAFETY: `avx2` is only set when the CPU reports AVX2.
                         unsafe {
                             match (*hidden, v2) {
-                                (8, false) => mlp_avx2::<8, false>(self, w1t, b1, w2, *b2, state, scratch),
-                                (16, false) => mlp_avx2::<16, false>(self, w1t, b1, w2, *b2, state, scratch),
-                                (32, false) => mlp_avx2::<32, false>(self, w1t, b1, w2, *b2, state, scratch),
-                                (64, false) => mlp_avx2::<64, false>(self, w1t, b1, w2, *b2, state, scratch),
-                                (8, true) => mlp_avx2::<8, true>(self, w1t, b1, w2, *b2, state, scratch),
-                                (16, true) => mlp_avx2::<16, true>(self, w1t, b1, w2, *b2, state, scratch),
-                                (32, true) => mlp_avx2::<32, true>(self, w1t, b1, w2, *b2, state, scratch),
-                                (64, true) => mlp_avx2::<64, true>(self, w1t, b1, w2, *b2, state, scratch),
+                                (8, false) => mlp_avx2::<8, false>(self, w1t, b1, w2, *b2, emb, state, scratch),
+                                (16, false) => mlp_avx2::<16, false>(self, w1t, b1, w2, *b2, emb, state, scratch),
+                                (32, false) => mlp_avx2::<32, false>(self, w1t, b1, w2, *b2, emb, state, scratch),
+                                (64, false) => mlp_avx2::<64, false>(self, w1t, b1, w2, *b2, emb, state, scratch),
+                                (128, false) => mlp_avx2::<128, false>(self, w1t, b1, w2, *b2, emb, state, scratch),
+                                (8, true) => mlp_avx2::<8, true>(self, w1t, b1, w2, *b2, emb, state, scratch),
+                                (16, true) => mlp_avx2::<16, true>(self, w1t, b1, w2, *b2, emb, state, scratch),
+                                (32, true) => mlp_avx2::<32, true>(self, w1t, b1, w2, *b2, emb, state, scratch),
+                                (64, true) => mlp_avx2::<64, true>(self, w1t, b1, w2, *b2, emb, state, scratch),
+                                (128, true) => mlp_avx2::<128, true>(self, w1t, b1, w2, *b2, emb, state, scratch),
                                 _ => return self.logit_reference(state, scratch),
                             }
                         }
                     } else {
-                        if !matches!(*hidden, 8 | 16 | 32 | 64) {
+                        if !matches!(*hidden, 8 | 16 | 32 | 64 | 128) {
                             return self.logit_reference(state, scratch);
                         }
-                        self.mlp_dispatch(*hidden, v2, w1t, b1, w2, *b2, state, scratch)
+                        self.mlp_dispatch(*hidden, v2, w1t, b1, w2, *b2, emb, state, scratch)
                     }
                 }
                 #[cfg(not(target_arch = "x86_64"))]
                 {
-                    if !matches!(*hidden, 8 | 16 | 32 | 64) {
+                    if !matches!(*hidden, 8 | 16 | 32 | 64 | 128) {
                         return self.logit_reference(state, scratch);
                     }
-                    self.mlp_dispatch(*hidden, v2, w1t, b1, w2, *b2, state, scratch)
+                    self.mlp_dispatch(*hidden, v2, w1t, b1, w2, *b2, emb, state, scratch)
                 }
             }
             Model::Linear { .. } => return self.logit_reference(state, scratch),
@@ -761,18 +962,21 @@ impl Evaluator {
         b1: &[f32],
         w2: &[f32],
         b2: f32,
+        emb: Option<&Embed>,
         state: &State,
         scratch: &mut Scratch,
     ) -> f32 {
         match (hidden, v2) {
-            (8, false) => self.mlp_fast::<8, false>(w1t, b1, w2, b2, state, scratch),
-            (16, false) => self.mlp_fast::<16, false>(w1t, b1, w2, b2, state, scratch),
-            (32, false) => self.mlp_fast::<32, false>(w1t, b1, w2, b2, state, scratch),
-            (64, false) => self.mlp_fast::<64, false>(w1t, b1, w2, b2, state, scratch),
-            (8, true) => self.mlp_fast::<8, true>(w1t, b1, w2, b2, state, scratch),
-            (16, true) => self.mlp_fast::<16, true>(w1t, b1, w2, b2, state, scratch),
-            (32, true) => self.mlp_fast::<32, true>(w1t, b1, w2, b2, state, scratch),
-            (64, true) => self.mlp_fast::<64, true>(w1t, b1, w2, b2, state, scratch),
+            (8, false) => self.mlp_fast::<8, false>(w1t, b1, w2, b2, emb, state, scratch),
+            (16, false) => self.mlp_fast::<16, false>(w1t, b1, w2, b2, emb, state, scratch),
+            (32, false) => self.mlp_fast::<32, false>(w1t, b1, w2, b2, emb, state, scratch),
+            (64, false) => self.mlp_fast::<64, false>(w1t, b1, w2, b2, emb, state, scratch),
+            (128, false) => self.mlp_fast::<128, false>(w1t, b1, w2, b2, emb, state, scratch),
+            (8, true) => self.mlp_fast::<8, true>(w1t, b1, w2, b2, emb, state, scratch),
+            (16, true) => self.mlp_fast::<16, true>(w1t, b1, w2, b2, emb, state, scratch),
+            (32, true) => self.mlp_fast::<32, true>(w1t, b1, w2, b2, emb, state, scratch),
+            (64, true) => self.mlp_fast::<64, true>(w1t, b1, w2, b2, emb, state, scratch),
+            (128, true) => self.mlp_fast::<128, true>(w1t, b1, w2, b2, emb, state, scratch),
             _ => f32::NAN, // unreachable: callers only pass supported sizes
         }
     }
@@ -781,7 +985,18 @@ impl Evaluator {
     pub fn logit_reference(&self, state: &State, scratch: &mut Scratch) -> f32 {
         features_versioned_into(state, SideReference::SideOne, self.feat_ver, &mut scratch.feats);
         let n_in = self.n_in();
-        let net = self.logit_from_features(&scratch.feats[..n_in], &mut scratch.hidden);
+        let net = if let Some(e) = self.embed() {
+            let total = n_in + e.input_len();
+            if scratch.feats.len() < total {
+                scratch.feats.resize(total, 0.0);
+            }
+            let mut ids = [0u16; N_IDS];
+            features_v4::identity_into(state, SideReference::SideOne, &mut ids);
+            e.fill_inputs(&ids, &mut scratch.feats[n_in..total]);
+            self.logit_from_features(&scratch.feats[..total], &mut scratch.hidden)
+        } else {
+            self.logit_from_features(&scratch.feats[..n_in], &mut scratch.hidden)
+        };
         match self.stock_coef {
             Some(c) => c * evaluate(state) + net,
             None => net,
@@ -795,12 +1010,15 @@ impl Evaluator {
         b1: &[f32],
         w2: &[f32],
         b2: f32,
+        emb: Option<&Embed>,
         state: &State,
         scratch: &mut Scratch,
     ) -> f32 {
-        let mut acc = hidden_acc::<H, V2>(self.id, w1t, b1, state, SideReference::SideOne, scratch);
+        let mut acc = hidden_acc_emb::<H, V2>(self.id, w1t, b1, state, SideReference::SideOne, scratch, emb);
         if self.feat_ver == FEATURE_VERSION_3 {
             features_v3::matchup_blocks(&mut AccSink::<H> { acc: &mut acc, w1t }, state, SideReference::SideOne);
+        } else if self.feat_ver == FEATURE_VERSION_4 {
+            features_v4::matchup_blocks_v4(&mut AccSink::<H> { acc: &mut acc, w1t }, state, SideReference::SideOne);
         }
         let mut z = b2;
         for j in 0..H {
@@ -820,6 +1038,9 @@ impl Evaluator {
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
+        if let Model::Mlp { hidden, w1t, b1, w2, b2, emb: Some(e) } = &self.model {
+            return self.to_bytes_embed(*hidden, w1t, b1, w2, *b2, e);
+        }
         let mut out = Vec::new();
         out.extend_from_slice(MAGIC);
         let push = |out: &mut Vec<u8>, v: u32| out.extend_from_slice(&v.to_le_bytes());
@@ -847,6 +1068,7 @@ impl Evaluator {
                 b1,
                 w2,
                 b2,
+                ..
             } => {
                 push(&mut out, KIND_MLP);
                 push(&mut out, self.n_in() as u32);
@@ -872,18 +1094,137 @@ impl Evaluator {
         out
     }
 
+    /// Format 3 (embedding tables), see the module doc.
+    fn to_bytes_embed(&self, hidden: usize, w1t: &[f32], b1: &[f32], w2: &[f32], b2: f32, e: &Embed) -> Vec<u8> {
+        let n_total = self.n_total();
+        let mut out = Vec::with_capacity(64 + (hidden * n_total + 2 * hidden + 1) * 4);
+        out.extend_from_slice(MAGIC);
+        let push = |out: &mut Vec<u8>, v: u32| out.extend_from_slice(&v.to_le_bytes());
+        push(&mut out, FORMAT_VERSION_EMBED);
+        push(&mut out, self.feat_ver);
+        push(&mut out, KIND_MLP);
+        push(&mut out, self.n_in() as u32);
+        push(&mut out, hidden as u32);
+        push(&mut out, if self.is_residual() { FLAG_RESIDUAL } else { 0 });
+        out.extend_from_slice(&self.stock_coef.unwrap_or(0.0).to_le_bytes());
+        out.extend_from_slice(&features_v4::vocab_hash().to_le_bytes());
+        for d in e.dims() {
+            push(&mut out, d as u32);
+        }
+        let mut pushf = |xs: &[f32]| {
+            for x in xs {
+                out.extend_from_slice(&x.to_le_bytes());
+            }
+        };
+        for j in 0..hidden {
+            for i in 0..n_total {
+                pushf(&[w1t[i * hidden + j]]);
+            }
+        }
+        pushf(b1);
+        pushf(w2);
+        pushf(&[b2]);
+        for t in 0..N_TABLES {
+            pushf(e.table(t));
+        }
+        out
+    }
+
+    fn from_bytes_embed(bytes: &[u8]) -> Result<Evaluator, String> {
+        const HEADER: usize = 24 + 4 + 4 + 8 + 4 * N_TABLES;
+        if bytes.len() < HEADER {
+            return Err("truncated format-3 weights header".to_string());
+        }
+        let u32_at = |off: usize| u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+        let feat_ver = u32_at(8);
+        if feat_ver != FEATURE_VERSION_4 {
+            return Err(format!("format-3 weights need FEATURE_VERSION 4, got {feat_ver}"));
+        }
+        if u32_at(12) != KIND_MLP {
+            return Err(format!("format-3 weights must be an MLP, got kind {}", u32_at(12)));
+        }
+        let n_dense = u32_at(16) as usize;
+        if n_dense != FEATURE_LEN_V4 {
+            return Err(format!("weights expect {n_dense} dense inputs, FEATURE_VERSION 4 has {FEATURE_LEN_V4}"));
+        }
+        let hidden = u32_at(20) as usize;
+        let flags = u32_at(24);
+        if flags & !FLAG_RESIDUAL != 0 {
+            return Err(format!("unknown weights flags {flags:#x}"));
+        }
+        let coef = f32::from_le_bytes(bytes[28..32].try_into().unwrap());
+        let stock_coef = if flags & FLAG_RESIDUAL != 0 {
+            if !coef.is_finite() {
+                return Err(format!("non-finite stock_coef {coef}"));
+            }
+            Some(coef)
+        } else {
+            None
+        };
+        let hash = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
+        if hash != features_v4::vocab_hash() {
+            return Err(format!(
+                "weights were trained with embedding vocabulary {hash:#018x}, this engine has {:#018x} \
+                 (the species / item / ability / move enums changed; retrain or use the matching engine)",
+                features_v4::vocab_hash()
+            ));
+        }
+        let mut dims = [0usize; N_TABLES];
+        for (t, d) in dims.iter_mut().enumerate() {
+            *d = u32_at(40 + 4 * t) as usize;
+            if *d == 0 || *d > 1024 {
+                return Err(format!("bad {} embedding dim {}", features_v4::TABLE_NAMES[t], d));
+            }
+        }
+        let slot_w: usize = dims.iter().sum();
+        let n_total = n_dense + N_SLOTS * slot_w;
+        let n_tab: usize = (0..N_TABLES).map(|t| features_v4::vocab_size(t) * dims[t]).sum();
+        let floats_needed = hidden * n_total + 2 * hidden + 1 + n_tab;
+        let body = &bytes[HEADER..];
+        if body.len() != floats_needed * 4 {
+            return Err(format!("weights body is {} bytes, expected {}", body.len(), floats_needed * 4));
+        }
+        let floats: Vec<f32> = body
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let a = hidden * n_total;
+        let mut tables: [Vec<f32>; N_TABLES] = Default::default();
+        let mut off = a + 2 * hidden + 1;
+        for t in 0..N_TABLES {
+            let n = features_v4::vocab_size(t) * dims[t];
+            tables[t] = floats[off..off + n].to_vec();
+            off += n;
+        }
+        let ev = Evaluator::mlp_embed(
+            hidden,
+            floats[..a].to_vec(),
+            floats[a..a + hidden].to_vec(),
+            floats[a + hidden..a + 2 * hidden].to_vec(),
+            floats[a + 2 * hidden],
+            Embed::new(dims, tables)?,
+        )?;
+        match stock_coef {
+            Some(c) => ev.with_stock_coef(c),
+            None => Ok(ev),
+        }
+    }
+
     pub fn from_bytes(bytes: &[u8]) -> Result<Evaluator, String> {
         if bytes.len() < 24 || &bytes[0..4] != MAGIC {
             return Err("not a poke-engine evaluator file (bad magic)".to_string());
         }
         let u32_at = |off: usize| u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
         let format = u32_at(4);
+        if format == FORMAT_VERSION_EMBED {
+            return Evaluator::from_bytes_embed(bytes);
+        }
         if format != FORMAT_VERSION && format != FORMAT_VERSION_RESIDUAL {
             return Err(format!("unsupported weights format version {format}"));
         }
         let feat_ver = u32_at(8);
         let expected_in = feature_len(feat_ver).ok_or_else(|| {
-            format!("weights were trained with unknown FEATURE_VERSION {feat_ver} (this engine knows 1, 2 and 3)")
+            format!("weights were trained with unknown FEATURE_VERSION {feat_ver} (this engine knows 1, 2, 3 and 4)")
         })?;
         let kind = u32_at(12);
         let n_in = u32_at(16) as usize;
@@ -1450,5 +1791,215 @@ mod fast_path_tests {
             }
             assert!(maxdiff <= 1e-5, "version {} hidden {}: max abs diff {}", ver, h, maxdiff);
         }
+    }
+}
+
+#[cfg(test)]
+mod embed_tests {
+    use super::*;
+    use crate::engine::abilities::Abilities;
+    use crate::choices::Choices;
+    use crate::state::PokemonStatus;
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u32 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 33) as u32
+        }
+        fn unit(&mut self) -> f32 {
+            (self.next() % 20001) as f32 / 10000.0 - 1.0
+        }
+    }
+
+    fn random_embed(dims: [usize; N_TABLES], seed: u64) -> Embed {
+        let mut r = Lcg(seed);
+        let tables: [Vec<f32>; N_TABLES] = std::array::from_fn(|t| {
+            (0..features_v4::vocab_size(t) * dims[t]).map(|_| r.unit() * 0.5).collect()
+        });
+        Embed::new(dims, tables).unwrap()
+    }
+
+    fn random_v4(h: usize, dims: [usize; N_TABLES], seed: u64) -> Evaluator {
+        let mut r = Lcg(seed);
+        let emb = random_embed(dims, seed + 1);
+        let n_in = FEATURE_LEN_V4 + emb.input_len();
+        let w1: Vec<f32> = (0..h * n_in).map(|_| r.unit() * 0.2).collect();
+        let b1: Vec<f32> = (0..h).map(|_| r.unit() * 0.3).collect();
+        let w2: Vec<f32> = (0..h).map(|_| r.unit()).collect();
+        Evaluator::mlp_embed(h, w1, b1, w2, 0.1, emb).unwrap()
+    }
+
+    fn states() -> Vec<State> {
+        include_str!("../data/gen9randombattle.txt")
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(State::deserialize)
+            .collect()
+    }
+
+    #[test]
+    fn v4_fast_path_matches_reference() {
+        let states = states();
+        let mut rng = Lcg(11);
+        for &h in &[8usize, 16, 64, 128] {
+            let ev = random_v4(h, [8, 4, 6, 5], 500 + h as u64).with_stock_coef(0.0125).unwrap();
+            assert_eq!(ev.feature_version(), 4);
+            let mut maxdiff = 0.0f32;
+            for s0 in states.iter().take(40) {
+                let mut scratch = Scratch::new();
+                for round in 0..4 {
+                    let mut s = s0.clone();
+                    if round > 0 {
+                        for side in [&mut s.side_one, &mut s.side_two] {
+                            for p in side.pokemon.pkmn.iter_mut() {
+                                if rng.next() % 3 == 0 {
+                                    p.hp = (rng.next() % (p.maxhp.max(1) as u32 + 1)) as i16;
+                                }
+                                if rng.next() % 4 == 0 {
+                                    p.item = features_v2::ITEM_LIST[rng.next() as usize % features_v2::ITEM_LIST.len()];
+                                }
+                                if rng.next() % 6 == 0 {
+                                    p.item = if rng.next() % 2 == 0 { Items::UNKNOWNITEM } else { Items::NONE };
+                                }
+                                if rng.next() % 4 == 0 {
+                                    p.ability = features_v2::ABILITY_LIST[rng.next() as usize % features_v2::ABILITY_LIST.len()];
+                                }
+                                if rng.next() % 6 == 0 {
+                                    p.ability = Abilities::NONE;
+                                }
+                                if rng.next() % 4 == 0 {
+                                    std::mem::swap(&mut p.moves.m0, &mut p.moves.m2);
+                                }
+                                if rng.next() % 5 == 0 {
+                                    p.moves.m3.id = Choices::NONE;
+                                }
+                                if rng.next() % 9 == 0 {
+                                    p.id = crate::pokemon::PokemonName::NONE;
+                                }
+                                if rng.next() % 5 == 0 {
+                                    p.status = unsafe { std::mem::transmute::<u8, PokemonStatus>((rng.next() % 7) as u8) };
+                                }
+                            }
+                            side.speed_boost = (rng.next() % 13) as i8 - 6;
+                            if rng.next() % 3 == 0 {
+                                side.active_index = unsafe { std::mem::transmute::<u8, crate::state::PokemonIndex>((rng.next() % 6) as u8) };
+                            }
+                        }
+                    }
+                    let a = ev.logit(&s, &mut scratch);
+                    let b = ev.logit_reference(&s, &mut Scratch::new());
+                    maxdiff = maxdiff.max((a - b).abs());
+                }
+            }
+            assert!(maxdiff <= 2e-4, "hidden {}: max abs diff {}", h, maxdiff);
+        }
+    }
+
+    #[test]
+    fn v4_identity_changes_the_logit() {
+        let ev = random_v4(16, [8, 8, 8, 8], 3);
+        let mut s = states().remove(0);
+        let mut sc = Scratch::new();
+        let base = ev.logit(&s, &mut Scratch::new());
+        s.side_two.get_active().item = Items::UNKNOWNITEM;
+        let unk = ev.logit(&s, &mut sc);
+        s.side_two.get_active().item = Items::NONE;
+        let none = ev.logit(&s, &mut Scratch::new());
+        assert!((base - unk).abs() > 1e-6 || (base - none).abs() > 1e-6);
+        assert!((unk - none).abs() > 1e-6, "unknown and none items must be distinct inputs");
+        // a fainted Pokemon sees only the pad identity: its species does not matter
+        let mut a = states().remove(1);
+        a.side_one.pokemon.pkmn[1].hp = 0;
+        let mut b = a.clone();
+        b.side_one.pokemon.pkmn[1].id = a.side_one.pokemon.pkmn[2].id;
+        assert_eq!(ev.logit_reference(&a, &mut Scratch::new()), ev.logit_reference(&b, &mut Scratch::new()));
+    }
+
+    #[test]
+    fn v4_bytes_roundtrip() {
+        let ev = random_v4(16, [8, 5, 4, 6], 21).with_stock_coef(0.0125).unwrap();
+        let bytes = ev.to_bytes();
+        assert_eq!(&bytes[4..8], &3u32.to_le_bytes());
+        assert_eq!(&bytes[8..12], &4u32.to_le_bytes());
+        assert_eq!(&bytes[16..20], &(FEATURE_LEN_V4 as u32).to_le_bytes());
+        let back = Evaluator::from_bytes(&bytes).unwrap();
+        assert_eq!(back.to_bytes(), bytes);
+        assert_eq!(back.stock_coef, Some(0.0125));
+        assert_eq!(back.embed().unwrap().dims(), [8, 5, 4, 6]);
+        for s in states().iter().take(10) {
+            assert_eq!(ev.logit(s, &mut Scratch::new()), back.logit(s, &mut Scratch::new()));
+        }
+        // plain (non residual) too
+        let plain = random_v4(8, [2, 2, 2, 2], 4);
+        let back = Evaluator::from_bytes(&plain.to_bytes()).unwrap();
+        assert!(!back.is_residual());
+        // corruption is rejected
+        assert!(Evaluator::from_bytes(&bytes[..bytes.len() - 4]).is_err());
+        let mut bad = bytes.clone();
+        bad[32] ^= 1; // vocabulary hash
+        let err = Evaluator::from_bytes(&bad).unwrap_err();
+        assert!(err.contains("vocabulary"), "{err}");
+        let mut bad = bytes.clone();
+        bad[8..12].copy_from_slice(&2u32.to_le_bytes()); // format 3 needs version 4
+        assert!(Evaluator::from_bytes(&bad).is_err());
+        let mut bad = bytes.clone();
+        bad[40..44].copy_from_slice(&0u32.to_le_bytes()); // zero dim
+        assert!(Evaluator::from_bytes(&bad).is_err());
+        // v4 without embeddings cannot be built from the plain constructors
+        assert!(Evaluator::mlp_v(4, 2, vec![0.0; 2 * FEATURE_LEN_V4], vec![0.0; 2], vec![0.0; 2], 0.0).is_err());
+        assert!(Evaluator::linear_v(4, vec![0.0; FEATURE_LEN_V4], 0.0).is_err());
+    }
+
+    #[test]
+    fn older_formats_still_load_and_are_unchanged() {
+        // formats 1 / 2 are written exactly as before for every non-embedding evaluator
+        let lin = Evaluator::linear(vec![0.0; FEATURE_LEN], 1.0).unwrap();
+        assert_eq!(&lin.to_bytes()[4..8], &1u32.to_le_bytes());
+        let v3 = Evaluator::mlp_v(3, 2, vec![0.01; 2 * crate::features::FEATURE_LEN_V3], vec![0.0; 2], vec![1.0; 2], 0.0)
+            .unwrap()
+            .with_stock_coef(0.0125)
+            .unwrap();
+        let bytes = v3.to_bytes();
+        assert_eq!(&bytes[4..8], &2u32.to_le_bytes());
+        let back = Evaluator::from_bytes(&bytes).unwrap();
+        assert_eq!(back.feature_version(), 3);
+        assert!(back.embed().is_none());
+        let s = &states()[0];
+        assert_eq!(v3.logit(s, &mut Scratch::new()), back.logit(s, &mut Scratch::new()));
+    }
+
+    #[test]
+    fn reference_input_layout() {
+        // embedding input = per slot [species | item | ability | mean of the 4 moves]
+        let dims = [2, 3, 1, 2];
+        let emb = random_embed(dims, 9);
+        let s = &states()[0];
+        let ids = features_v4::identity(s, SideReference::SideOne);
+        let mut out = vec![0.0f32; emb.input_len()];
+        emb.fill_inputs(&ids, &mut out);
+        let w = emb.slot_width();
+        assert_eq!(w, 8);
+        // slot 3 (own bench 2)
+        let ids3 = &ids[3 * IDS_PER_SLOT..4 * IDS_PER_SLOT];
+        let o = &out[3 * w..4 * w];
+        assert_eq!(&o[0..2], &emb.table(0)[ids3[0] as usize * 2..ids3[0] as usize * 2 + 2]);
+        assert_eq!(&o[2..5], &emb.table(1)[ids3[1] as usize * 3..ids3[1] as usize * 3 + 3]);
+        assert_eq!(o[5], emb.table(2)[ids3[2] as usize]);
+        for c in 0..2 {
+            let mean: f32 = (0..4).map(|m| emb.table(3)[ids3[3 + m] as usize * 2 + c]).sum::<f32>() / 4.0;
+            assert!((o[6 + c] - mean).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn embed_new_validates_shapes() {
+        let dims = [2, 2, 2, 2];
+        let good: [Vec<f32>; N_TABLES] = std::array::from_fn(|t| vec![0.0; features_v4::vocab_size(t) * 2]);
+        assert!(Embed::new(dims, good.clone()).is_ok());
+        let mut bad = good.clone();
+        bad[1].pop();
+        assert!(Embed::new(dims, bad).is_err());
+        assert!(Embed::new([0, 2, 2, 2], good).is_err());
     }
 }

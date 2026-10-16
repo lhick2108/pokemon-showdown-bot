@@ -19,6 +19,7 @@ pub mod choices;
 pub mod features;
 pub mod features_v2;
 pub mod features_v3;
+pub mod features_v4;
 pub mod instruction;
 pub mod io;
 pub mod learned;
@@ -72,6 +73,13 @@ macro_rules! define_enum_with_from_str {
             }
         }
 
+        impl $name {
+            /// Variant names in declaration order (index = discriminant for the dense enums).
+            pub const NAMES: &'static [&'static str] = &[$(stringify!($variant)),+];
+            /// Number of variants.
+            pub const COUNT: usize = Self::NAMES.len();
+        }
+
         impl std::fmt::Display for $name {
             fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
                 write!(f, "{:?}", self)
@@ -120,6 +128,13 @@ macro_rules! define_enum_with_from_str {
                     _ => panic!("Invalid {}: {}", stringify!($name), input.to_uppercase().as_str()),
                 }
             }
+        }
+
+        impl $name {
+            /// Variant names in declaration order (index = discriminant for the dense enums).
+            pub const NAMES: &'static [&'static str] = &[$(stringify!($variant)),+];
+            /// Number of variants.
+            pub const COUNT: usize = Self::NAMES.len();
         }
 
         impl std::fmt::Display for $name {

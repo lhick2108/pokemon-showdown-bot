@@ -13,8 +13,9 @@ use poke_engine::engine::state::{MoveChoice, PokemonVolatileStatus, Terrain, Wea
 use poke_engine::instruction::{Instruction, StateInstructions};
 use poke_engine::features::{
     feature_len, feature_names_versioned, features_versioned, FEATURE_LEN, FEATURE_LEN_V2,
-    FEATURE_LEN_V3, FEATURE_VERSION,
+    FEATURE_LEN_V3, FEATURE_LEN_V4, FEATURE_VERSION,
 };
+use poke_engine::features_v4;
 use poke_engine::learned::{Evaluator, Scratch};
 use poke_engine::mcts::{perform_mcts_export, ExportConfig, MctsResult, MctsSideResult};
 use poke_engine::prior::{
@@ -1070,10 +1071,16 @@ impl PyEvaluator {
         self.inner.material
     }
 
-    /// Feature version the weights consume (1 or 2).
+    /// Feature version the weights consume (1, 2, 3 or 4).
     #[getter]
     fn feature_version(&self) -> u32 {
         self.inner.feature_version()
+    }
+
+    /// Embedding dims (species, item, ability, move) of a feature-version-4 net, else None.
+    #[getter]
+    fn embed_dims(&self) -> Option<Vec<usize>> {
+        self.inner.embed().map(|e| e.dims().to_vec())
     }
 
     #[getter]
@@ -1280,9 +1287,45 @@ fn state_features(py_state: PyState, side: u8, version: Option<u32>) -> PyResult
 fn check_version(version: Option<u32>) -> PyResult<u32> {
     let v = version.unwrap_or(FEATURE_VERSION);
     if feature_len(v).is_none() {
-        return Err(value_err(format!("unknown feature version {v} (known: 1, 2, 3)")));
+        return Err(value_err(format!("unknown feature version {v} (known: 1, 2, 3, 4)")));
     }
     Ok(v)
+}
+
+/// Identity indices of feature version 4 (`IDENTITY_LENGTH` = 84 ints): per Pokemon slot (own
+/// 0..5 then opp 0..5, slot 0 = the active) `[species, item, ability, move0..move3]`; 0 = pad
+/// (fainted), 1 = unknown, else enum discriminant + 2. See docs/features-v4.md.
+#[pyfunction]
+#[pyo3(signature = (py_state, side=1))]
+fn state_identity(py_state: PyState, side: u8) -> PyResult<Vec<u16>> {
+    let side_ref = match side {
+        1 => SideReference::SideOne,
+        2 => SideReference::SideTwo,
+        _ => return Err(value_err(format!("side must be 1 or 2, got {side}"))),
+    };
+    let state: State = py_state.into();
+    Ok(features_v4::identity(&state, side_ref))
+}
+
+/// Rows of the four embedding tables (species, item, ability, move), pad and unknown included.
+#[pyfunction]
+fn identity_vocab_sizes() -> Vec<usize> {
+    (0..features_v4::N_TABLES).map(features_v4::vocab_size).collect()
+}
+
+/// Entry names of embedding table `table` (0 species, 1 item, 2 ability, 3 move), in row order.
+#[pyfunction]
+fn identity_vocab(table: usize) -> PyResult<Vec<String>> {
+    if table >= features_v4::N_TABLES {
+        return Err(value_err(format!("table must be 0..{}, got {table}", features_v4::N_TABLES - 1)));
+    }
+    Ok(features_v4::vocab_names(table))
+}
+
+/// Fingerprint of the four vocabularies, stored in v4 `.pev` files.
+#[pyfunction]
+fn identity_vocab_hash() -> u64 {
+    features_v4::vocab_hash()
 }
 
 /// Names of the features, same order as `state_features`.
@@ -1610,7 +1653,14 @@ fn py_poke_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("FEATURE_LENGTH", FEATURE_LEN)?;
     m.add("FEATURE_LENGTH_V2", FEATURE_LEN_V2)?;
     m.add("FEATURE_LENGTH_V3", FEATURE_LEN_V3)?;
-    m.add("FEATURE_VERSIONS", vec![1u32, 2u32, 3u32])?;
+    m.add("FEATURE_LENGTH_V4", FEATURE_LEN_V4)?;
+    m.add("FEATURE_VERSIONS", vec![1u32, 2u32, 3u32, 4u32])?;
+    m.add("IDENTITY_LENGTH", features_v4::N_IDS)?;
+    m.add("IDENTITY_IDS_PER_SLOT", features_v4::IDS_PER_SLOT)?;
+    m.add_function(wrap_pyfunction!(state_identity, m)?)?;
+    m.add_function(wrap_pyfunction!(identity_vocab_sizes, m)?)?;
+    m.add_function(wrap_pyfunction!(identity_vocab, m)?)?;
+    m.add_function(wrap_pyfunction!(identity_vocab_hash, m)?)?;
     m.add_function(wrap_pyfunction!(feature_length, m)?)?;
     m.add_class::<PyEvaluator>()?;
     m.add_class::<PyPolicyPrior>()?;

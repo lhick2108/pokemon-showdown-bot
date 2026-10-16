@@ -463,3 +463,66 @@ rows are 1.5 KB for v1, 4.4 KB for v2). Treat as +-50%:
 | (c) human_eval, 35.7k games x 4 | about 140k positions per model | below 0.5 GB | about 1.5 min per model |
 
 Uncapped (`--max-per-game 0`) the pretrain set is about 2.6M rows (about 4 GB v1, 12 GB v2).
+
+## Feature version 4: identity embeddings, wide net, human pretrain then self-play fine-tune (589.65)
+
+`--features v4` = dense v2 ++ v3 features (2379) plus the species / item / ability / four move
+identity of all 12 slots as learned embeddings (`--embed-dim`, default 8 per table, moves
+mean-pooled), feeding `Linear(2379 + 12 * 32, --hidden) -> ReLU -> Linear(hidden, 1)`. Layout,
+vocabularies and the format-3 `.pev`: `docs/features-v4.md`. `--residual`, `--init`,
+`--value-target search|blend|td|nstep`, `--q-*`, `--nodes`, `--dropout` and `--val-data` work as
+for v1-v3; `--augment-*` and `--aux on` are v1 only. A run also writes `<out>.pev.vocab.json`.
+
+Rows are 2463 columns (the 84 identity indices ride in the same matrix; float16 holds them
+exactly), 4.9 KB per float16 row: 1M rows = 4.9 GB, 3M rows = 15 GB. Cap the human set with
+`--max-per-game` to fit RAM (6 decisions per game over the 100k-game set is about 1.1M train
+rows = 5.5 GB); matrices over 2 GB stay in CPU RAM and are moved to the GPU per batch.
+
+Recommended commands (PowerShell, repo root, 3080; `--batch-size 2048` because the net is wide
+and the sets are large; set `OMP_NUM_THREADS=4` to cap the CPU side):
+
+```powershell
+# (a) human pretrain: outcome targets on first-person truth states, h128, embed 8, residual
+python -m showdown_bot.train --data data\human\pc1-fp-aux\train --states truth `
+    --value-target outcome --model mlp --residual --features v4 --embed-dim 8 --hidden 128 `
+    --x-dtype float16 --max-per-game 8 --load-workers 6 --batch-size 2048 --lr 1e-3 `
+    --weight-decay 1e-4 --epochs 12 --patience 3 --out models\human-v4-h128.pev `
+    --val-data data\human\pc1-fp-aux\test@4
+
+# (b) self-play fine-tune: warm start, search-value targets (corrected q labels), lower lr
+python -m showdown_bot.train --data data\selfplay\gen8 --data data\selfplay\gen9 `
+    --init models\human-v4-h128.pev --states prefer-truth --value-target search --q-kind absolute `
+    --model mlp --residual --features v4 --embed-dim 8 --hidden 128 --x-dtype float16 `
+    --load-workers 6 --batch-size 1024 --lr 2e-4 --weight-decay 1e-4 --dropout 0.1 `
+    --epochs 15 --patience 3 --out models\ft-v4-h128.pev `
+    --val-data data\human\pc1-fp-aux\test@4
+
+# (c) score both on human test positions next to the references
+python scripts\human_eval.py models\human-v4-h128.pev models\ft-v4-h128.pev `
+    models\gen7-res-root-mlp16.pev --data data\human\pc1-fp-aux\test --json human-eval-v4.json
+```
+
+`--init` needs the same `--features`, `--hidden`, `--embed-dim` and `--residual` (it prints the
+mismatch otherwise); a vocabulary hash different from the engine's is refused. Because the
+fine-tune starts from the human net, the first epochs of (b) show how far self-play labels move
+it; lower `--lr` (1e-4) or raise `--dropout` if the self-play val BCE rises while train falls
+(the 1.4M self-play rows overfit larger nets from scratch, bead 589.20; that is the reason for
+the pretrain). Both steps verify the export (max |`Evaluator.evaluate` - torch logit|, about
+1e-6 on smoke runs).
+
+Smoke runs (3,258 human rows then 3,850 gen8+gen9 self-play rows, h64, embed 8, residual,
+3 epochs each, RTX 3080): human pretrain 12.9 s total, fine-tune with `--init` and
+`--value-target search` 6.8 s, both exports verified. Leaf-eval speed (single thread, 102 gen9
+random-battle states, `engine/examples/bench_net.rs`, the SPRT experiment was loading the
+machine so treat as +-10%):
+
+| evaluator | pure `Evaluator.logit` calls/s | MCTS iterations/s, 1 thread | vs stock evaluate |
+| --- | --- | --- | --- |
+| stock `evaluate` | 15.0M | 305-325k | 1.00 |
+| gen7 net (v1, h16, residual) | 5.0M | 281-287k | 0.92 |
+| v4, h64, embed 8 | 0.60-0.66M | 181-182k | 0.58 |
+| v4, h128, embed 8 | 0.47-0.48M | 157-158k | 0.50 |
+
+At equal wall time a v4 h64 net therefore searches about 0.64x as many iterations as the gen7
+net, h128 about 0.55x. About 0.7 us of the 1.5 us (h64) is the v3 matchup block, which is
+recomputed per leaf and does not depend on the hidden size.

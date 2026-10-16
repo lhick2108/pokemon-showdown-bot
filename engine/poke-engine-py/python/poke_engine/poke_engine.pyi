@@ -441,7 +441,11 @@ class MctsResult:
 FEATURE_VERSION: int
 FEATURE_LENGTH: int
 FEATURE_LENGTH_V2: int
+FEATURE_LENGTH_V3: int
+FEATURE_LENGTH_V4: int
 FEATURE_VERSIONS: List[int]
+IDENTITY_LENGTH: int
+IDENTITY_IDS_PER_SLOT: int
 
 def feature_length(version: Optional[int] = None) -> int: ...
 
@@ -477,6 +481,10 @@ class Evaluator:
     def save(self, path: str) -> None: ...
     @property
     def feature_version(self) -> int: ...
+    @property
+    def embed_dims(self) -> Optional[List[int]]:
+        """Embedding dims (species, item, ability, move) of a feature-version-4 net, else None."""
+        ...
     def evaluate(self, py_state: State) -> float: ...
     def logit(self, py_state: State) -> float:
         """Model logit of P(side one wins); same as ``evaluate``."""
@@ -509,6 +517,15 @@ def state_features(py_state: State, side: int = 1, version: Optional[int] = None
     ...
 
 def state_feature_names(version: Optional[int] = None) -> List[str]: ...
+
+def state_identity(py_state: State, side: int = 1) -> List[int]:
+    """Feature version 4 identity indices (IDENTITY_LENGTH ints): per slot (own 0..5, opp 0..5)
+    [species, item, ability, move0..3]; 0 = pad (fainted), 1 = unknown, else enum id + 2."""
+    ...
+
+def identity_vocab_sizes() -> List[int]: ...
+def identity_vocab(table: int) -> List[str]: ...
+def identity_vocab_hash() -> int: ...
 
 def mcts(
     py_state: State,

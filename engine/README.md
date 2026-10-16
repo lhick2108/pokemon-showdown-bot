@@ -87,6 +87,10 @@ Little endian: `"PEVN"`, `u32 format`, `u32 feature_version`, `u32 kind`
 `u32 flags` (bit0 = residual) and `f32 stock_coef`. A residual evaluator's logit
 is `stock_coef * evaluate(state) + net(features)` (the net's bias included);
 `stock_coef = a * 0.0125`, the multiplier on the raw stock evaluation points.
+**Format 3 (feature version 4, embedding tables)** is written only for nets with
+learned identity embeddings; see `docs/features-v4.md` (`write_mlp_embed`,
+`Evaluator.embed_dims`, `state_identity`, `identity_vocab*`). Formats 1 and 2 are
+unchanged and still load.
 Format 1 files load unchanged (not residual). Plain evaluators are still
 written as format 1, so older tooling keeps working; only a residual file needs
 a v2-aware reader. `write_linear` / `write_mlp` take `stock_coef` (default 0.0 =

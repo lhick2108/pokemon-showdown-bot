@@ -41,6 +41,22 @@ Q_KINDS = ("relative", "absolute")
 Q_EVAL_SCALE = 0.0125  # the stock MCTS score is sigmoid(0.0125 * (e_leaf - e_root))
 
 
+def state_row(poke_engine, state, side: int, feature_version: int | None = None) -> list[float]:
+    """One training/eval input row of ``state`` for ``side``.
+
+    Versions 1-3: ``poke_engine.state_features``. Version 4: the dense features followed by the
+    ``IDENTITY_LENGTH`` (84) identity indices (``state_identity``) as floats, so the whole row
+    travels through the one feature matrix; the model splits it again (``train.EmbedMLP``).
+    Indices are < 2048, exactly representable even in float16.
+    """
+    if feature_version in (None, 1):
+        return poke_engine.state_features(state, side)
+    row = poke_engine.state_features(state, side, feature_version)
+    if feature_version == 4:
+        row = list(row) + [float(i) for i in poke_engine.state_identity(state, side)]
+    return row
+
+
 @dataclass
 class Sample:
     features: list[float]
@@ -248,7 +264,6 @@ def iter_samples(
     import poke_engine
 
     # None = the engine's default feature version (old engines have no ``version`` argument)
-    feat_kwargs = {} if feature_version in (None, 1) else {"version": feature_version}
     stats = stats if stats is not None else LoadStats()
     # ``files`` restricts the walk to those game files (used by the parallel loader)
     for path in (recorder.iter_game_files(root) if files is None else files):
@@ -345,7 +360,7 @@ def iter_samples(
                 stock_eval = float(poke_engine.evaluate(state))  # always filled (absolute q needs it)
                 for side in sides:
                     yield Sample(
-                        features=poke_engine.state_features(state, side, **feat_kwargs),
+                        features=state_row(poke_engine, state, side, feature_version),
                         value=value_target(result, side),
                         policy=policy if side == 1 else None,
                         kind=kind,
@@ -379,7 +394,7 @@ def iter_samples(
                             continue
                         for side in sides:
                             yield Sample(
-                                features=poke_engine.state_features(n_parsed, side, **feat_kwargs),
+                                features=state_row(poke_engine, n_parsed, side, feature_version),
                                 value=value_target(result, side),
                                 policy=None,
                                 kind=KIND_NODE,

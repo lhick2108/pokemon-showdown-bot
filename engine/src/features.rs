@@ -17,6 +17,7 @@ pub const FEATURE_VERSION: u32 = 1;
 pub const FEATURE_VERSION_1: u32 = 1;
 pub const FEATURE_VERSION_2: u32 = 2;
 pub const FEATURE_VERSION_3: u32 = 3;
+pub const FEATURE_VERSION_4: u32 = 4;
 
 /// Pokemon slots encoded per side (slot 0 is the active Pokemon).
 pub const TEAM_SLOTS: usize = 6;
@@ -157,6 +158,7 @@ pub const FEATURE_LEN: usize = 2 * PER_SIDE + FIELD_LEN;
 pub const FEATURE_LEN_V1: usize = FEATURE_LEN;
 pub use crate::features_v2::FEATURE_LEN_V2;
 pub use crate::features_v3::FEATURE_LEN_V3;
+pub use crate::features_v4::FEATURE_LEN_V4;
 
 /// Length of the feature vector of `version` (1, 2 or 3), None for unknown versions.
 pub fn feature_len(version: u32) -> Option<usize> {
@@ -164,6 +166,7 @@ pub fn feature_len(version: u32) -> Option<usize> {
         FEATURE_VERSION_1 => Some(FEATURE_LEN_V1),
         FEATURE_VERSION_2 => Some(FEATURE_LEN_V2),
         FEATURE_VERSION_3 => Some(FEATURE_LEN_V3),
+        FEATURE_VERSION_4 => Some(FEATURE_LEN_V4),
         _ => None,
     }
 }
@@ -362,6 +365,10 @@ pub fn features_versioned_into(state: &State, side: SideReference, version: u32,
             features_into(state, side, out);
             crate::features_v3::extras_into(state, side, &mut out[..FEATURE_LEN_V3]);
         }
+        FEATURE_VERSION_4 => {
+            features_into(state, side, out);
+            crate::features_v4::extras_into(state, side, &mut out[..FEATURE_LEN_V4]);
+        }
         _ => panic!("unknown feature version {}", version),
     }
 }
@@ -381,6 +388,7 @@ pub fn feature_names_versioned(version: u32) -> Vec<String> {
         FEATURE_VERSION_1 => {}
         FEATURE_VERSION_2 => names.extend(crate::features_v2::extra_names()),
         FEATURE_VERSION_3 => names.extend(crate::features_v3::extra_names()),
+        FEATURE_VERSION_4 => names.extend(crate::features_v4::extra_names()),
         _ => panic!("unknown feature version {}", version),
     }
     names
