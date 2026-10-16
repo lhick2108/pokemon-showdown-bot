@@ -118,6 +118,68 @@ def absolute_search_value(
     return 1.0 / (1.0 + math.exp(-z))
 
 
+# poke_engine.Evaluator per weights path, loaded once per process (leaf scale is applied here)
+_ANCHOR_EVALUATORS: dict[str, Any] = {}
+
+
+def _anchor_evaluator(path: str) -> Any:
+    ev = _ANCHOR_EVALUATORS.get(path)
+    if ev is None:
+        import poke_engine
+
+        try:
+            ev = poke_engine.Evaluator.load(path)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(
+                f"cannot load the evaluator {path!r} that anchors this recording's search scores "
+                f"({exc}); pass --q-evaluator PATH [--q-leaf-scale S] (or 'stock') to override"
+            ) from exc
+        _ANCHOR_EVALUATORS[path] = ev
+    return ev
+
+
+def recording_anchor(
+    header: dict[str, Any], q_evaluator: str | None = None, q_leaf_scale: float | None = None
+) -> tuple[str | None, float]:
+    """``(evaluator path or None for stock, leaf scale)`` the recording's search used.
+
+    Read from the game header's ``config`` (``evaluator``, ``evaluator_scale``), which is the
+    recording player's own search config. ``q_evaluator`` / ``q_leaf_scale`` override it
+    (``q_evaluator="stock"`` forces the stock anchor). An evaluator ensemble (``evaluator2``)
+    cannot be reconstructed without exported values, so it raises unless overridden.
+    """
+    cfg = header.get("config") or {}
+    if q_evaluator is not None:
+        path = None if q_evaluator.lower() == "stock" else q_evaluator
+        scale = q_leaf_scale if q_leaf_scale is not None else (
+            float(cfg.get("evaluator_scale") or 1.0) if cfg.get("evaluator") == path else 1.0)
+        return path, float(scale)
+    path = cfg.get("evaluator")
+    if not path:
+        return None, 1.0
+    if cfg.get("evaluator2"):
+        raise ValueError(
+            f"{header.get('battle_tag')}: recorded with an evaluator ensemble (evaluator2); the "
+            "per-world evaluator is not stored, pass --q-evaluator to force one")
+    scale = q_leaf_scale if q_leaf_scale is not None else cfg.get("evaluator_scale") or 1.0
+    return str(path), float(scale)
+
+
+def learned_absolute_search_value(evaluator: Any, state: Any, avg_score: float, scale: float) -> float:
+    """Exact absolute P(side one wins) at a search root run with a learned evaluator.
+
+    The engine's leaf score is ``sigmoid(k * (z_leaf - z_root))`` (relative evaluators), so the
+    mean score ``m`` inverts to ``z_root + logit(m) / k`` with ``z_root = evaluator.logit(root)``
+    (includes the stock term of a residual net) and ``k`` the leaf scale; absolute (non-relative)
+    evaluators use ``logit(m) / k``. Mirrors ``LeafEval::absolute_logit`` in ``engine/src/mcts.rs``.
+    """
+    p = min(max(avg_score, 1e-4), 1 - 1e-4)
+    z = math.log(p / (1 - p)) / scale
+    if evaluator.relative_to_root:
+        z += float(evaluator.logit(state))
+    return 1.0 / (1.0 + math.exp(-z))
+
+
 def decision_search_value(decision: dict[str, Any]) -> float | None:
     """Mean ``avg_score`` over the decision's usable worlds (side one's view), or None."""
     scores = [q for q in map(_valid_score, decision.get("worlds", ())) if q is not None]
@@ -141,6 +203,9 @@ def iter_samples(
     nodes: str = "off",
     node_min_visits: int = 0,
     nodes_per_world: int = 0,
+    q_evaluator: str | None = None,
+    q_leaf_scale: float | None = None,
+    use_exported_q: bool = True,
 ) -> Iterator[Sample]:
     """Yield one ``Sample`` per stored state (every searched world, plus truth).
 
@@ -168,6 +233,13 @@ def iter_samples(
     ``node_depth`` / ``node_static`` carry the weighting information for the trainer.
     ``nodes_per_world`` > 0 keeps only that many of a world's eligible nodes (a uniform
     random subset, reproducible from ``seed``, the file name and the decision index).
+
+    Absolute search values (``search_value_abs``): a world's exported ``search_value`` when
+    present (``use_exported_q``); otherwise reconstructed from ``avg_score`` with the
+    evaluator the recording used (``recording_anchor``: the header config's ``evaluator`` /
+    ``evaluator_scale``, overridable with ``q_evaluator`` / ``q_leaf_scale``), exactly as the
+    engine does (``learned_absolute_search_value``). Only recordings made with the stock
+    evaluator use ``sigmoid(q_eval_scale * evaluate(state) + logit(avg_score))``.
     """
     if q_source not in Q_SOURCES:
         raise ValueError(f"q_source must be one of {Q_SOURCES}")
@@ -193,6 +265,8 @@ def iter_samples(
         stats.games += 1
         stats.results[result] += 1
         tag = game["header"].get("battle_tag", "")
+        anchor_path, anchor_scale = recording_anchor(game["header"], q_evaluator, q_leaf_scale)
+        anchor_ev = None if anchor_path is None else _anchor_evaluator(anchor_path)
         final_state = None
         for d_ in reversed(game["decisions"]):
             final_state = (d_.get("truth") or {}).get("state") or (
@@ -229,11 +303,13 @@ def iter_samples(
             world_abs: list[float | None] = []
             for w in decision.get("worlds", ()):
                 score, st = _valid_score(w), parse(w["state"])
-                exported = w.get("search_value")  # absolute root value, exported with the nodes
+                exported = w.get("search_value") if use_exported_q else None  # absolute root value
                 world_abs.append(
                     None if score is None or st is None
                     else float(exported) if exported is not None
                     else absolute_search_value(poke_engine.evaluate(st), score, q_eval_scale)
+                    if anchor_ev is None
+                    else learned_absolute_search_value(anchor_ev, st, score, anchor_scale)
                 )
             valid_abs = [v for v in world_abs if v is not None]
             abs_mean = sum(valid_abs) / len(valid_abs) if valid_abs else None
@@ -250,7 +326,8 @@ def iter_samples(
                 tstate = parse(tstring)
                 t_abs = (
                     None if tstate is None or q_mean is None
-                    else abs_mean if all(w.get("search_value") is not None for w in decision["worlds"])
+                    else abs_mean if anchor_ev is not None or (use_exported_q and all(
+                        w.get("search_value") is not None for w in decision["worlds"]))
                     else absolute_search_value(poke_engine.evaluate(tstate), q_mean, q_eval_scale)
                 )
                 states.append((KIND_TRUTH, tstring, q_mean, t_abs))

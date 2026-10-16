@@ -1732,9 +1732,12 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             opp_visits=bool(self.config.belief_reweight),
             export_nodes=export,
             export_min_visits=self.config.export_min_visits,
+            # recorded searches always carry the absolute root value (no node export needed)
+            record_value=self._recorder is not None,
             **self._prior_kwargs(),
         ) if (self.config.tendency or self.config.belief_reweight or self.config.opp_model
-              or export or self.config.prior is not None or self.config.material > 0) else _worker.search_world
+              or export or self.config.prior is not None or self.config.material > 0
+              or self._recorder is not None) else _worker.search_world
         futures = [
             loop.run_in_executor(
                 executor, search_fn, state, time_ms, self.config.threads,

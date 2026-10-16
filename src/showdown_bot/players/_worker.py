@@ -131,6 +131,7 @@ def search_world(
     export_nodes: int = 0,
     export_min_visits: int = 16,
     material: float = 0.0,
+    record_value: bool = False,
 ) -> tuple:
     """Run MCTS on one serialised world.
 
@@ -155,6 +156,9 @@ def search_world(
     ``(state, visits, value, static_value, depth)`` (values are absolute P(side one wins); see
     ``poke_engine.MctsResult.nodes``) and whose ``.search_value`` is the root's absolute search
     value; an engine without the export raises.
+    With ``record_value`` (and no node export) the result is an ``OppTuple`` with ``.search_value``
+    set (``nodes`` None) whenever the engine reports a finite root search value (single-threaded
+    searches; an older engine or the threaded search leaves it off).
     Plain tuples keep the result cheap to pickle. A Rust panic surfaces in
     Python as ``pyo3_runtime.PanicException`` (a ``BaseException``), so it is
     converted to an ordinary ``RuntimeError`` here.
@@ -194,6 +198,10 @@ def search_world(
         if export_nodes:
             nodes = [(str(s), int(v), float(val), float(st), int(d)) for s, v, val, st, d in result.nodes or ()]
             return OppTuple(out, opp, nodes, float(result.root_search_value))
+        if record_value:
+            value = float(getattr(result, "root_search_value", float("nan")))
+            if value == value and abs(value) != float("inf"):  # finite
+                return OppTuple(out, opp, None, value)
         if opp_visits:
             return OppTuple(out, opp)
         return out

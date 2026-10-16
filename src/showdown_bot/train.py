@@ -52,7 +52,10 @@ Value target (``--value-target``)
     without a usable q fall back to z. ``--q-kind absolute|relative`` (default absolute): the recorded score is
     relative to the root evaluation, so absolute q adds it back,
     ``sigmoid(scale*eval(state) + logit(avg_score))``, ``--q-eval-scale``
-    (0.0125). ``--q-source decision|world`` picks the
+    (0.0125) is only the anchor for stock-evaluator recordings; for a learned-evaluator
+    recording (header config ``evaluator``) the root logit comes from that evaluator and
+    the relative part is divided by its leaf scale (exact; ``--q-evaluator`` /
+    ``--q-leaf-scale`` override the header). ``--q-source decision|world`` picks the
     decision's mean over worlds (default) or each world's own score. Metrics are
     reported against the training target and against the pure outcome z.
 
@@ -312,6 +315,7 @@ def _load_chunk(job: tuple) -> dict:
         worlds="fallback" if states == "prefer-truth" else states in ("both", "worlds"),
         truth=states in ("both", "truth", "prefer-truth"), stats=stats, q_source=kw["q_source"],
         q_eval_scale=kw["q_eval_scale"], feature_version=kw["feature_version"], files=files,
+        q_evaluator=kw["q_evaluator"], q_leaf_scale=kw["q_leaf_scale"],
     ):
         feats.append(np.asarray(s.features, dtype=np.dtype(kw["x_dtype"])))
         ys.append(s.value)
@@ -421,6 +425,8 @@ def load_data(
     node_depth_discount: float = 1.0,
     nodes_per_world: int = 0,
     aux_targets: bool = False,
+    q_evaluator: str | None = None,
+    q_leaf_scale: float | None = None,
 ) -> Data:
     """Load the samples of the given run directories (``Source`` / path / spec) into memory.
 
@@ -459,7 +465,8 @@ def load_data(
               feature_version=feature_version, x_dtype=x_dtype, seed=seed, keep_every=STATE_KEEP_EVERY,
               nodes=nodes, node_min_visits=node_min_visits, node_weight=node_weight,
               node_visit_ref=node_visit_ref, node_depth_discount=node_depth_discount,
-              nodes_per_world=nodes_per_world, aux=aux_targets)
+              nodes_per_world=nodes_per_world, aux=aux_targets,
+              q_evaluator=q_evaluator, q_leaf_scale=q_leaf_scale)
     with tempfile.TemporaryDirectory(prefix="pev-load-") as spill:
         job0 = 0
         for source in sources:
@@ -1122,6 +1129,12 @@ def _parser() -> argparse.ArgumentParser:
                    help="q = root-relative avg_score, or absolute (adds back the root's stock eval)")
     p.add_argument("--q-eval-scale", type=float, default=dataset.Q_EVAL_SCALE,
                    help="coefficient of the stock eval in the search score (default 0.0125)")
+    p.add_argument("--q-evaluator", default=None, metavar="PATH|stock",
+                   help="evaluator that anchors the recorded root-relative scores into absolute q. "
+                        "Default: read per game from the header config (evaluator + evaluator_scale); "
+                        "override when a header is missing or wrong. 'stock' forces the stock anchor")
+    p.add_argument("--q-leaf-scale", type=float, default=None, metavar="S",
+                   help="leaf scale of the recording's evaluator (default: header evaluator_scale)")
     p.add_argument("--q-source", choices=dataset.Q_SOURCES, default="decision",
                    help="q for world samples: decision mean (default) or the world's own score")
     p.add_argument("--nodes", choices=dataset.NODE_MODES, default="off",
@@ -1237,6 +1250,7 @@ def main(argv=None) -> int:
         nodes=args.nodes, node_min_visits=args.node_min_visits, node_weight=args.node_weight,
         node_visit_ref=args.node_visit_ref, node_depth_discount=args.node_depth_discount,
         nodes_per_world=args.nodes_per_world, aux_targets=args.aux == "on" or args.aux_metrics,
+        q_evaluator=args.q_evaluator, q_leaf_scale=args.q_leaf_scale,
     )
     extra_val: list[tuple[str, Data]] = []
     for vsrc in args.val_data:

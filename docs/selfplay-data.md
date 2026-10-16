@@ -57,10 +57,20 @@ opponent team included), `total_visits`, `avg_score` (root total score / total
 visits, in the engine's [0,1] value scale from side one's view), and `moves`
 (`choice`, `visits`, `score` for each of our options).
 
-Optional world fields, written only by searches run with `export_nodes` > 0 (`selfplay.py
---export-nodes K`, engine 0.0.48+sdb.9, bead showdown-bot-rnm; see "Interior nodes" below):
-`search_value` (the search's *absolute* P(side one wins) at the root; unlike `avg_score` it needs
-no root evaluation to be added back) and `nodes`.
+Optional world fields: `search_value` (the search's *absolute* P(side one wins) at the root;
+unlike `avg_score` it needs no root evaluation to be added back; written for every searched
+world of a recording made after the q-anchor change, single-threaded searches only, earlier
+only with `export_nodes` > 0) and `nodes` (only with `selfplay.py --export-nodes K`, engine
+0.0.48+sdb.9, bead showdown-bot-rnm; see "Interior nodes" below).
+
+When `search_value` is absent the loader reconstructs it exactly from `avg_score` m with the
+evaluator the recording used (header `config.evaluator`, `config.evaluator_scale` = k):
+`q = sigmoid(logit(m) / k + z_root)`, `z_root = Evaluator.logit(world state)` (a residual net's
+logit already contains its stock term; absolute, non-relative evaluators have `z_root = 0`).
+Stock-evaluator recordings use `sigmoid(0.0125 * evaluate(state) + logit(m))`. `train.py
+--q-evaluator PATH|stock --q-leaf-scale S` overrides the header; an evaluator ensemble
+(`evaluator2`) or an unloadable evaluator file raises instead of falling back to the stock anchor.
+`material` > 0 recordings follow the engine's own `root_search_value`, which ignores the blend.
 
 States are stored as strings, not features, so features can be regenerated with
 `poke_engine.state_features(State.from_string(s), side)` after any

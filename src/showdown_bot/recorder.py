@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import math
 import os
 import re
 import threading
@@ -70,9 +71,11 @@ def world_record(
             move["strategy"] = float(share)
     if nash is not None:  # Nash mode: our equilibrium strategy and the game value
         record["nash"] = nash
+    value = getattr(outcome, "search_value", None)  # absolute root value (every recorded search)
+    if value is not None and math.isfinite(value):
+        record["search_value"] = round(float(value), 5)
     nodes = getattr(outcome, "nodes", None)
     if nodes is not None:  # interior-node export (bead rnm): [state, visits, value, static, depth]
-        record["search_value"] = round(float(outcome.search_value), 5)
         record["nodes"] = [[s, int(v), round(float(val), 5), round(float(st), 5), int(d)]
                            for s, v, val, st, d in nodes]
     return record
