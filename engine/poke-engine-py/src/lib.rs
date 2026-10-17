@@ -1,5 +1,5 @@
 use pyo3::prelude::*;
-use pyo3::types::PyType;
+use pyo3::types::{PyBytes, PyType};
 use pyo3::{pyfunction, pymethods, pymodule, wrap_pyfunction, Bound, PyResult};
 use std::collections::HashSet;
 
@@ -16,6 +16,7 @@ use poke_engine::features::{
     FEATURE_LEN_V3, FEATURE_LEN_V4, FEATURE_LEN_V5, FEATURE_VERSION,
 };
 use poke_engine::features_v4;
+use poke_engine::tokens;
 use poke_engine::learned::{Evaluator, Scratch};
 use poke_engine::mcts::{perform_mcts_export, ExportConfig, MctsResult, MctsSideResult};
 use poke_engine::prior::{
@@ -1244,6 +1245,159 @@ fn policy_actions(py_state: PyState, side: u8) -> PyResult<Vec<(String, i32)>> {
         .collect())
 }
 
+// ---------------------------------------------------------------------------
+// Transformer tokens (bead showdown-bot-589.68.1, docs/tokens.md)
+// ---------------------------------------------------------------------------
+
+type RevealArg = Option<Vec<(String, Vec<String>, bool, bool, bool)>>;
+type TokenOut<'py> = (Bound<'py, PyBytes>, Bound<'py, PyBytes>, Vec<String>);
+
+fn reveal_of(r: RevealArg) -> Option<Vec<tokens::Revealed>> {
+    r.map(|rows| {
+        rows.into_iter()
+            .map(|(species, moves, item, ability, tera)| tokens::Revealed { species, moves, item, ability, tera })
+            .collect()
+    })
+}
+
+fn i16_bytes(v: &[i16]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+fn f32_bytes(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+/// The 13 action-slot choice strings of `side` ("" for an empty slot), from the same
+/// `root_options` + `action_slot` path as `policy_actions`.
+fn slot_names(state: &State, side: u8) -> Vec<String> {
+    let (own, opts) = root_options(state, side);
+    let mut names = vec![String::new(); N_ACTIONS];
+    for o in &opts {
+        if let Some(s) = action_slot(own, o) {
+            names[s] = movechoice_to_string(own, o);
+        }
+    }
+    names
+}
+
+fn tokens_core<'py>(
+    py: Python<'py>,
+    state: &State,
+    side: u8,
+    reveal: RevealArg,
+    with_choices: bool,
+) -> PyResult<TokenOut<'py>> {
+    let r = side_ref(side)?;
+    let rev = reveal_of(reveal);
+    let mut cat = vec![0i16; tokens::CAT_LEN];
+    let mut cont = vec![0f32; tokens::CONT_LEN];
+    tokens::state_tokens_into(state, r, rev.as_deref(), &mut cat, &mut cont);
+    let mut names = Vec::new();
+    if with_choices {
+        names = slot_names(state, side);
+        names.extend(slot_names(state, 3 - side));
+    }
+    Ok((PyBytes::new(py, &i16_bytes(&cat)), PyBytes::new(py, &f32_bytes(&cont)), names))
+}
+
+/// Token buffers of a `State` object: `(cat int16 bytes, cont float32 bytes, choices)`; see
+/// `token_layout()` / docs/tokens.md. `opp_reveal` is an optional list of
+/// `(species, moves, item_revealed, ability_revealed, tera_revealed)` rows; when given, the
+/// opponent is reduced to what they list. `choices` is the 26 slot names (own 13, opp 13)
+/// when `with_choices`, else empty.
+#[pyfunction]
+#[pyo3(signature = (py_state, side=1, opp_reveal=None, with_choices=false))]
+fn state_tokens<'py>(
+    py: Python<'py>,
+    py_state: PyState,
+    side: u8,
+    opp_reveal: RevealArg,
+    with_choices: bool,
+) -> PyResult<TokenOut<'py>> {
+    let state: State = py_state.into();
+    tokens_core(py, &state, side, opp_reveal, with_choices)
+}
+
+/// `state_tokens` for a serialized state string (`State.to_string()`): skips the slow
+/// `State` object round trip.
+#[pyfunction]
+#[pyo3(signature = (state, side=1, opp_reveal=None, with_choices=false))]
+fn state_tokens_str<'py>(
+    py: Python<'py>,
+    state: &str,
+    side: u8,
+    opp_reveal: RevealArg,
+    with_choices: bool,
+) -> PyResult<TokenOut<'py>> {
+    let state = State::deserialize(state);
+    tokens_core(py, &state, side, opp_reveal, with_choices)
+}
+
+/// Hidden-set targets (int16 bytes: `6 * HID_W` ids, 6 mask flags, 6 true species ids) for the
+/// opponent slots of `state`, taken from `truth`'s set of the same species.
+#[pyfunction]
+#[pyo3(signature = (state, truth, side=1))]
+fn state_hidden_targets<'py>(py: Python<'py>, state: &str, truth: &str, side: u8) -> PyResult<Bound<'py, PyBytes>> {
+    let r = side_ref(side)?;
+    let (s, t) = (State::deserialize(state), State::deserialize(truth));
+    Ok(PyBytes::new(py, &i16_bytes(&tokens::hidden_targets(&s, &t, r))))
+}
+
+/// Mean seconds per core `state_tokens` computation (no Python conversion), `n` repetitions.
+#[pyfunction]
+#[pyo3(signature = (state, side=1, n=1000, scrub=false))]
+fn tokens_bench(state: &str, side: u8, n: usize, scrub: bool) -> PyResult<f64> {
+    let r = side_ref(side)?;
+    let s = State::deserialize(state);
+    let rev = if scrub { Some(vec![tokens::Revealed::default()]) } else { None };
+    let mut cat = vec![0i16; tokens::CAT_LEN];
+    let mut cont = vec![0f32; tokens::CONT_LEN];
+    let t0 = std::time::Instant::now();
+    for _ in 0..n {
+        tokens::state_tokens_into(&s, r, rev.as_deref(), &mut cat, &mut cont);
+        std::hint::black_box(&cont);
+    }
+    Ok(t0.elapsed().as_secs_f64() / n as f64)
+}
+
+/// `(name, buffer, offset, shape, dtype)` of every token field; buffer is "cat" (int16) or
+/// "cont" (float32), offset in elements.
+#[pyfunction]
+fn token_layout() -> Vec<(String, String, usize, Vec<usize>, String)> {
+    tokens::layout()
+        .into_iter()
+        .map(|(n, b, o, s, d)| (n.to_string(), b.to_string(), o, s, d.to_string()))
+        .collect()
+}
+
+/// Constants of the token layout.
+#[pyfunction]
+fn token_constants() -> Vec<(String, usize)> {
+    vec![
+        ("TOKEN_VERSION", tokens::TOKEN_VERSION as usize),
+        ("N_MON", tokens::N_MON),
+        ("IDS_PER_MON", features_v4::IDS_PER_SLOT),
+        ("KNOWN_W", tokens::KNOWN_W),
+        ("C_MON", tokens::C_MON),
+        ("C_SIDE", tokens::C_SIDE),
+        ("C_GLOB", tokens::C_GLOB),
+        ("N_PAIR", poke_engine::features_v3::N_PAIR),
+        ("N_PAIR_CH", tokens::N_PAIR_CH),
+        ("N_AGG", tokens::N_AGG),
+        ("N_ACT", tokens::N_ACT),
+        ("N_AFEAT", N_AFEAT),
+        ("ACT_CAT_W", tokens::ACT_CAT_W),
+        ("HID_W", tokens::HID_W),
+        ("META_W", tokens::META_W),
+        ("CAT_LEN", tokens::CAT_LEN),
+        ("CONT_LEN", tokens::CONT_LEN),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect()
+}
+
 #[pyfunction(name = "evaluate")]
 fn stock_evaluate(py_state: PyState) -> f32 {
     let state: State = py_state.into();
@@ -1667,6 +1821,12 @@ fn py_poke_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPolicyPrior>()?;
     m.add_function(wrap_pyfunction!(policy_actions, m)?)?;
     m.add_function(wrap_pyfunction!(policy_action_features, m)?)?;
+    m.add_function(wrap_pyfunction!(state_tokens, m)?)?;
+    m.add_function(wrap_pyfunction!(state_tokens_str, m)?)?;
+    m.add_function(wrap_pyfunction!(state_hidden_targets, m)?)?;
+    m.add_function(wrap_pyfunction!(tokens_bench, m)?)?;
+    m.add_function(wrap_pyfunction!(token_layout, m)?)?;
+    m.add_function(wrap_pyfunction!(token_constants, m)?)?;
     m.add("N_POLICY_ACTIONS", N_ACTIONS)?;
     m.add("N_POLICY_AFEAT", N_AFEAT)?;
     m.add("N_POLICY_EMB", N_EMB)?;

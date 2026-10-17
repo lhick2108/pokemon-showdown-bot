@@ -524,6 +524,37 @@ def state_identity(py_state: State, side: int = 1) -> List[int]:
     [species, item, ability, move0..3]; 0 = pad (fainted), 1 = unknown, else enum id + 2."""
     ...
 
+def state_tokens(
+    py_state: State, side: int = 1,
+    opp_reveal: Optional[List[Tuple[str, List[str], bool, bool, bool]]] = None,
+    with_choices: bool = False,
+) -> Tuple[bytes, bytes, List[str]]:
+    """Transformer tokens (docs/tokens.md): (int16 `cat` bytes, float32 `cont` bytes, slot names).
+    `token_layout()` says where each field lives; `opp_reveal` rows are
+    (species, revealed moves, item revealed, ability revealed, tera revealed)."""
+    ...
+
+def state_tokens_str(
+    state: str, side: int = 1,
+    opp_reveal: Optional[List[Tuple[str, List[str], bool, bool, bool]]] = None,
+    with_choices: bool = False,
+) -> Tuple[bytes, bytes, List[str]]:
+    """`state_tokens` for a serialized state string (skips the State object round trip)."""
+    ...
+
+def state_hidden_targets(state: str, truth: str, side: int = 1) -> bytes:
+    """int16 bytes: 6 x 8 hidden-set ids, 6 mask flags, 6 true opponent species ids."""
+    ...
+
+def tokens_bench(state: str, side: int = 1, n: int = 1000, scrub: bool = False) -> float:
+    """Mean seconds per core token computation."""
+    ...
+
+def token_layout() -> List[Tuple[str, str, int, List[int], str]]:
+    """(name, buffer 'cat'|'cont', element offset, shape, dtype) of every token field."""
+    ...
+
+def token_constants() -> List[Tuple[str, int]]: ...
 def identity_vocab_sizes() -> List[int]: ...
 def identity_vocab(table: int) -> List[str]: ...
 def identity_vocab_hash() -> int: ...

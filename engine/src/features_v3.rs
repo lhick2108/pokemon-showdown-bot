@@ -38,7 +38,7 @@ use crate::features_v2::{
 use crate::state::{Pokemon, PokemonStatus, PokemonType, Side, SideReference, State};
 
 pub const V3_BASE: usize = FEATURE_LEN_V1;
-const N_PAIR: usize = TEAM_SLOTS * TEAM_SLOTS;
+pub const N_PAIR: usize = TEAM_SLOTS * TEAM_SLOTS;
 pub const PAIR_CHANNELS: [&str; 5] = ["speed", "dmg_own", "dmg_opp", "prio_ko_own", "prio_ko_opp"];
 pub const AGG_NAMES: [&str; 4] = ["sweepers", "answers_min", "answers_mean", "unanswered"];
 const AGG_BASE: usize = V3_BASE + PAIR_CHANNELS.len() * N_PAIR;

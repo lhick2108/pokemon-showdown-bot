@@ -30,6 +30,7 @@ pub mod pokemon;
 pub mod prior;
 pub mod search;
 pub mod state;
+pub mod tokens;
 
 #[macro_export]
 macro_rules! assert_unique_feature {

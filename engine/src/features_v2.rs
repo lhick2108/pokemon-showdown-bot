@@ -265,8 +265,8 @@ pub const PS2: usize = SIDE_SCALAR_NAMES.len() + ACTIVE_NAMES.len();
 pub const FIELD2_NAMES: [&str; 3] = ["weather_turns", "terrain_turns", "trick_room_turns"];
 
 pub const V2_BASE: usize = FEATURE_LEN_V1;
-const SIDE2_BASE: usize = V2_BASE + 2 * TEAM_SLOTS * PM2;
-const FIELD2_BASE: usize = SIDE2_BASE + 2 * PS2;
+pub const SIDE2_BASE: usize = V2_BASE + 2 * TEAM_SLOTS * PM2;
+pub const FIELD2_BASE: usize = SIDE2_BASE + 2 * PS2;
 /// Total length of the v2 feature vector.
 pub const FEATURE_LEN_V2: usize = FIELD2_BASE + FIELD2_NAMES.len();
 
