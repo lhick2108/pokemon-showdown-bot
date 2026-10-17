@@ -13,7 +13,7 @@ use poke_engine::engine::state::{MoveChoice, PokemonVolatileStatus, Terrain, Wea
 use poke_engine::instruction::{Instruction, StateInstructions};
 use poke_engine::features::{
     feature_len, feature_names_versioned, features_versioned, FEATURE_LEN, FEATURE_LEN_V2,
-    FEATURE_LEN_V3, FEATURE_LEN_V4, FEATURE_VERSION,
+    FEATURE_LEN_V3, FEATURE_LEN_V4, FEATURE_LEN_V5, FEATURE_VERSION,
 };
 use poke_engine::features_v4;
 use poke_engine::learned::{Evaluator, Scratch};
@@ -1071,13 +1071,13 @@ impl PyEvaluator {
         self.inner.material
     }
 
-    /// Feature version the weights consume (1, 2, 3 or 4).
+    /// Feature version the weights consume (1 to 5).
     #[getter]
     fn feature_version(&self) -> u32 {
         self.inner.feature_version()
     }
 
-    /// Embedding dims (species, item, ability, move) of a feature-version-4 net, else None.
+    /// Embedding dims (species, item, ability, move) of a feature-version-4/5 net, else None.
     #[getter]
     fn embed_dims(&self) -> Option<Vec<usize>> {
         self.inner.embed().map(|e| e.dims().to_vec())
@@ -1287,7 +1287,7 @@ fn state_features(py_state: PyState, side: u8, version: Option<u32>) -> PyResult
 fn check_version(version: Option<u32>) -> PyResult<u32> {
     let v = version.unwrap_or(FEATURE_VERSION);
     if feature_len(v).is_none() {
-        return Err(value_err(format!("unknown feature version {v} (known: 1, 2, 3, 4)")));
+        return Err(value_err(format!("unknown feature version {v} (known: 1 to 5)")));
     }
     Ok(v)
 }
@@ -1654,7 +1654,8 @@ fn py_poke_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("FEATURE_LENGTH_V2", FEATURE_LEN_V2)?;
     m.add("FEATURE_LENGTH_V3", FEATURE_LEN_V3)?;
     m.add("FEATURE_LENGTH_V4", FEATURE_LEN_V4)?;
-    m.add("FEATURE_VERSIONS", vec![1u32, 2u32, 3u32, 4u32])?;
+    m.add("FEATURE_LENGTH_V5", FEATURE_LEN_V5)?;
+    m.add("FEATURE_VERSIONS", vec![1u32, 2u32, 3u32, 4u32, 5u32])?;
     m.add("IDENTITY_LENGTH", features_v4::N_IDS)?;
     m.add("IDENTITY_IDS_PER_SLOT", features_v4::IDS_PER_SLOT)?;
     m.add_function(wrap_pyfunction!(state_identity, m)?)?;

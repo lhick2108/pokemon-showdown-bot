@@ -573,6 +573,8 @@ def split_by_battle(
 # ---------------------------------------------------------------------------
 
 
+V4_DENSE = 2379  # dense width of feature version 4 (poke_engine.FEATURE_LENGTH_V4)
+V5_DENSE = 2191  # dense width of feature version 5 = v4 without the 188 matchup columns
 N_SLOTS = 12  # identity slots: own 0..5, opp 0..5
 IDS_PER_SLOT = 7  # species, item, ability, move0..3
 N_IDS = N_SLOTS * IDS_PER_SLOT
@@ -967,8 +969,9 @@ def export_pev(model: nn.Module, out: Path, feature_version: int = 1) -> None:
             str(out), model.l1.weight.detach().numpy(), model.l1.bias.detach().numpy(),
             model.out.weight.detach().numpy(), float(model.out.bias.item()),
             [e.weight.detach().numpy() for e in model.emb], model.dims, stock_coef=stock_coef,
+            feature_version=feature_version,
         )
-        write_vocab_record(out, model.dims)
+        write_vocab_record(out, model.dims, feature_version)
         return
     if isinstance(model, nn.Linear):
         poke_engine.write_linear(
@@ -987,7 +990,7 @@ def export_pev(model: nn.Module, out: Path, feature_version: int = 1) -> None:
     )
 
 
-def write_vocab_record(pev_path: Path, dims) -> Path:
+def write_vocab_record(pev_path: Path, dims, feature_version: int = 4) -> Path:
     """``<pev>.vocab.json``: the vocabulary fingerprint, table sizes, embedding dims and the
     entry names (row order) the net was trained with, so a trained file can be audited against
     any engine build (the same hash is inside the ``.pev``)."""
@@ -996,7 +999,7 @@ def write_vocab_record(pev_path: Path, dims) -> Path:
     import poke_engine
 
     rec = {
-        "feature_version": 4,
+        "feature_version": feature_version,
         "vocab_hash": f"{poke_engine.identity_vocab_hash():#018x}",
         "tables": list(EMBED_TABLES),
         "embed_dims": [int(d) for d in dims],
@@ -1051,8 +1054,8 @@ def _read_pev_embed(path, raw: bytes, feat_ver: int, kind: int, n_dense: int, hi
     """Format 3 (feature version 4 with identity embeddings), see ``engine/src/learned.rs``."""
     import struct
 
-    if kind != 2 or feat_ver != 4:
-        raise ValueError(f"{path}: format 3 needs an MLP of feature version 4")
+    if kind != 2 or feat_ver not in (4, 5):
+        raise ValueError(f"{path}: format 3 needs an MLP of feature version 4 or 5")
     flags, coef = struct.unpack_from("<If", raw, 24)
     (vhash,) = struct.unpack_from("<Q", raw, 32)
     dims = struct.unpack_from("<4I", raw, 40)
@@ -1095,7 +1098,9 @@ def load_init(model: nn.Module, path: str | Path, *, model_kind: str, n_feat: in
     problems = []
     if pev["kind"] != model_kind:
         problems.append(f"model kind {pev['kind']} (training {model_kind})")
-    if pev["feature_version"] != feature_version:
+    # partial warm start: a v4 net can seed a v5 net (v5 = v4 minus the matchup block)
+    v4_to_v5 = pev["feature_version"] == 4 and feature_version == 5 and pev.get("embed_dims") is not None
+    if pev["feature_version"] != feature_version and not v4_to_v5:
         problems.append(f"feature version {pev['feature_version']} (training {feature_version})")
     net_ = model.net if isinstance(model, ResidualNet) else model
     is_embed = isinstance(net_, EmbedMLP)
@@ -1109,7 +1114,10 @@ def load_init(model: nn.Module, path: str | Path, *, model_kind: str, n_feat: in
             problems.append(f"embed dims {tuple(pev['embed_dims'])} (training {tuple(net_.dims)})")
         if pev["vocab_hash"] != poke_engine.identity_vocab_hash():
             problems.append("embedding vocabulary differs from this engine's")
-    if pev["n_in"] + (N_IDS if is_embed else 0) != n_feat:
+    n_dense_file = V5_DENSE if v4_to_v5 else pev["n_in"]
+    if v4_to_v5 and pev["n_in"] != V4_DENSE:
+        problems.append(f"{pev['n_in']} dense inputs (a v4 net has {V4_DENSE})")
+    if n_dense_file + (N_IDS if is_embed else 0) != n_feat:
         problems.append(f"{pev['n_in']} inputs (training {n_feat})")
     if model_kind == "mlp" and pev["hidden"] != hidden:
         problems.append(f"hidden {pev['hidden']} (training {hidden})")
@@ -1121,7 +1129,11 @@ def load_init(model: nn.Module, path: str | Path, *, model_kind: str, n_feat: in
     net = model.net if isinstance(model, ResidualNet) else model
     with torch.no_grad():
         if is_embed:
-            net.l1.weight.copy_(torch.from_numpy(pev["w1"]))
+            w1 = torch.from_numpy(pev["w1"])
+            if v4_to_v5:
+                # drop the first-layer columns of the v3 matchup block (dense cols V5_DENSE..V4_DENSE)
+                w1 = torch.cat([w1[:, :V5_DENSE], w1[:, V4_DENSE:]], dim=1)
+            net.l1.weight.copy_(w1)
             net.l1.bias.copy_(torch.from_numpy(pev["b1"]))
             net.out.weight.copy_(torch.from_numpy(pev["w2"]).reshape(1, -1))
             net.out.bias.fill_(pev["b2"])
@@ -1422,7 +1434,7 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--embed-dim", default="8", metavar="D|S,I,A,M",
                    help="--features v4: learned identity embedding width, one value for all four "
                         "tables or species,item,ability,move (default 8); moves are mean-pooled")
-    p.add_argument("--features", choices=("v1", "v2", "v3", "v4", "1", "2", "3", "4"), default="v1",
+    p.add_argument("--features", choices=("v1", "v2", "v3", "v4", "v5", "1", "2", "3", "4", "5"), default="v1",
                    help="engine feature layout: v1 (738 values) or v2 (v1 + item / ability / "
                         "move-property features, see docs/features-v2.md) or v3 (v1 + pairwise "
                         "speed / damage / revenge-kill matchup features, 926 values; '3' = 'v3') or v4 "
@@ -1485,18 +1497,18 @@ def main(argv=None) -> int:
         print("--augment-* supports only --features v1", file=sys.stderr)
         return 2
     embed_dims = None
-    if feature_version == 4:
+    if feature_version in (4, 5):
         try:
             embed_dims = parse_embed_dims(args.embed_dim)
         except ValueError as exc:
             print(str(exc), file=sys.stderr)
             return 2
         if args.model != "mlp":
-            print("--features v4 needs --model mlp", file=sys.stderr)
+            print("--features v4/v5 needs --model mlp", file=sys.stderr)
             return 2
     print(f"features: {args.features}, x dtype {x_dtype}"
           + (f", identity embeddings (species,item,ability,move) dims {parse_embed_dims(args.embed_dim)}"
-             if feature_version == 4 else ""))
+             if feature_version in (4, 5) else ""))
     data = load_data(
         args.data, args.states, args.weighting, args.value_target, args.blend_lambda, args.q_source,
         args.q_kind, args.q_eval_scale, residual=args.residual,

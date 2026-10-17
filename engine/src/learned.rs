@@ -56,7 +56,7 @@ use crate::engine::items::Items;
 use crate::engine::state::{PokemonVolatileStatus as V, Terrain, Weather};
 use crate::features::{
     feature_len, features_versioned_into, FEATURE_LEN, FEATURE_LEN_V4, FEATURE_VERSION_1,
-    FEATURE_VERSION_2, FEATURE_VERSION_3, FEATURE_VERSION_4, PER_POKEMON, PER_SIDE, TEAM_SLOTS,
+    FEATURE_VERSION_2, FEATURE_VERSION_3, FEATURE_VERSION_4, FEATURE_VERSION_5, PER_POKEMON, PER_SIDE, TEAM_SLOTS,
 };
 use crate::features_v2::{self, Sink};
 use crate::features_v3;
@@ -106,6 +106,9 @@ pub struct Embed {
     dims: [usize; N_TABLES],
     /// `tables[t]` is row-major `[vocab_size(t)][dims[t]]`
     tables: [Vec<f32>; N_TABLES],
+    /// Dense input length the embedding inputs follow (`FEATURE_LEN_V4` or, for feature
+    /// version 5, `FEATURE_LEN_V5`); set by `Evaluator::mlp_embed_v`.
+    n_dense: usize,
 }
 
 impl Embed {
@@ -126,7 +129,7 @@ impl Embed {
                 ));
             }
         }
-        Ok(Embed { dims, tables })
+        Ok(Embed { dims, tables, n_dense: FEATURE_LEN_V4 })
     }
 
     pub fn dims(&self) -> [usize; N_TABLES] {
@@ -444,9 +447,9 @@ fn mlp_side<const H: usize, const V2: bool>(
                     // fainted variant sees the pad identity, the alive one the real identity
                     let pos = side_no * TEAM_SLOTS + slot;
                     let mut v0 = v;
-                    e.add_slot::<H>(&mut v0, w1t, FEATURE_LEN_V4, pos, &[features_v4::IDX_PAD; IDS_PER_SLOT]);
+                    e.add_slot::<H>(&mut v0, w1t, e.n_dense, pos, &[features_v4::IDX_PAD; IDS_PER_SLOT]);
                     sc.cache_vals[o..o + H].copy_from_slice(&v0);
-                    e.add_slot::<H>(&mut v, w1t, FEATURE_LEN_V4, pos, &features_v4::slot_ids_alive(p));
+                    e.add_slot::<H>(&mut v, w1t, e.n_dense, pos, &features_v4::slot_ids_alive(p));
                 } else {
                     sc.cache_vals[o..o + H].copy_from_slice(&v);
                 }
@@ -667,8 +670,8 @@ impl Evaluator {
     /// value = w . features + b over the features of `feat_ver` (1, 2 or 3).
     pub fn linear_v(feat_ver: u32, w: Vec<f32>, b: f32) -> Result<Evaluator, String> {
         let n_in = feature_len(feat_ver).ok_or_else(|| format!("unknown feature version {feat_ver}"))?;
-        if feat_ver == FEATURE_VERSION_4 {
-            return Err("feature version 4 needs embedding tables (use a MLP with Embed)".to_string());
+        if features_v4::has_identity(feat_ver) {
+            return Err(format!("feature version {feat_ver} needs embedding tables (use a MLP with Embed)"));
         }
         if w.len() != n_in {
             return Err(format!(
@@ -710,8 +713,8 @@ impl Evaluator {
         b2: f32,
     ) -> Result<Evaluator, String> {
         let n_in = feature_len(feat_ver).ok_or_else(|| format!("unknown feature version {feat_ver}"))?;
-        if feat_ver == FEATURE_VERSION_4 {
-            return Err("feature version 4 needs embedding tables (use Evaluator::mlp_embed)".to_string());
+        if features_v4::has_identity(feat_ver) {
+            return Err(format!("feature version {feat_ver} needs embedding tables (use Evaluator::mlp_embed_v)"));
         }
         Evaluator::mlp_inner(feat_ver, n_in, hidden, w1, b1, w2, b2, None)
     }
@@ -726,8 +729,26 @@ impl Evaluator {
         b2: f32,
         emb: Embed,
     ) -> Result<Evaluator, String> {
-        let n_in = FEATURE_LEN_V4 + emb.input_len();
-        Evaluator::mlp_inner(FEATURE_VERSION_4, n_in, hidden, w1, b1, w2, b2, Some(emb))
+        Evaluator::mlp_embed_v(FEATURE_VERSION_4, hidden, w1, b1, w2, b2, emb)
+    }
+
+    /// Embedding MLP of feature version 4 or 5 (v5 = v4 without the matchup block, so the
+    /// dense part is `FEATURE_LEN_V5` long).
+    pub fn mlp_embed_v(
+        feat_ver: u32,
+        hidden: usize,
+        w1: Vec<f32>,
+        b1: Vec<f32>,
+        w2: Vec<f32>,
+        b2: f32,
+        mut emb: Embed,
+    ) -> Result<Evaluator, String> {
+        if !features_v4::has_identity(feat_ver) {
+            return Err(format!("feature version {feat_ver} has no identity embeddings (4 or 5 do)"));
+        }
+        emb.n_dense = feature_len(feat_ver).unwrap();
+        let n_in = emb.n_dense + emb.input_len();
+        Evaluator::mlp_inner(feat_ver, n_in, hidden, w1, b1, w2, b2, Some(emb))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -792,7 +813,7 @@ impl Evaluator {
         }
     }
 
-    /// Feature version of the weights (1, 2, 3 or 4).
+    /// Feature version of the weights (1 to 5).
     pub fn feature_version(&self) -> u32 {
         self.feat_ver
     }
@@ -909,7 +930,7 @@ impl Evaluator {
     pub fn logit(&self, state: &State, scratch: &mut Scratch) -> f32 {
         let net = match &self.model {
             Model::Mlp { hidden, w1t, b1, w2, b2, emb } => {
-                let v2 = self.feat_ver == FEATURE_VERSION_2 || self.feat_ver == FEATURE_VERSION_4;
+                let v2 = self.feat_ver != FEATURE_VERSION_1 && self.feat_ver != FEATURE_VERSION_3;
                 let emb = emb.as_ref();
                 #[cfg(target_arch = "x86_64")]
                 {
@@ -1137,15 +1158,16 @@ impl Evaluator {
         }
         let u32_at = |off: usize| u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
         let feat_ver = u32_at(8);
-        if feat_ver != FEATURE_VERSION_4 {
-            return Err(format!("format-3 weights need FEATURE_VERSION 4, got {feat_ver}"));
+        if !features_v4::has_identity(feat_ver) {
+            return Err(format!("format-3 weights need FEATURE_VERSION 4 or 5, got {feat_ver}"));
         }
         if u32_at(12) != KIND_MLP {
             return Err(format!("format-3 weights must be an MLP, got kind {}", u32_at(12)));
         }
         let n_dense = u32_at(16) as usize;
-        if n_dense != FEATURE_LEN_V4 {
-            return Err(format!("weights expect {n_dense} dense inputs, FEATURE_VERSION 4 has {FEATURE_LEN_V4}"));
+        let want_dense = feature_len(feat_ver).unwrap();
+        if n_dense != want_dense {
+            return Err(format!("weights expect {n_dense} dense inputs, FEATURE_VERSION {feat_ver} has {want_dense}"));
         }
         let hidden = u32_at(20) as usize;
         let flags = u32_at(24);
@@ -1196,7 +1218,8 @@ impl Evaluator {
             tables[t] = floats[off..off + n].to_vec();
             off += n;
         }
-        let ev = Evaluator::mlp_embed(
+        let ev = Evaluator::mlp_embed_v(
+            feat_ver,
             hidden,
             floats[..a].to_vec(),
             floats[a..a + hidden].to_vec(),
@@ -1224,7 +1247,7 @@ impl Evaluator {
         }
         let feat_ver = u32_at(8);
         let expected_in = feature_len(feat_ver).ok_or_else(|| {
-            format!("weights were trained with unknown FEATURE_VERSION {feat_ver} (this engine knows 1, 2, 3 and 4)")
+            format!("weights were trained with unknown FEATURE_VERSION {feat_ver} (this engine knows 1 to 5)")
         })?;
         let kind = u32_at(12);
         let n_in = u32_at(16) as usize;
@@ -1821,13 +1844,17 @@ mod embed_tests {
     }
 
     fn random_v4(h: usize, dims: [usize; N_TABLES], seed: u64) -> Evaluator {
+        random_embed_ev(FEATURE_VERSION_4, h, dims, seed)
+    }
+
+    fn random_embed_ev(ver: u32, h: usize, dims: [usize; N_TABLES], seed: u64) -> Evaluator {
         let mut r = Lcg(seed);
         let emb = random_embed(dims, seed + 1);
-        let n_in = FEATURE_LEN_V4 + emb.input_len();
+        let n_in = feature_len(ver).unwrap() + emb.input_len();
         let w1: Vec<f32> = (0..h * n_in).map(|_| r.unit() * 0.2).collect();
         let b1: Vec<f32> = (0..h).map(|_| r.unit() * 0.3).collect();
         let w2: Vec<f32> = (0..h).map(|_| r.unit()).collect();
-        Evaluator::mlp_embed(h, w1, b1, w2, 0.1, emb).unwrap()
+        Evaluator::mlp_embed_v(ver, h, w1, b1, w2, 0.1, emb).unwrap()
     }
 
     fn states() -> Vec<State> {
@@ -1840,11 +1867,20 @@ mod embed_tests {
 
     #[test]
     fn v4_fast_path_matches_reference() {
+        fast_path_matches_reference(FEATURE_VERSION_4);
+    }
+
+    #[test]
+    fn v5_fast_path_matches_reference() {
+        fast_path_matches_reference(FEATURE_VERSION_5);
+    }
+
+    fn fast_path_matches_reference(ver: u32) {
         let states = states();
         let mut rng = Lcg(11);
         for &h in &[8usize, 16, 64, 128] {
-            let ev = random_v4(h, [8, 4, 6, 5], 500 + h as u64).with_stock_coef(0.0125).unwrap();
-            assert_eq!(ev.feature_version(), 4);
+            let ev = random_embed_ev(ver, h, [8, 4, 6, 5], 500 + h as u64).with_stock_coef(0.0125).unwrap();
+            assert_eq!(ev.feature_version(), ver);
             let mut maxdiff = 0.0f32;
             for s0 in states.iter().take(40) {
                 let mut scratch = Scratch::new();
@@ -1949,6 +1985,56 @@ mod embed_tests {
         // v4 without embeddings cannot be built from the plain constructors
         assert!(Evaluator::mlp_v(4, 2, vec![0.0; 2 * FEATURE_LEN_V4], vec![0.0; 2], vec![0.0; 2], 0.0).is_err());
         assert!(Evaluator::linear_v(4, vec![0.0; FEATURE_LEN_V4], 0.0).is_err());
+    }
+
+    #[test]
+    fn v5_bytes_roundtrip_and_is_v4_without_matchup() {
+        use crate::features::{FEATURE_LEN_V5, FEATURE_VERSION_5};
+        let ev = random_embed_ev(FEATURE_VERSION_5, 16, [8, 5, 4, 6], 22).with_stock_coef(0.0125).unwrap();
+        let bytes = ev.to_bytes();
+        assert_eq!(&bytes[4..8], &3u32.to_le_bytes());
+        assert_eq!(&bytes[8..12], &5u32.to_le_bytes());
+        assert_eq!(&bytes[16..20], &(FEATURE_LEN_V5 as u32).to_le_bytes());
+        let back = Evaluator::from_bytes(&bytes).unwrap();
+        assert_eq!(back.to_bytes(), bytes);
+        assert_eq!(back.feature_version(), 5);
+        for s in states().iter().take(10) {
+            assert_eq!(ev.logit(s, &mut Scratch::new()), back.logit(s, &mut Scratch::new()));
+        }
+        // a v5 header with v4's dense width is rejected, and so are the plain constructors
+        let mut bad = bytes.clone();
+        bad[16..20].copy_from_slice(&(FEATURE_LEN_V4 as u32).to_le_bytes());
+        assert!(Evaluator::from_bytes(&bad).is_err());
+        assert!(Evaluator::mlp_v(5, 2, vec![0.0; 2 * FEATURE_LEN_V5], vec![0.0; 2], vec![0.0; 2], 0.0).is_err());
+        // v5 equals a v4 net whose matchup columns are zero (same embeddings and other weights)
+        let v4 = random_v4(16, [8, 5, 4, 6], 22);
+        let n4 = FEATURE_LEN_V4 + v4.embed().unwrap().input_len();
+        let n5 = FEATURE_LEN_V5 + v4.embed().unwrap().input_len();
+        let (w1t4, b1, w2, b2) = match &v4.model {
+            Model::Mlp { w1t, b1, w2, b2, .. } => (w1t.clone(), b1.clone(), w2.clone(), *b2),
+            _ => unreachable!(),
+        };
+        let h = 16;
+        let mut w1_4 = vec![0.0f32; h * n4];
+        let mut w1_5 = vec![0.0f32; h * n5];
+        for j in 0..h {
+            for i in 0..n4 {
+                let v = w1t4[i * h + j];
+                let in_matchup = (FEATURE_LEN_V5..FEATURE_LEN_V4).contains(&i);
+                w1_4[j * n4 + i] = if in_matchup { 0.0 } else { v };
+                if !in_matchup {
+                    let i5 = if i < FEATURE_LEN_V5 { i } else { i - (FEATURE_LEN_V4 - FEATURE_LEN_V5) };
+                    w1_5[j * n5 + i5] = v;
+                }
+            }
+        }
+        let emb = v4.embed().unwrap().clone();
+        let a = Evaluator::mlp_embed_v(4, h, w1_4, b1.clone(), w2.clone(), b2, emb.clone()).unwrap();
+        let b = Evaluator::mlp_embed_v(5, h, w1_5, b1, w2, b2, emb).unwrap();
+        for s in states().iter().take(20) {
+            let (x, y) = (a.logit(s, &mut Scratch::new()), b.logit(s, &mut Scratch::new()));
+            assert!((x - y).abs() < 1e-4, "{x} vs {y}");
+        }
     }
 
     #[test]

@@ -44,7 +44,7 @@ Q_EVAL_SCALE = 0.0125  # the stock MCTS score is sigmoid(0.0125 * (e_leaf - e_ro
 def state_row(poke_engine, state, side: int, feature_version: int | None = None) -> list[float]:
     """One training/eval input row of ``state`` for ``side``.
 
-    Versions 1-3: ``poke_engine.state_features``. Version 4: the dense features followed by the
+    Versions 1-3: ``poke_engine.state_features``. Versions 4 and 5: the dense features followed by the
     ``IDENTITY_LENGTH`` (84) identity indices (``state_identity``) as floats, so the whole row
     travels through the one feature matrix; the model splits it again (``train.EmbedMLP``).
     Indices are < 2048, exactly representable even in float16.
@@ -52,7 +52,7 @@ def state_row(poke_engine, state, side: int, feature_version: int | None = None)
     if feature_version in (None, 1):
         return poke_engine.state_features(state, side)
     row = poke_engine.state_features(state, side, feature_version)
-    if feature_version == 4:
+    if feature_version in (4, 5):
         row = list(row) + [float(i) for i in poke_engine.state_identity(state, side)]
     return row
 

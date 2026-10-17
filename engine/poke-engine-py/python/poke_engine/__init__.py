@@ -346,9 +346,10 @@ def write_mlp(
 
 
 def write_mlp_embed(
-    path, w1, b1, w2, b2: float, tables, dims, stock_coef: float = 0.0
+    path, w1, b1, w2, b2: float, tables, dims, stock_coef: float = 0.0,
+    feature_version: int = 4,
 ) -> None:
-    """Write a feature-version-4 MLP evaluator with learned identity embeddings (format 3).
+    """Write a feature-version-4 (or, with ``feature_version=5``, v4 without the matchup block) MLP evaluator with learned identity embeddings (format 3).
 
     ``w1`` is ``[hidden][FEATURE_LENGTH_V4 + 12 * sum(dims)]`` (torch ``nn.Linear`` layout: the
     dense columns, then per Pokemon slot -- own 0..5, opp 0..5 -- the species, item, ability and
@@ -362,7 +363,9 @@ def write_mlp_embed(
         raise ValueError("dims and tables need 4 entries (species, item, ability, move)")
     w1f, b1f, w2f = _flat(w1), _flat(b1), _flat(w2)
     hidden = len(b1f)
-    n_dense = feature_length(4)
+    if feature_version not in (4, 5):
+        raise ValueError(f"identity embeddings need feature_version 4 or 5, got {feature_version}")
+    n_dense = feature_length(feature_version)
     n_total = n_dense + 12 * sum(dims)
     if hidden == 0 or len(w1f) != hidden * n_total or len(w2f) != hidden:
         raise ValueError(
@@ -376,7 +379,7 @@ def write_mlp_embed(
     flags = 1 if stock_coef != 0.0 else 0
     header = (
         _MAGIC
-        + struct.pack("<5I", 3, 4, 2, n_dense, hidden)
+        + struct.pack("<5I", 3, feature_version, 2, n_dense, hidden)
         + struct.pack("<If", flags, float(stock_coef))
         + struct.pack("<Q", identity_vocab_hash())
         + struct.pack("<4I", *dims)

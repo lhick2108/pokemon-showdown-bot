@@ -284,7 +284,7 @@ def _v2_state() -> State:
 
 
 def test_feature_versions_and_lengths():
-    assert poke_engine.FEATURE_VERSIONS == [1, 2, 3, 4]
+    assert poke_engine.FEATURE_VERSIONS == [1, 2, 3, 4, 5]
     assert poke_engine.feature_length() == FEATURE_LENGTH == DOCUMENTED_FEATURE_LENGTH
     assert poke_engine.feature_length(2) == poke_engine.FEATURE_LENGTH_V2 > FEATURE_LENGTH
     assert 1500 < poke_engine.FEATURE_LENGTH_V2 < 3000

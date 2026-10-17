@@ -34,6 +34,16 @@ pub const V3_SHIFT: usize = FEATURE_LEN_V2 - FEATURE_LEN_V1;
 /// Length of the dense part.
 pub const FEATURE_LEN_V4: usize = FEATURE_LEN_V2 + features_v3::V3_EXTRA;
 
+/// Feature version 5 = v4 without the matchup block: the dense part is v1 ++ v2 extras, the
+/// identity part is identical to v4's (all of `identity_into` / the vocabularies are shared).
+pub const FEATURE_LEN_V5: usize = FEATURE_LEN_V2;
+
+/// Whether `version` carries the identity indices / embeddings (v4 and v5).
+#[inline(always)]
+pub fn has_identity(version: u32) -> bool {
+    version == crate::features::FEATURE_VERSION_4 || version == crate::features::FEATURE_VERSION_5
+}
+
 /// Pokemon slots with identity indices (own 0..5, opp 0..5).
 pub const N_SLOTS: usize = 2 * TEAM_SLOTS;
 /// Indices per slot: species, item, ability, 4 moves.
@@ -263,6 +273,18 @@ mod tests {
         }
         let n = feature_names_versioned(4);
         assert_eq!(n[FEATURE_LEN_V2], "match.speed.own0.opp0");
+    }
+
+    #[test]
+    fn v5_dense_is_v2() {
+        assert_eq!(FEATURE_LEN_V5, FEATURE_LEN_V2);
+        assert_eq!(feature_names_versioned(5), feature_names_versioned(2));
+        for s in states().iter().take(20) {
+            assert_eq!(
+                features_versioned(s, SideReference::SideTwo, 5),
+                features_versioned(s, SideReference::SideTwo, 2)
+            );
+        }
     }
 
     #[test]
