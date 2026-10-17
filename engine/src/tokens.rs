@@ -27,9 +27,11 @@ use crate::features_v4::{
 };
 use crate::pokemon::PokemonName;
 use crate::prior::{action_slot, ActionCtx, N_ACTIONS, N_AFEAT};
-use crate::state::{Move, PokemonType, Side, SideReference, State};
+use crate::state::{Move, PokemonStatus, PokemonType, Side, SideReference, State};
 
-pub const TOKEN_VERSION: u32 = 1;
+/// 2: the opponent scrub also hides bench membership from the matchup aggregates, the alive
+/// fraction and the opponent's switch action tokens (v1 leaked them).
+pub const TOKEN_VERSION: u32 = 2;
 
 /// Pokemon tokens (own 0..5, opp 6..11; slot 0 of each side is the active Pokemon).
 pub const N_MON: usize = N_SLOTS;
@@ -110,6 +112,13 @@ fn scrub_opp(opp: &mut Side, rev: &[Revealed]) -> [[i16; KNOWN_W]; TEAM_SLOTS] {
             p.moves.m2 = Move::default();
             p.moves.m3 = Move::default();
             p.tera_type = PokemonType::TYPELESS;
+            // a never-revealed Pokemon is canonically alive and untouched: its hp cannot leak
+            p.hp = p.maxhp.max(1);
+            p.status = PokemonStatus::NONE;
+            p.rest_turns = 0;
+            p.sleep_turns = 0;
+            p.terastallized = false;
+            p.mega_evolved = false;
             continue;
         };
         known[k][0] = 1;
@@ -208,6 +217,28 @@ pub fn state_tokens_into(
     let mut dense = [0f32; FEATURE_LEN_V4];
     features_versioned_into(st, side, FEATURE_VERSION_4, &mut dense);
 
+    // matchup block source: hidden opponent mons are removed (hp 0) so that neither the pair
+    // values nor the aggregates see them; the other opponent features keep them alive.
+    let hidden_team: Vec<usize> = match &opp_known_team {
+        Some(k) => (0..TEAM_SLOTS).filter(|&i| k[i][0] == 0).collect(),
+        None => Vec::new(),
+    };
+    let mut dense_buf = [0f32; FEATURE_LEN_V4];
+    let dense_m: &[f32; FEATURE_LEN_V4] = if hidden_team.is_empty() {
+        &dense
+    } else {
+        let mut c = st.clone();
+        let o = match side {
+            SideReference::SideOne => &mut c.side_two,
+            SideReference::SideTwo => &mut c.side_one,
+        };
+        for &i in &hidden_team {
+            o.pokemon.pkmn[i].hp = 0;
+        }
+        features_versioned_into(&c, side, FEATURE_VERSION_4, &mut dense_buf);
+        &dense_buf
+    };
+
     // identity ids
     let mut ids = [0u16; N_IDS];
     identity_into(st, side, &mut ids);
@@ -265,10 +296,10 @@ pub fn state_tokens_into(
             continue;
         }
         for ch in 0..N_PAIR_CH {
-            cont[O_PAIR + pair * N_PAIR_CH + ch] = dense[pair_idx(ch, pair)];
+            cont[O_PAIR + pair * N_PAIR_CH + ch] = dense_m[pair_idx(ch, pair)];
         }
     }
-    cont[O_AGG..O_AGG + N_AGG].copy_from_slice(&dense[pair_idx(N_PAIR_CH, 0)..pair_idx(N_PAIR_CH, 0) + N_AGG]);
+    cont[O_AGG..O_AGG + N_AGG].copy_from_slice(&dense_m[pair_idx(N_PAIR_CH, 0)..pair_idx(N_PAIR_CH, 0) + N_AGG]);
 
     // action tokens, own then opp
     let (o1, o2) = st.root_get_all_options();
@@ -287,13 +318,20 @@ pub fn state_tokens_into(
         }
         for s in 8..N_ACT {
             let k = order[s - 8 + 1];
-            cat[O_ACT_CAT + (side_no * N_ACT + s) * ACT_CAT_W + 1] = slot_ids(&sd.pokemon.pkmn[k])[0] as i16;
+            cat[O_ACT_CAT + (side_no * N_ACT + s) * ACT_CAT_W + 1] = if side_no == 1 && opp_hidden[s - 8 + 1] {
+                IDX_UNKNOWN as i16
+            } else {
+                slot_ids(&sd.pokemon.pkmn[k])[0] as i16
+            };
         }
         let ctx = ActionCtx::new(st, who[side_no]);
         let mut f = [0f32; N_AFEAT];
         for opt in &opts[side_no] {
             if let Some(s) = action_slot(sd, opt) {
                 cat[O_ACT_LEGAL + side_no * N_ACT + s] = 1;
+                if side_no == 1 && s >= 8 && opp_hidden[s - 8 + 1] {
+                    continue; // switch to a never-revealed Pokemon: legal, but nothing about it is known
+                }
                 ctx.features(opt, &mut f);
                 let o = O_ACT_CONT + (side_no * N_ACT + s) * N_AFEAT;
                 cont[o..o + N_AFEAT].copy_from_slice(&f);
@@ -438,5 +476,38 @@ mod tests {
         let s = &states()[0];
         let t = hidden_targets(s, s, SideReference::SideOne);
         assert!(t[TEAM_SLOTS * HID_W..TEAM_SLOTS * HID_W + TEAM_SLOTS].iter().all(|&m| m == 1));
+    }
+
+    #[test]
+    fn unrevealed_bench_does_not_leak() {
+        let all = states();
+        let s = &all[0];
+        let donor = &all[1];
+        let opp = &s.side_two;
+        let active = &opp.pokemon.pkmn[opp.active_index as usize];
+        let rev = vec![Revealed {
+            species: PokemonName::NAMES[active.id as usize].to_string(),
+            moves: vec![Choices::NAMES[active.moves.m0.id as usize].to_string()],
+            item: false,
+            ability: false,
+            tera: false,
+        }];
+        let base = tok(s, SideReference::SideOne, Some(&rev));
+        for k in 0..TEAM_SLOTS {
+            if k == opp.active_index as usize {
+                continue;
+            }
+            let mut t = s.clone();
+            // replace the never-revealed bench Pokemon by an unrelated one (species, set, hp)
+            let mut p = donor.side_two.pokemon.pkmn[k].clone();
+            if rev.iter().any(|r| norm(&r.species) == norm(PokemonName::NAMES[p.id as usize])) {
+                continue;
+            }
+            p.hp = 1;
+            t.side_two.pokemon.pkmn[k] = p;
+            let other = tok(&t, SideReference::SideOne, Some(&rev));
+            assert_eq!(base.0, other.0, "cat differs for bench {k}");
+            assert_eq!(base.1, other.1, "cont differs for bench {k}");
+        }
     }
 }

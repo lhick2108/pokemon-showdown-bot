@@ -209,3 +209,57 @@ def test_export_round_trip(tmp_path, states):
 def test_battle_hash_is_stable():
     assert tokens.battle_hash("battle-x-1") == tokens.battle_hash("battle-x-1")
     assert 0 <= tokens.battle_hash("battle-x-1") < 2**63
+
+
+def _opp_pieces(state: str) -> list[str]:
+    """The 6 Pokemon strings of side two."""
+    return state.split("/")[1].split("=")[:6]
+
+
+def _with_opp_mon(state: str, k: int, mon: str) -> str:
+    parts = state.split("/")
+    pieces = parts[1].split("=")
+    pieces[k] = mon
+    parts[1] = "=".join(pieces)
+    return "/".join(parts)
+
+
+def _fainted(mon: str) -> str:
+    f = mon.split(",")
+    f[6] = "0"  # hp
+    return ",".join(f)
+
+
+def test_unrevealed_opponent_bench_leaks_nothing(states):
+    """589.68.3: with opp_reveal, replacing (species, set, hp) of a never-revealed opponent bench Pokemon
+    changes NO token value: not the pairs, aggregates, alive fraction or opponent switch tokens."""
+    checked = 0
+    for n, s in enumerate(states):
+        donor = states[(n + 1) % len(states)]
+        st = pe.State.from_string(s)
+        act = int(str(st.side_two.active_index)[-1])
+        mons, dmons = _opp_pieces(s), _opp_pieces(donor)
+        reveal = [(str(st.side_two.pokemon[act].id), [], False, False, False)]
+        base, _ = tok(s, 1, reveal)
+        assert base["meta"][2] == 1 and (base["mon_known"][7:, 0] == 0).all()
+        names = {m.split(",")[0] for m in mons}
+        for k in range(6):
+            if k == act:
+                continue
+            for repl in (dmons[k], _fainted(dmons[k]), _fainted(mons[k])):
+                if repl.split(",")[0] in names - {mons[k].split(",")[0]}:
+                    continue  # a duplicate species would be matched to the reveal
+                other, _ = tok(_with_opp_mon(s, k, repl), 1, reveal)
+                for name in base:
+                    assert np.array_equal(base[name], other[name]), (n, k, name)
+                checked += 1
+    assert checked >= 30
+    # control: without the scrub the same swap is visible, so the test can fail
+    diffs = 0
+    for n, s in enumerate(states):
+        act = int(str(pe.State.from_string(s).side_two.active_index)[-1])
+        k = (act + 1) % 6
+        plain, _ = tok(s, 1)
+        swapped, _ = tok(_with_opp_mon(s, k, _opp_pieces(states[(n + 1) % len(states)])[k]), 1)
+        diffs += not all(np.array_equal(plain[f], swapped[f]) for f in plain)
+    assert diffs >= len(states) // 2

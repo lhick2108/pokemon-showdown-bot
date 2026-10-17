@@ -2,7 +2,7 @@
 
 A Jaxcalibur-style token view of an engine `State`, produced by one Rust function and written to
 memory-mappable shards by `src/showdown_bot/tokens.py`. The trainer (589.68.2) builds on the shard
-format below. `TOKEN_VERSION` = 1, `SHARD_FORMAT` = 1.
+format below. `TOKEN_VERSION` = 2 (1 leaked unrevealed bench membership, see below), `SHARD_FORMAT` = 1.
 
 Nothing is re-implemented: `engine/src/tokens.rs` writes the **dense v4 vector** once
 (`features_v4`: v1 ++ v2 extras ++ v3 matchup block) and slices it into tokens; the categorical ids
@@ -13,7 +13,7 @@ are `features_v4::identity_into` (same vocabularies and **vocab hash `0x41bb9361
 disagree. Existing nets, `.pev` (formats 1-3) and `.ppol` files are untouched (only visibility of a few
 constants changed in `features_v2/v3`).
 
-## Engine API (`poke_engine`, wheel 0.0.48+sdb.20)
+## Engine API (`poke_engine`, wheel 0.0.48+sdb.21)
 
 | function | returns |
 | --- | --- |
@@ -40,9 +40,17 @@ items become `UNKNOWNITEM`, abilities `NONE`, unrevealed moves `NONE` (revealed 
 the front in their original order, so move position leaks nothing), unrevealed Tera types `TYPELESS`.
 An opponent Pokemon with no row (the active one is always treated as revealed) is a fully hidden slot:
 all its ids are `1` (unknown), its continuous features are zero except `is_opp`, and its matchup pairs
-are zero. `meta[2]` = 1. This is the view a live bot has; sampled-world fillers do not leak. Known
-leaks: the 8 matchup aggregates and `alive_fraction` of the opponent side are computed from the
-unscrubbed team *membership* (not its sets).
+are zero. `meta[2]` = 1. This is the view a live bot has; sampled-world fillers do not leak.
+
+**Nothing about a never-revealed opponent Pokemon reaches any token** (TOKEN_VERSION 2; v1 still leaked
+through team membership). Such a Pokemon is canonicalised before anything is computed (alive at full hp,
+no status, not Terastallized, no set), and in addition: the 36 pair values *and the 8 `match_agg`
+aggregates* are computed with the hidden Pokemon removed from the opposing team (so the aggregates only
+range over the active and the revealed opponents); the opponent's switch action token to a hidden slot
+has species id 1 (unknown) and zero `act_cont` but stays legal; `alive_fraction` counts it as alive. Test:
+`tests/test_tokens.py::test_unrevealed_opponent_bench_leaks_nothing` swaps species/set/hp (also fainted) of
+every unrevealed bench slot and asserts that every value of both buffers is unchanged (it fails on the
+sdb.20 wheel); the Rust twin is `tokens::tests::unrevealed_bench_does_not_leak`.
 
 ## Layout
 
