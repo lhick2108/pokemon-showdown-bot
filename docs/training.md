@@ -526,3 +526,66 @@ machine so treat as +-10%):
 At equal wall time a v4 h64 net therefore searches about 0.64x as many iterations as the gen7
 net, h128 about 0.55x. About 0.7 us of the 1.5 us (h64) is the v3 matchup block, which is
 recomputed per leaf and does not depend on the hidden size.
+
+
+## Feature version 5: v4 without the matchup block, faster leaves (589.66)
+
+`--features v5` = v4 minus the 188 v3 matchup columns (dense 2191 = v1 ++ v2 extras, same 84
+identity indices and embeddings, same `EmbedMLP`, same format-3 `.pev` with `feature_version 5`);
+`--embed-dim`, `--hidden`, `--residual`, `--init`, `--dropout`, `--value-target` ... work exactly
+as for v4. Details and the warm-start rule: `docs/features-v4.md`. Rows are 2275 columns.
+
+Leaf-eval speed (single thread, 102 gen9 random-battle states, `engine/examples/bench_net.rs`,
+sdb.19 build; median of 3 runs while an 18-worker experiment loaded the machine, so +-10%;
+"calls/s" = `Evaluator.logit` on one state repeated, the per-search cache hot):
+
+| evaluator | pure logit calls/s | MCTS iterations/s, 1 thread | vs stock evaluate (~306k) |
+| --- | --- | --- | --- |
+| gen7 net (v1, h16, residual) | 3.75M | 271k | 0.89 |
+| v4, h128, embed 8 | 0.49M | 162k | 0.53 |
+| v5, h128, embed 8 | 1.15M | 218k | 0.71 |
+| v5, h64, embed 8 | 1.95M | 244k | 0.79 |
+
+Before the queued first-layer accumulation described below the v4 h128 net measured 151k
+it/s / 2.6 us per call and v5 h128 217k / 0.93 us (single runs, same load), so that change is
+worth about 20% on v4 and about 5% on v5. v5 h128 searches about 1.35x as many iterations as
+v4 h128 at equal time.
+
+Where the time goes (v5 h128, ~0.87 us per logit): the stock `evaluate` the residual adds
+(0.07-0.13 us), `features_v2::dynamic_blocks` (~0.11 us), the 12 cached per-Pokemon vectors, the
+~34 queued first-layer rows and the output dot product; about half of it does not depend on the
+hidden size (h16 v5 ~0.44 us). For v4 the matchup block adds ~65 queued rows and ~0.7 us of
+feature code: per call, `collect` (per-Pokemon attack numbers) ~28%, the 36 pair damage /
+speed / priority-KO evaluations ~64%, aggregates ~8%.
+
+Optimization kept: the per-leaf sparse first-layer inputs (v1 dynamic, v2 dynamic, v3/v4
+matchup) are queued as (row, value) pairs and applied in 32-float chunks of the hidden vector
+(`learned.rs::Acc`), so the accumulator stays in registers; per-lane summation order is the
+same as before (results agree with the dense reference path to f32 rounding; the tests keep the
+2e-4 tolerance). A pair cache for the matchup block (key = the attack numbers / defensive stats /
+hp of the two Pokemon) was analysed and NOT implemented: most of the block is per-pair
+arithmetic that a lookup replaces only at ~15 cycles vs ~64, bench-bench pairs hit but the
+active pair (changes every leaf) and the aggregates do not, so the bound is below 2x on the
+~0.7 us and less on the whole leaf, and the extra key hashing eats part of it. Use v5 instead.
+
+Commands (PowerShell, repo root, 3080), mirroring the v4 ones above:
+
+```powershell
+# (a) v5 fine-tune warm-started from the v4 human net (drops the matchup columns, keeps
+#     embeddings, bias, output layer and every other first-layer column)
+python -m showdown_bot.train --data data\selfplay\gen8 --data data\selfplay\gen9 `
+    --init models\human-v4-h128.pev --states prefer-truth --value-target search --q-kind absolute `
+    --model mlp --residual --features v5 --embed-dim 8 --hidden 128 --x-dtype float16 `
+    --load-workers 4 --batch-size 1024 --lr 2e-4 --weight-decay 1e-4 --dropout 0.1 `
+    --epochs 15 --patience 3 --out models\ft-v5-h128.pev `
+    --val-data data\human\pc1-fp-aux\test@4
+
+# (b) without the warm start: v5 human pretrain, then the same fine-tune with --init
+python -m showdown_bot.train --data data\human\pc1-fp-aux\train --states truth `
+    --value-target outcome --model mlp --residual --features v5 --embed-dim 8 --hidden 128 `
+    --x-dtype float16 --max-per-game 8 --load-workers 4 --batch-size 2048 --lr 1e-3 `
+    --weight-decay 1e-4 --epochs 12 --patience 3 --out models\human-v5-h128.pev `
+    --val-data data\human\pc1-fp-aux\test@4
+```
+
+A v5 row is 2275 float16 columns (4.55 KB), 7% smaller than v4.

@@ -101,3 +101,21 @@ has it); other sizes fall back to the dense reference path. Measured leaf rates 
 
 Not supported with v4: `--augment-bench` / `--augment-sides` (they permute v1 columns) and
 `--aux on`. Policy nets (`PolicyNet`) accept only v1 / v2.
+
+## Feature version 5: v4 without the matchup block (589.66)
+
+`--features v5` / `state_features(state, side, 5)` / format-3 `.pev` with `feature_version = 5`.
+The dense part is **v1 ++ v2 extras (2191 = `FEATURE_LENGTH_V5` = `FEATURE_LENGTH_V2`)**, i.e. v4
+minus the 188 v3 matchup columns; the 84 identity indices, the vocabularies, the vocab hash, the
+embedding tables, the model (`EmbedMLP`) and the file layout are exactly v4's, only the dense
+width `n_in` in the header (2191) and the version differ. Code is shared: the engine encodes v5
+through the v2 path and `features_v4::{identity_into, has_identity}`; the matchup block is simply
+not emitted. Reason: the matchup block costs ~0.7 us of compute plus ~0.5-0.9 us of first-layer
+accumulation per leaf (about 65 of the ~100 queued input rows), roughly 60% of a v4 leaf.
+
+Partial warm start `--init models\human-v4-h128.pev --features v5`: `train.load_init` accepts a
+v4 file for a v5 run (same `--hidden`, `--embed-dim`, `--residual`) and copies the embeddings,
+bias, output layer and every first-layer column except the 188 matchup columns (v4 dense columns
+2191..2378), which are dropped. The warm-started net is a perturbation of the v4 net, not the same
+function (the hidden pre-activations lose the matchup contribution), so fine-tune it on
+self-play/human data rather than expecting the v4 strength. The reverse (v5 -> v4) is refused.
