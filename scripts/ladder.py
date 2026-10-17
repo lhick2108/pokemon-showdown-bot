@@ -104,21 +104,35 @@ class Run:
         if self.controller:
             game.arm = arm.name if arm else None
             ladder_ab.append_record(self.ab_log, ladder_ab.ab_record(game, arm, player.username))
-        log = self.out / "logs" / f"{ladder.safe_filename(battle.battle_tag)}.log"
-        log.parent.mkdir(parents=True, exist_ok=True)
-        reqs = getattr(player, "battle_requests", {}).get(battle.battle_tag, [])
-        events = [f">{battle.battle_tag}", *battle._build_replay_events()]
-        # +1: the header line shifts event positions
-        text = ladder.log_with_requests(events, [(pos + 1, raw) for pos, raw in reqs])
-        log.write_text(text + "\n", encoding="utf-8")
-        game.log_file = str(log.relative_to(self.out))
+        try:
+            log = self.out / "logs" / f"{ladder.safe_filename(battle.battle_tag)}.log"
+            log.parent.mkdir(parents=True, exist_ok=True)
+            reqs = getattr(player, "battle_requests", {}).get(battle.battle_tag, [])
+            events = [f">{battle.battle_tag}", *battle._build_replay_events()]
+            # +1: the header line shifts event positions
+            text = ladder.log_with_requests(events, [(pos + 1, raw) for pos, raw in reqs])
+            log.write_text(text + "\n", encoding="utf-8")
+            game.log_file = str(log.relative_to(self.out))
+        except Exception:
+            logging.getLogger(__name__).exception("could not save log of %s", battle.battle_tag)
         ladder.append_game(self.out / "games.jsonl", game)
         self.games.append(game)
         rating = (f"{game.rating_before}->{game.rating_after}"
                   if game.rating_after is not None else "n/a")
         tag = f" [{game.arm}]" if game.arm else ""
-        print(f"[{len(self.games)}/{self.args.games}]{tag} {game.battle_tag} vs {game.opponent}: "
-              f"{game.result} in {game.turns} turns, rating {rating}", flush=True)
+        # progress line last and never fatal: the record above is already saved
+        ladder.safe_print(f"[{len(self.games)}/{self.args.games}]{tag} {game.battle_tag} vs {game.opponent}: "
+                          f"{game.result} in {game.turns} turns, rating {rating}", flush=True)
+
+    def on_rating(self, player, battle_tag: str, rating_after: int) -> None:
+        """The server's ``|raw|NAME's rating: A -> B`` line arrives after the win line (after
+        on_finish ran): patch the saved record, the in-memory game and the A/B row."""
+        for game in self.games:
+            if game.battle_tag == battle_tag and game.rating_after is None:
+                game.rating_after = rating_after
+        ladder.update_game_rating(self.out / "games.jsonl", battle_tag, rating_after)
+        if self.controller:
+            ladder_ab.update_record_rating(self.ab_log, battle_tag, rating_after)
 
     def recorder(self):
         # per-decision search records (worlds, policy) so ladder blunders can be replayed
@@ -131,7 +145,7 @@ class Run:
         if self.controller is not None:
             cls = ladder_ab.with_arm_switch(cls, self.controller)
         cls = ladder.with_ladder_hooks(
-            cls, move_cap_s=self.args.move_cap, on_finish=self.on_finish,
+            cls, move_cap_s=self.args.move_cap, on_finish=self.on_finish, on_rating=self.on_rating,
             save_server_replay=self.args.save_replays,
         )
         if self.policy is not None:
@@ -348,6 +362,7 @@ class Run:
 
 
 def main(argv=None) -> int:
+    ladder.configure_stdio()  # opponent names (e.g. U+2606) must not crash a redirected cp1252 stdout
     args = _parser().parse_args(argv)
     logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     creds = None

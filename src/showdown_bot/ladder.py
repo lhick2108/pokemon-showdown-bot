@@ -159,6 +159,7 @@ def with_ladder_hooks(
     move_cap_s: float = DEFAULT_MOVE_CAP_S,
     on_finish: Callable[[Any, Any], None] | None = None,
     save_server_replay: bool = False,
+    on_rating: Callable[[Any, str, int], None] | None = None,
 ) -> type:
     """Subclass of ``cls`` with a hard per-decision cap and a battle-finished hook."""
 
@@ -170,6 +171,25 @@ def with_ladder_hooks(
         deciding_since: float | None = None
 
         async def _handle_battle_message(self, split_messages):
+            try:
+                return await self._handle_battle_message_inner(split_messages)
+            finally:
+                # the post-game ``|raw|NAME's rating: A -> B`` line comes AFTER ``|win|``, i.e.
+                # after poke-env already fired the finished callback (and our record was
+                # written), so it must be picked up here, once the chunk is processed
+                self._note_rating(split_messages)
+
+        def _note_rating(self, split_messages):
+            if on_rating is None:
+                return
+            try:
+                tag, new = rating_from_messages(split_messages, self.username)
+                if tag is not None:
+                    on_rating(self, tag, new)
+            except Exception:
+                logger.exception("could not record rating update")
+
+        async def _handle_battle_message_inner(self, split_messages):
             # keep every |request| (our full real sets) in order, before poke-env consumes it
             self.last_server_msg = time.monotonic()
             try:
@@ -310,6 +330,71 @@ def rating_after_from_log(replay_data: Sequence[Sequence[str]], username: str) -
             if m and m.group("name").lower().replace("<strong>", "") == username.lower():
                 return int(m.group("new"))
     return None
+
+
+def rating_from_messages(
+    split_messages: Sequence[Sequence[str]], username: str
+) -> tuple[str | None, int | None]:
+    """(battle_tag, new rating) from a battle chunk holding our post-game rating line.
+
+    ``split_messages`` is poke-env's split websocket chunk: ``[['>battle-..'], ['', 'raw', ..], ..]``.
+    """
+    if not split_messages or not split_messages[0] or not split_messages[0][0].startswith(">"):
+        return None, None
+    new = rating_after_from_log(split_messages[1:], username)
+    if new is None:
+        return None, None
+    return split_messages[0][0][1:].strip(), new
+
+
+def update_game_rating(path: Path, battle_tag: str, rating_after: int) -> bool:
+    """Set ``rating_after`` of the games.jsonl row of ``battle_tag`` (atomic rewrite)."""
+    if not path.exists():
+        return False
+    lines = path.read_text(encoding="utf-8").splitlines()
+    hit = False
+    for i, line in enumerate(lines):
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if row.get("battle_tag") == battle_tag:
+            row["rating_after"] = rating_after
+            lines[i] = json.dumps(row)
+            hit = True
+    if hit:
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    return hit
+
+
+def configure_stdio() -> None:
+    """UTF-8 stdout/stderr that never raises on odd characters (player names like ☆).
+
+    Redirected to a file on Windows the default is cp1252, which cannot encode them.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
+def safe_print(*args: Any, **kwargs: Any) -> None:
+    """print() that cannot raise on encoding or I/O problems."""
+    try:
+        print(*args, **kwargs)
+    except UnicodeEncodeError:
+        file = kwargs.get("file") or sys.stdout
+        enc = getattr(file, "encoding", None) or "ascii"
+        text = " ".join(str(a) for a in args).encode(enc, "replace").decode(enc)
+        try:
+            print(text, **{k: v for k, v in kwargs.items() if k != "file"}, file=file)
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 
 def parse_player_lines(text: str) -> list[dict]:

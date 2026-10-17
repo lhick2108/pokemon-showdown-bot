@@ -1,3 +1,4 @@
+import json
 import asyncio
 import logging
 import time
@@ -114,3 +115,74 @@ def test_time_cap_passes_fast_decisions_and_hook_runs():
     assert asyncio.run(p.choose_move(_Battle())) == "fast"
     p._battle_finished_callback("battle")
     assert seen == ["battle"] and cls.cap_hits == 0
+
+
+# --- rating arrives after the finish callback; names with non-cp1252 characters ---------
+
+STAR = "Star☆Bot❤"
+
+
+def test_rating_line_with_unicode_name_and_chunk_parsing():
+    raw = ["", "raw", f"{STAR}'s rating: 2259 &rarr; <strong>2272</strong><br />(+13 for winning)"]
+    assert ladder.rating_after_from_log([raw], STAR) == 2272
+    chunk = [[">battle-gen9randombattle-1"], ["", "win", STAR], raw]
+    assert ladder.rating_from_messages(chunk, STAR) == ("battle-gen9randombattle-1", 2272)
+    # the opponent's line or a chunk without one yields nothing
+    assert ladder.rating_from_messages(chunk, "someone") == (None, None)
+    assert ladder.rating_from_messages([[">b"], ["", "win", STAR]], STAR) == (None, None)
+    assert ladder.rating_from_messages([], STAR) == (None, None)
+
+
+def test_rating_patched_when_it_arrives_after_finish_callback():
+    """Real server order: |win| (finish callback, record written) then |raw| rating line."""
+    events = []
+
+    class P(_Base):
+        username = STAR
+
+        async def _handle_battle_message(self, split_messages):
+            for m in split_messages[1:]:
+                if m[1] == "win":
+                    self._battle_finished_callback("battle")
+                events.append(("seen", m[1]))
+
+    cls = ladder.with_ladder_hooks(
+        P, move_cap_s=1,
+        on_finish=lambda p, b: events.append("finish"),
+        on_rating=lambda p, tag, new: events.append(("rating", tag, new)),
+    )
+    chunk = [[">battle-x"], ["", "win", STAR],
+             ["", "raw", f"{STAR}'s rating: 2259 &rarr; <strong>2272</strong>"]]
+    asyncio.run(cls()._handle_battle_message(chunk))
+    assert events.index("finish") < events.index(("rating", "battle-x", 2272))
+
+
+def test_update_game_rating_rewrites_only_matching_row(tmp_path):
+    path = tmp_path / "games.jsonl"
+    for tag in ("a", "b"):
+        ladder.append_game(path, ladder.LadderGame(tag, STAR, "win", 5, 1000, None))
+    assert ladder.update_game_rating(path, "b", 1013)
+    assert not ladder.update_game_rating(path, "zzz", 1)
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert [r["rating_after"] for r in rows] == [None, 1013]
+    assert rows[0]["opponent"] == STAR
+
+
+def test_safe_print_survives_cp1252_stdout(tmp_path):
+    path = tmp_path / "out.txt"
+    with path.open("w", encoding="cp1252") as fh:
+        with pytest.raises(UnicodeEncodeError):
+            print(STAR, file=fh)
+        ladder.safe_print(f"vs {STAR}: win", file=fh, flush=True)
+    assert "vs Star" in path.read_text(encoding="cp1252")
+
+
+def test_configure_stdio_makes_stdout_utf8_replace(tmp_path, monkeypatch):
+    import sys
+    path = tmp_path / "out.txt"
+    with path.open("w", encoding="cp1252") as fh:
+        monkeypatch.setattr(sys, "stdout", fh)
+        monkeypatch.setattr(sys, "stderr", fh)
+        ladder.configure_stdio()
+        print(STAR)
+    assert STAR in path.read_text(encoding="utf-8")

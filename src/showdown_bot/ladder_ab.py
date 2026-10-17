@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import random
 import re
 import time
@@ -165,3 +166,25 @@ def append_record(path: Path, record: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(record) + "\n")
+
+
+def update_record_rating(path: Path, battle_tag: str, rating_after: int) -> bool:
+    """Set ``rating_after`` on the ab.jsonl row of ``battle_tag`` (atomic rewrite)."""
+    if not path.exists():
+        return False
+    lines = path.read_text(encoding="utf-8").splitlines()
+    hit = False
+    for i, line in enumerate(lines):
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if row.get("battle_tag") == battle_tag and row.get("rating_after") is None:
+            row["rating_after"] = rating_after
+            lines[i] = json.dumps(row)
+            hit = True
+    if hit:
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    return hit
