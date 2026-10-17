@@ -61,6 +61,9 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--out", type=Path, default=None, help="default data/ladder/<run-id> (data/challenges/<run-id> in challenge mode)")
     p.add_argument("--move-cap", type=bench._positive_seconds, default=ladder.DEFAULT_MOVE_CAP_S,
                    help="hard cap in seconds per decision (default 5)")
+    p.add_argument("--search-workers", type=bench._positive_int, default=None, metavar="N",
+                   help="MCTS process pool size; worlds are searched in parallel waves of N "
+                        "(default: the player's own pool, 1 worker = worlds one after another)")
     p.add_argument("--save-replays", action="store_true",
                    help="ask the server to save each replay (/savereplay); default off")
     p.add_argument("--env-file", type=Path, default=REPO / ".env")
@@ -142,7 +145,8 @@ class Run:
         print(f"challenge from {user} ({fmt}): {verb} - {reason}", flush=True)
 
     def make_player(self):
-        cfg = league.LeagueConfig(out=self.out, connect_timeout=self.args.connect_timeout)
+        cfg = league.LeagueConfig(out=self.out, connect_timeout=self.args.connect_timeout,
+                                  search_workers=self.args.search_workers)
         player = league._make_player(
             self.spec, cfg, self.recorder(), self.args.max_concurrent, secrets.randbits(16),
             account=self.account(), server=self.server,
