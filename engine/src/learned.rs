@@ -241,6 +241,9 @@ pub struct Scratch {
     cache_recip: Vec<f32>,
     /// Next way to evict, per set.
     cache_next: Vec<u8>,
+    /// Reused queues of the per-leaf (feature, value) pairs, see `Acc`.
+    pidx: Vec<u32>,
+    pval: Vec<f32>,
 }
 
 const CACHE_SETS: usize = 2 * TEAM_SLOTS * TEAM_SLOTS;
@@ -262,6 +265,8 @@ impl Scratch {
             cache_keys: Vec::new(),
             cache_next: Vec::new(),
             cache_recip: Vec::new(),
+            pidx: Vec::with_capacity(512),
+            pval: Vec::with_capacity(512),
         }
     }
 }
@@ -299,12 +304,96 @@ unsafe fn mlp_avx2<const H: usize, const V2: bool>(
     ev.mlp_fast::<H, V2>(w1t, b1, w2, b2, emb, state, scratch)
 }
 
-/// Adds first-layer weight rows for the (absolute-index) features it receives.
-struct AccSink<'a, const H: usize> {
+/// First-layer accumulator of the sparse fast path. `dense` holds the part that is added as a
+/// whole vector (bias, cached per-Pokemon contributions); the (feature, value) pairs of the
+/// per-leaf features are only queued and applied in `flush`, in register-sized chunks of the
+/// hidden vector, so the accumulator stays in registers across the whole queue instead of
+/// being loaded and stored once per feature row.
+struct Acc<'a, const H: usize> {
+    dense: [f32; H],
+    w1t: &'a [f32],
+    idx: Vec<u32>,
+    val: Vec<f32>,
+}
+
+impl<'a, const H: usize> Acc<'a, H> {
+    #[inline(always)]
+    fn new(w1t: &'a [f32], b1: &[f32], mut idx: Vec<u32>, mut val: Vec<f32>) -> Self {
+        idx.clear();
+        val.clear();
+        let mut dense = [0.0f32; H];
+        dense.copy_from_slice(&b1[..H]);
+        Acc { dense, w1t, idx, val }
+    }
+
+    #[inline(always)]
+    fn one(&mut self, feat: usize) {
+        self.idx.push(feat as u32);
+        self.val.push(1.0);
+    }
+
+    #[inline(always)]
+    fn val(&mut self, feat: usize, x: f32) {
+        self.idx.push(feat as u32);
+        self.val.push(x);
+    }
+
+    /// Applies the queue to `dense` (same per-lane summation order as adding row by row).
+    #[inline(always)]
+    fn flush(&mut self) {
+        // 32 floats = 4 AVX2 registers (the whole vector for H <= 32)
+        const CH: usize = 32;
+        let ch = if H < CH { H } else { CH };
+        let mut c = 0;
+        while c < H {
+            // `ch` divides H for every supported size (8, 16, 32, 64, 128)
+            let mut a = [0.0f32; CH];
+            a[..ch].copy_from_slice(&self.dense[c..c + ch]);
+            for (i, v) in self.idx.iter().zip(self.val.iter()) {
+                let o = *i as usize * H + c;
+                let row = &self.w1t[o..o + ch];
+                for j in 0..ch {
+                    a[j] += *v * row[j];
+                }
+            }
+            self.dense[c..c + ch].copy_from_slice(&a[..ch]);
+            c += ch;
+        }
+        self.idx.clear();
+        self.val.clear();
+    }
+
+    /// Flushes and returns the finished hidden vector, handing the queues back to `sc`.
+    #[inline(always)]
+    fn finish(mut self, sc: &mut Scratch) -> [f32; H] {
+        self.flush();
+        sc.pidx = self.idx;
+        sc.pval = self.val;
+        self.dense
+    }
+}
+
+/// Queues first-layer weight rows for the (absolute-index) features it receives.
+struct AccSink<'a, 'b, const H: usize> {
+    acc: &'a mut Acc<'b, H>,
+}
+impl<'a, 'b, const H: usize> Sink for AccSink<'a, 'b, H> {
+    #[inline(always)]
+    fn one(&mut self, idx: usize) {
+        self.acc.one(idx);
+    }
+    #[inline(always)]
+    fn val(&mut self, idx: usize, v: f32) {
+        self.acc.val(idx, v);
+    }
+}
+
+/// Adds rows straight into an array (cache-miss path: per-Pokemon static features).
+struct ArrSink<'a, const H: usize> {
     acc: &'a mut [f32; H],
     w1t: &'a [f32],
 }
-impl<'a, const H: usize> Sink for AccSink<'a, H> {
+impl<'a, const H: usize> Sink for ArrSink<'a, H> {
     #[inline(always)]
     fn one(&mut self, idx: usize) {
         add_row::<H>(self.acc, self.w1t, idx);
@@ -382,7 +471,7 @@ fn static_contrib<const H: usize>(
 
 #[inline(always)]
 fn mlp_side<const H: usize, const V2: bool>(
-    acc: &mut [f32; H],
+    acc: &mut Acc<H>,
     w1t: &[f32],
     side: &Side,
     side_no: usize,
@@ -437,7 +526,7 @@ fn mlp_side<const H: usize, const V2: bool>(
                 static_contrib::<H>(&mut v, w1t, base, p);
                 if V2 {
                     features_v2::static_block(
-                        &mut AccSink::<H> { acc: &mut v, w1t },
+                        &mut ArrSink::<H> { acc: &mut v, w1t },
                         features_v2::mon_base(side_no, slot),
                         p,
                     );
@@ -462,14 +551,14 @@ fn mlp_side<const H: usize, const V2: bool>(
             let o = (line * 2 + (p.hp > 0) as usize) * H;
             let vals: &[f32; H] = sc.cache_vals[o..o + H].try_into().unwrap();
             for j in 0..H {
-                acc[j] += vals[j];
+                acc.dense[j] += vals[j];
             }
             alive_count += (p.hp > 0) as i8;
             // hp fraction (0 when fainted)
             let hpf = (p.hp.max(0) as f32 * sc.cache_recip[line]).min(1.0);
-            axpy_row::<H>(acc, hpf, w1t, base);
+            acc.val(base, hpf);
             if p.status != PokemonStatus::NONE {
-                add_row::<H>(acc, w1t, base + 1 + p.status as usize);
+                acc.one(base + 1 + p.status as usize);
             }
         }
     }
@@ -487,7 +576,7 @@ fn mlp_side<const H: usize, const V2: bool>(
     ];
     if boosts.iter().any(|b| *b != 0) {
         for (i, b) in boosts.iter().enumerate() {
-            axpy_row::<H>(acc, *b as f32 / 6.0, w1t, ex + i);
+            acc.val(ex + i, *b as f32 / 6.0);
         }
     }
     let vs = &side.volatile_statuses;
@@ -512,7 +601,7 @@ fn mlp_side<const H: usize, const V2: bool>(
         ];
         for (i, v) in VOLS.iter().enumerate() {
             if vs.contains(v) {
-                add_row::<H>(acc, w1t, ex + 7 + i);
+                acc.one(ex + 7 + i);
             }
         }
         if vs.contains(&V::PERISH4)
@@ -520,24 +609,24 @@ fn mlp_side<const H: usize, const V2: bool>(
             || vs.contains(&V::PERISH2)
             || vs.contains(&V::PERISH1)
         {
-            add_row::<H>(acc, w1t, ex + 7 + 16);
+            acc.one(ex + 7 + 16);
         }
         for (i, v) in [V::FOCUSENERGY, V::MUSTRECHARGE, V::LOCKEDMOVE].iter().enumerate() {
             if vs.contains(v) {
-                add_row::<H>(acc, w1t, ex + 7 + 17 + i);
+                acc.one(ex + 7 + 17 + i);
             }
         }
     }
     let c = &side.side_conditions;
     let sc0 = ex + 27;
     if c.stealth_rock > 0 {
-        add_row::<H>(acc, w1t, sc0);
+        acc.one(sc0);
     }
     if c.spikes != 0 {
-        axpy_row::<H>(acc, c.spikes as f32 / 3.0, w1t, sc0 + 1);
+        acc.val(sc0 + 1, c.spikes as f32 / 3.0);
     }
     if c.toxic_spikes != 0 {
-        axpy_row::<H>(acc, c.toxic_spikes as f32 / 2.0, w1t, sc0 + 2);
+        acc.val(sc0 + 2, c.toxic_spikes as f32 / 2.0);
     }
     for (i, v) in [
         c.sticky_web,
@@ -554,20 +643,20 @@ fn mlp_side<const H: usize, const V2: bool>(
     ].iter().copied().enumerate()
     {
         if v > 0 {
-            add_row::<H>(acc, w1t, sc0 + 3 + i);
+            acc.one(sc0 + 3 + i);
         }
     }
     let misc = ex + 41;
     if side.wish.0 > 0 {
-        add_row::<H>(acc, w1t, misc);
+        acc.one(misc);
     }
     if side.future_sight.0 > 0 {
-        add_row::<H>(acc, w1t, misc + 1);
+        acc.one(misc + 1);
     }
     if side.force_switch {
-        add_row::<H>(acc, w1t, misc + 2);
+        acc.one(misc + 2);
     }
-    axpy_row::<H>(acc, alive_count as f32 / TEAM_SLOTS as f32, w1t, misc + 3);
+    acc.val(misc + 3, alive_count as f32 / TEAM_SLOTS as f32);
 }
 
 /// First-layer pre-activations `b1 + W1 x` of the sparse fast path for `state` seen from
@@ -599,6 +688,22 @@ pub(crate) fn hidden_acc_emb<const H: usize, const V2: bool>(
     scratch: &mut Scratch,
     emb: Option<&Embed>,
 ) -> [f32; H] {
+    let mut acc = Acc::<H>::new(w1t, b1, std::mem::take(&mut scratch.pidx), std::mem::take(&mut scratch.pval));
+    hidden_acc_into::<H, V2>(&mut acc, model_id, w1t, state, own, scratch, emb);
+    acc.finish(scratch)
+}
+
+/// Queues / accumulates everything of `hidden_acc_emb` into `acc` (not yet flushed).
+#[inline(always)]
+pub(crate) fn hidden_acc_into<const H: usize, const V2: bool>(
+    acc: &mut Acc<H>,
+    model_id: u64,
+    w1t: &[f32],
+    state: &State,
+    own: SideReference,
+    scratch: &mut Scratch,
+    emb: Option<&Embed>,
+) {
     if scratch.cache_model != model_id || scratch.cache_vals.len() != CACHE_SETS * CACHE_WAYS * 2 * H {
         scratch.cache_model = model_id;
         scratch.cache_vals.clear();
@@ -610,14 +715,12 @@ pub(crate) fn hidden_acc_emb<const H: usize, const V2: bool>(
         scratch.cache_next.clear();
         scratch.cache_next.resize(CACHE_SETS, 0);
     }
-    let mut acc = [0.0f32; H];
-    acc.copy_from_slice(&b1[..H]);
     let (own_side, opp_side) = match own {
         SideReference::SideOne => (&state.side_one, &state.side_two),
         SideReference::SideTwo => (&state.side_two, &state.side_one),
     };
-    mlp_side::<H, V2>(&mut acc, w1t, own_side, 0, emb, scratch);
-    mlp_side::<H, V2>(&mut acc, w1t, opp_side, 1, emb, scratch);
+    mlp_side::<H, V2>(acc, w1t, own_side, 0, emb, scratch);
+    mlp_side::<H, V2>(acc, w1t, opp_side, 1, emb, scratch);
 
     let field = 2 * PER_SIDE;
     let weather = state.get_weather();
@@ -632,7 +735,7 @@ pub(crate) fn hidden_acc_emb<const H: usize, const V2: bool>(
     ].iter().copied().enumerate()
     {
         if weather == w {
-            add_row::<H>(&mut acc, w1t, field + k);
+            acc.one(field + k);
         }
     }
     let terrain = state.get_terrain();
@@ -644,16 +747,15 @@ pub(crate) fn hidden_acc_emb<const H: usize, const V2: bool>(
     ].iter().copied().enumerate()
     {
         if terrain == t {
-            add_row::<H>(&mut acc, w1t, field + 7 + k);
+            acc.one(field + 7 + k);
         }
     }
     if state.trick_room.active {
-        add_row::<H>(&mut acc, w1t, field + 11);
+        acc.one(field + 11);
     }
     if V2 {
-        features_v2::dynamic_blocks(&mut AccSink::<H> { acc: &mut acc, w1t }, state, own);
+        features_v2::dynamic_blocks(&mut AccSink::<H> { acc }, state, own);
     }
-    acc
 }
 
 #[inline]
@@ -1035,12 +1137,14 @@ impl Evaluator {
         state: &State,
         scratch: &mut Scratch,
     ) -> f32 {
-        let mut acc = hidden_acc_emb::<H, V2>(self.id, w1t, b1, state, SideReference::SideOne, scratch, emb);
+        let mut acc = Acc::<H>::new(w1t, b1, std::mem::take(&mut scratch.pidx), std::mem::take(&mut scratch.pval));
+        hidden_acc_into::<H, V2>(&mut acc, self.id, w1t, state, SideReference::SideOne, scratch, emb);
         if self.feat_ver == FEATURE_VERSION_3 {
-            features_v3::matchup_blocks(&mut AccSink::<H> { acc: &mut acc, w1t }, state, SideReference::SideOne);
+            features_v3::matchup_blocks(&mut AccSink::<H> { acc: &mut acc }, state, SideReference::SideOne);
         } else if self.feat_ver == FEATURE_VERSION_4 {
-            features_v4::matchup_blocks_v4(&mut AccSink::<H> { acc: &mut acc, w1t }, state, SideReference::SideOne);
+            features_v4::matchup_blocks_v4(&mut AccSink::<H> { acc: &mut acc }, state, SideReference::SideOne);
         }
+        let acc = acc.finish(scratch);
         let mut z = b2;
         for j in 0..H {
             z += acc[j].max(0.0) * w2[j];

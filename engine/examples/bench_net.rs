@@ -17,17 +17,17 @@ fn main() {
         let (hs, ver) = match a[2][4..].split_once('v') { Some((h, v)) => (h, v.parse::<u32>().unwrap()), None => (&a[2][4..], 1) };
         let h: usize = hs.parse().unwrap();
         let n_in = poke_engine::features::feature_len(ver).unwrap();
-        if ver == 4 {
+        if poke_engine::features_v4::has_identity(ver) {
             // embedding dim 8 for each of species / item / ability / move (random-ish weights)
             use poke_engine::features_v4::vocab_size;
-            let dims = [8usize; 4];
+            let dims = [8usize; 4]; // zero<H>v4 | zero<H>v5
             let tables: [Vec<f32>; 4] = std::array::from_fn(|t| {
                 (0..vocab_size(t) * dims[t]).map(|i| ((i * 104729) % 1000) as f32 / 1000.0 - 0.5).collect()
             });
             let emb = poke_engine::learned::Embed::new(dims, tables).unwrap();
             let n_total = n_in + emb.input_len();
             let w1: Vec<f32> = (0..h * n_total).map(|i| ((i * 7919) % 1000) as f32 / 1000.0 - 0.5).collect();
-            Evaluator::mlp_embed(h, w1, vec![0.1; h], vec![0.0; h], 0.0, emb)
+            Evaluator::mlp_embed_v(ver, h, w1, vec![0.1; h], vec![0.0; h], 0.0, emb)
                 .unwrap()
                 .with_stock_coef(0.0125)
                 .unwrap()
