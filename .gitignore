@@ -28,3 +28,6 @@ models/
 
 # Scratch tooling (npm installs etc.)
 scratch/
+
+# learn/ outputs
+learn/out/
