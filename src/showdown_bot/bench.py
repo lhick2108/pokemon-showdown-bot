@@ -26,6 +26,7 @@ from poke_env.ps_client import (
 )
 
 from showdown_bot.players.human import HumanPolicyPlayer
+from showdown_bot.players.tokenpolicy import TokenPolicyPlayer
 from showdown_bot.players.humansearch import HumanSearchPlayer
 from showdown_bot.players.search import SearchNetPlayer, SearchPlayer
 
@@ -44,6 +45,8 @@ PLAYER_REGISTRY: dict[str, type[Player]] = {
     "human": HumanPolicyPlayer,
     # Search bot whose final move is blended with the human model (search keys + model, w, pick, blend, temp, elo).
     "humansearch": HumanSearchPlayer,
+    # No-search bot that plays the token transformer's policy head (spec keys: model, device, temp, pick).
+    "token-policy": TokenPolicyPlayer,
 }
 
 # "foulplay" is a special opponent name: it is not a poke-env Player subclass.

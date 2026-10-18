@@ -71,6 +71,7 @@ def prior_kwargs(
     prior_fpu: float,
     human_path: str | None,
     human_elo,
+    root_prior_s1: dict | None = None,
 ) -> dict:
     """``monte_carlo_tree_search`` keywords for the PUCT prior settings.
 
@@ -81,6 +82,8 @@ def prior_kwargs(
     out: dict = {"c_puct": float(c_puct), "prior_eps": float(prior_eps), "fpu_reduction": float(prior_fpu)}
     net = get_prior(prior_path) if prior_path else None
     out["prior"] = net
+    if root_prior_s1:  # token-net root prior for our side (replaces the .ppol root prior)
+        out["root_prior_s1"] = {str(k): float(v) for k, v in root_prior_s1.items()}
     if prior_opp in ("self", "human"):
         out["prior_opp"] = net
     elif prior_opp != "none":
@@ -128,6 +131,7 @@ def search_world(
     prior_fpu: float = 0.0,
     human_path: str | None = None,
     human_elo=None,
+    root_prior_s1: dict | None = None,
     export_nodes: int = 0,
     export_min_visits: int = 16,
     material: float = 0.0,
@@ -151,6 +155,8 @@ def search_world(
     (side_two) root ``(choice, visits)`` options.
     With ``prior_path`` (a ``.ppol`` policy net) side one's selection becomes PUCT; see
     ``prior_kwargs`` for ``prior_opp``. Single-threaded only; the result shape is unchanged.
+    ``root_prior_s1`` ({choice: probability}, e.g. from the token net) replaces side one's ROOT
+    prior; without ``prior_path`` only the root uses PUCT.
     With ``export_nodes`` > 0 (single-threaded only) the result is an ``OppTuple`` whose
     ``.nodes`` lists up to that many sampled interior search nodes as
     ``(state, visits, value, static_value, depth)`` (values are absolute P(side one wins); see
@@ -182,12 +188,12 @@ def search_world(
             kwargs["gamma"] = float(selection_gamma)
         if joint:
             kwargs["return_joint"] = True
-        if prior_path:
+        if prior_path or root_prior_s1:
             if threads > 1:
                 raise RuntimeError("policy priors need threads == 1")
             kwargs.update(prior_kwargs(
                 state, state_string, prior_path, prior_opp, c_puct, prior_eps, prior_fpu,
-                human_path, human_elo,
+                human_path, human_elo, root_prior_s1,
             ))
         if export_nodes:
             kwargs["export_nodes"] = int(export_nodes)

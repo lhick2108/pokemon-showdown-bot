@@ -236,6 +236,11 @@ class SearchConfig:
     prior_eps: float = 0.03  # share of uniform mixed into every prior
     prior_fpu: float = 0.0  # unvisited options start from (parent mean - this)
     prior_human: str | None = None  # human-policy .npz for prior_opp=human (default: opp_model)
+    # Token transformer root prior (docs/token-net.md): the net's policy over our legal actions replaces
+    # the .ppol ROOT prior of our side (computed once per decision in this process). With ``prior``
+    # unset, only the root uses PUCT (interior nodes and the opponent keep UCB1 unless prior_opp is a path).
+    tok_prior: str | None = None
+    tok_device: str = "auto"  # auto | cpu | cuda
     nash_pseudocount: float = nash_module.DEFAULT_PSEUDOCOUNT  # mode="nash": cell shrinkage c
     nash_floor: float = DEFAULT_NASH_FLOOR  # mode="nash": drop actions below this share
     bayes_argmax: bool = False  # mode="bayes": play the strategy's best move instead of sampling it
@@ -955,7 +960,10 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             raise ValueError(f"selection_gamma must be in (0, 1], got {self.config.selection_gamma}")
         if self.config.selection != "ucb1" and self.config.threads > 1:
             raise ValueError("selection exp3/rm needs threads == 1 (the shared-tree search is ucb1 only)")
-        if self.config.prior is not None:
+        self._tok_root: dict[str, float] | None = None
+        self.tok_net = None
+        self.tok_prior_errors = 0
+        if self.config.prior is not None or self.config.tok_prior is not None:
             self._validate_prior()
         if not (math.isfinite(self.config.material) and 0 <= self.config.material < 1):
             raise ValueError(f"material must be in [0, 1), got {self.config.material}")
@@ -1107,6 +1115,7 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         if not legal:
             return None
         trackers = self.opponent_model.update(battle)
+        self._tok_root = None
         full = self._draw_full()
         if full and self.config.endgame != endgame_module.OFF:
             ours, theirs = endgame_module.alive_counts(battle)
@@ -1124,6 +1133,7 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             truth_state, truth_status = self._truth_state(battle)
             opp_facts = _opp_facts(battle, trackers)
         world_slots, state_strings, built = self._sample_worlds(battle, trackers, n_worlds)
+        self._tok_root = self._token_root_prior(battle, trackers, state_strings)
         self._export_now = recording  # interior-node export only for recorded (full) searches
         results = await self._run_worlds(state_strings, time_ms)
         result_worlds = list(self._result_worlds)
@@ -1741,9 +1751,18 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             raise ValueError(f"prior_eps must be in [0, 1), got {cfg.prior_eps}")
         if not math.isfinite(cfg.prior_fpu):
             raise ValueError(f"prior_fpu must be finite, got {cfg.prior_fpu}")
-        if not Path(cfg.prior).is_file():
-            raise FileNotFoundError(f"prior file not found: {cfg.prior}")
-        updates: dict[str, Any] = {"prior": str(Path(cfg.prior).resolve())}
+        updates: dict[str, Any] = {}
+        if cfg.prior is not None:
+            if not Path(cfg.prior).is_file():
+                raise FileNotFoundError(f"prior file not found: {cfg.prior}")
+            updates["prior"] = str(Path(cfg.prior).resolve())
+        if cfg.tok_prior is not None:
+            from showdown_bot import token_policy
+
+            if not token_policy.valid_device(cfg.tok_device):
+                raise ValueError(f"tok_device must be auto, cpu, cuda or cuda:N, got {cfg.tok_device!r}")
+            self.tok_net = token_policy.TokenPolicy.load(cfg.tok_prior, cfg.tok_device)
+            updates["tok_prior"] = self.tok_net.path
         opp = (cfg.prior_opp or "self").strip()
         if opp.lower() in ("self", "none", "human"):
             opp = opp.lower()
@@ -1772,13 +1791,31 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
 
     def _prior_kwargs(self) -> dict[str, Any]:
         cfg = self.config
-        if cfg.prior is None:
+        if cfg.prior is None and cfg.tok_prior is None:
             return {}
-        return dict(
+        out = dict(
             prior_path=cfg.prior, prior_opp=cfg.prior_opp, c_puct=cfg.c_puct,
             prior_eps=cfg.prior_eps, prior_fpu=cfg.prior_fpu,
             human_path=cfg.prior_human, human_elo=cfg.opp_elo,
         )
+        if self._tok_root:
+            out["root_prior_s1"] = self._tok_root
+        return out
+
+    def _token_root_prior(self, battle: Any, trackers: Any, state_strings: list[str]) -> dict[str, float] | None:
+        """Our side's root prior from the token net: one batched forward over the sampled worlds,
+        the policy head averaged over them. None (plain search) if the net is off or fails."""
+        if self.tok_net is None:
+            return None
+        try:
+            from showdown_bot import tokens
+
+            reveal = tokens.reveal_rows(_opp_facts(battle, trackers))
+            return self.tok_net.distribution(state_strings, reveal) or None
+        except Exception:  # the prior must never cost a decision
+            self.tok_prior_errors += 1
+            logger.exception("token root prior failed in %s", battle.battle_tag)
+            return None
 
     async def _run_worlds_on(
         self, executor: Executor, state_strings: list[str], time_ms: int
@@ -1797,7 +1834,8 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             record_value=self._recorder is not None,
             **self._prior_kwargs(),
         ) if (self.config.tendency or self.config.belief_reweight or self.config.opp_model
-              or export or self.config.prior is not None or self.config.material > 0
+              or export or self.config.prior is not None or self._tok_root is not None
+              or self.config.material > 0
               or self._recorder is not None) else _worker.search_world
         futures = [
             loop.run_in_executor(

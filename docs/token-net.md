@@ -102,3 +102,61 @@ Speed on the 3080 with the ladder using the CPU: about 4,400 samples/s at batch 
 | 256 | 13.1 ms | 9.6 ms |
 
 `python -m showdown_bot.token_net bench [--layers N]`. Batch 1 is dominated by kernel launches; CUDA graphs or `torch.compile` are the next step for a bot.
+
+## Playing the net: `token-policy` bot and the transformer root prior (bead 589.68, step W2)
+
+`src/showdown_bot/token_policy.py` (`TokenPolicy`: load, tokenise, batched forward), `players/tokenpolicy.py` (the bot),
+`tests/test_token_policy.py`. **No engine or wheel change**: `monte_carlo_tree_search(..., root_prior_s1=)` (a
+`{choice: probability}` dict, `engine/src/prior.rs::PriorConfig::root_s1`) already replaces a side's root prior in PUCT. It works
+without a `.ppol`: the root then uses PUCT and every other node keeps decoupled UCB1.
+
+View the net gets at every decision: the bot's own state from side one, the opponent scrubbed to what the set tracker has seen
+(`tokens.reveal_rows(_opp_facts(...))`, the training view). The 16 history rows are padding (training saw real events; tracking
+them live is not done, so the live policy may be a little weaker than the offline top-1). Legal actions are the engine's
+`act_legal` (the same options as the search root); illegal slots carry zero mass, and the vector is renormalised after the
+poke-env order mapping.
+
+### Bot specs
+
+| spec | meaning |
+| --- | --- |
+| `token-policy:model=<tok.pt>[:device=auto\|cpu\|cuda\|cuda:N][:temp=T][:pick=argmax\|sample]` | no search. Argmax of the policy head over legal actions; `temp=T` samples from `p^(1/T)` (`pick=sample` without `temp` samples at T=1) |
+| `search-net:...:tok_prior=<tok.pt>[:tok_device=auto\|cpu\|cuda]` | our side's root prior = the net's policy (replaces the `.ppol` root prior; with `prior=` the `.ppol` still serves interior nodes and the opponent side, without it only the root is PUCT). `c_puct`, `prior_eps` (default 0.03 uniform mix) and `fpu` apply as for `.ppol` priors. Also accepted by `search` and `humansearch` |
+
+Per decision the net runs **once** in the bot process (GPU if available), batched over the sampled worlds (the policy head is
+averaged over them: our side is identical in every world, only the scrubbed opponent view differs), and the resulting dict is
+shipped to every world's search worker. Opponent side: the `.ppol` mirror / `prior_opp=` setting is unchanged. The net's opponent
+action head is keyed by action tokens whose unrevealed move slots have no name, so it cannot be turned into a root vector over
+a sampled world's real options without per-world work; not done. If the net fails, the decision falls back to the unmodified
+search (`bot.tok_prior_errors`).
+
+### Latency per decision (3080, fp16 autocast, league/ladder busy on the CPU, 6.08 M model, median of 60)
+
+| | tokenise | forward + host copy | total |
+| --- | ---: | ---: | ---: |
+| cuda, 1 world | 0.4 ms | 14.5 ms | 14.9 ms |
+| cuda, 4 worlds (batched) | 1.0 ms | 15.0 ms | 15.7 ms |
+| cpu (contended), 1 world | 0.4 ms | 50.8 ms | 51.2 ms |
+| cpu (contended), 4 worlds | 1.0 ms | 141 ms | 142 ms |
+
+`tok_prior` therefore adds about 16 ms per searched decision on the GPU (under 2% of a `time_ms=1000` search; it runs before the
+search on the event-loop thread). Use `tok_device=cuda` for league runs. Games sharing a process share one net instance (cached per
+path and device).
+
+### Example SPRT commands
+
+Current best: `search-net:scale=1.5:c_puct=2:prior=models\prior-gen56-h32.ppol:mode=argmax:time_ms=1000:worlds=4:evaluator=models\gen7-res-root-mlp16.pev`
+
+```
+# transformer prior replaces the .ppol at the root, everything else identical
+python -m showdown_bot.league --bots "cand=search-net:scale=1.5:c_puct=2:prior=models\prior-gen56-h32.ppol:tok_prior=models\tok-d256.pt:tok_device=cuda:mode=argmax:time_ms=1000:worlds=4:evaluator=models\gen7-res-root-mlp16.pev,best=search-net:scale=1.5:c_puct=2:prior=models\prior-gen56-h32.ppol:mode=argmax:time_ms=1000:worlds=4:evaluator=models\gen7-res-root-mlp16.pev" --sprt 0,21 --max-games 2000 --search-workers 32 --concurrency 4 --teams swap --out data/league/sprt-tokprior-vs-best --seed 1
+
+# transformer root prior only (no .ppol; interior nodes plain UCB1): swap the cand spec for
+cand=search-net:scale=1.5:c_puct=2:tok_prior=models\tok-d256.pt:tok_device=cuda:mode=argmax:time_ms=1000:worlds=4:evaluator=models\gen7-res-root-mlp16.pev
+
+# the raw net as a no-search bot (a sanity opponent for any of the above)
+tokpol=token-policy:model=models\tok-d256.pt:device=cuda
+```
+
+The flags follow `docs/league.md` ("SPRT duel"). `tests/test_token_policy.py::test_documented_specs_parse` runs these spellings
+through `parse_spec`.

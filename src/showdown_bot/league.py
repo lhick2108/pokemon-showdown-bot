@@ -68,17 +68,23 @@ EXPLOIT_KEYS = {"opp_model": str, "opp_elo": str, "exploit_delta": float, "explo
 
 # Policy priors (docs/policy-prior.md): prior=<.ppol> turns on PUCT selection; prior_opp = self |
 # none | human | <.ppol>; c_puct, prior_eps, fpu tune it; prior_human = human-policy .npz for
-# prior_opp=human (default: opp_model).
+# prior_opp=human (default: opp_model). tok_prior=<token net .pt> replaces our side's ROOT prior with the
+# token transformer policy (docs/token-net.md); it works with or without prior=<.ppol> (the .ppol then
+# keeps serving the interior nodes and the opponent side); tok_device = auto | cpu | cuda.
 PRIOR_KEYS = {"prior": str, "prior_opp": str, "c_puct": float, "prior_eps": float, "fpu": float,
-              "prior_human": str}
+              "prior_human": str, "tok_prior": str, "tok_device": str}
 PRIOR_FIELDS = {"prior": "prior", "prior_opp": "prior_opp", "c_puct": "c_puct",
-                "prior_eps": "prior_eps", "fpu": "prior_fpu", "prior_human": "prior_human"}
+                "prior_eps": "prior_eps", "fpu": "prior_fpu", "prior_human": "prior_human",
+                "tok_prior": "tok_prior", "tok_device": "tok_device"}
 
 HUMAN_BLEND_KEYS = {"model": str, "w": float, "pick": str, "blend": str, "temp": float, "elo": str}
 
 SPEC_KEYS = {
     # a no-search bot that plays like a ladder human (showdown_bot.players.human)
     "human": {"model": str, "pick": str, "elo": str, "temp": float},
+    # a no-search bot that plays the token transformer's policy head (players.tokenpolicy):
+    # argmax unless temp (or pick=sample) is given
+    "token-policy": {"model": str, "device": str, "temp": float, "pick": str},
     "search": {"evaluator": str, "scale": float, "time_ms": int, "worlds": int,
                "selection": str, "gamma": float, "mode": str,
                "tendency": str, "tkappa": float, "tdelta": float,
@@ -216,6 +222,12 @@ def parse_spec(text: str) -> BotSpec:
                 raise ValueError(f"w must be in [0, 1] in bot spec {raw!r}")
             if key == "blend" and parsed.lower() not in ("geo", "mix"):
                 raise ValueError(f"blend must be geo or mix in bot spec {raw!r}")
+            if key in ("device", "tok_device"):
+                from showdown_bot.token_policy import valid_device
+
+                if not valid_device(parsed):
+                    raise ValueError(f"{key} must be auto, cpu, cuda or cuda:N in bot spec {raw!r}")
+                parsed = parsed.lower()
             if key == "temp" and not (math.isfinite(parsed) and parsed > 0):
                 raise ValueError(f"temp must be > 0 in bot spec {raw!r}")
             if key == "exploit_delta" and not (math.isfinite(parsed) and 0 <= parsed < 1):
@@ -250,8 +262,14 @@ def parse_spec(text: str) -> BotSpec:
                 parsed = parsed.lower()
             params.append((key, parsed.lower() if key in ("selection", "mode", "tendency", "endgame", "pick", "blend") else parsed))
     keys = dict(params)
-    if "prior" not in keys and any(k in keys for k in ("prior_opp", "c_puct", "prior_eps", "fpu", "prior_human")):
-        raise ValueError(f"prior_opp / c_puct / prior_eps / fpu / prior_human need prior=<path.ppol> in bot spec {raw!r}")
+    if "prior" not in keys and "tok_prior" not in keys and any(
+            k in keys for k in ("prior_opp", "c_puct", "prior_eps", "fpu", "prior_human")):
+        raise ValueError(f"prior_opp / c_puct / prior_eps / fpu / prior_human need prior=<path.ppol> "
+                         f"or tok_prior=<token net .pt> in bot spec {raw!r}")
+    if "tok_device" in keys and "tok_prior" not in keys:
+        raise ValueError(f"tok_device needs tok_prior=<token net .pt> in bot spec {raw!r}")
+    if type_name == "token-policy" and "model" not in keys:
+        raise ValueError(f"token-policy spec {raw!r} needs model=<token net .pt>")
     if "scale2" in keys and "ev2" not in keys:
         raise ValueError(f"scale2 needs ev2=<path.pev> in bot spec {raw!r}")
     if "ev2" in keys:
@@ -843,6 +861,12 @@ def _make_player(spec: BotSpec, cfg: LeagueConfig, recorder, concurrency: int, s
             if spec.param(key) is not None:
                 kwargs[key] = spec.param(key)
         kwargs["seed"] = cfg.seed * 1000 + salt
+    if spec.type == "token-policy":
+        kwargs["model"] = spec.param("model")
+        for key in ("device", "temp", "pick"):
+            if spec.param(key) is not None:
+                kwargs[key] = spec.param(key)
+        kwargs["seed"] = cfg.seed * 1000 + salt
     if spec.type == "humansearch":
         kwargs["model"] = spec.param("model")
         if spec.param("w") is not None:
@@ -1400,7 +1424,7 @@ def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     p.add_argument("--bots", help="comma-separated label=type[:key=value...] or plain type. Types: "
                    + ", ".join(sorted(bench.PLAYER_REGISTRY)) + ", foulplay. search keys: "
-                   "evaluator, scale, time_ms, worlds, selection (ucb1|exp3|rm), gamma, mode (mixed|argmax|nash|bayes), npc (matrix pseudocount), bargmax (0|1, bayes picks its best move), tendency (on|off), tkappa, tdelta, endgame (off|safest|nash), eg_alive, eg_side, eg_ms, eg_worlds, eg_cap, opp_model, opp_elo, exploit_delta, exploit_weight, exploit_kappa, exploit_gain (docs/human-policy.md), prior, prior_opp (self|none|human|path), c_puct, prior_eps, fpu, prior_human (docs/policy-prior.md). human keys: model, pick (sample|argmax), temp, elo. humansearch: search keys + model, w (human weight 0..1), pick, blend (geo|mix), temp, elo. e.g. net=search-net:evaluator=m.pev:scale=4:endgame=safest:eg_alive=5:eg_ms=1500")
+                   "evaluator, scale, time_ms, worlds, selection (ucb1|exp3|rm), gamma, mode (mixed|argmax|nash|bayes), npc (matrix pseudocount), bargmax (0|1, bayes picks its best move), tendency (on|off), tkappa, tdelta, endgame (off|safest|nash), eg_alive, eg_side, eg_ms, eg_worlds, eg_cap, opp_model, opp_elo, exploit_delta, exploit_weight, exploit_kappa, exploit_gain (docs/human-policy.md), prior, prior_opp (self|none|human|path), c_puct, prior_eps, fpu, prior_human (docs/policy-prior.md). human keys: model, pick (sample|argmax), temp, elo. token-policy keys: model, device (auto|cpu|cuda), temp, pick; search bots also take tok_prior=<token net .pt>, tok_device (docs/token-net.md). humansearch: search keys + model, w (human weight 0..1), pick, blend (geo|mix), temp, elo. e.g. net=search-net:evaluator=m.pev:scale=4:endgame=safest:eg_alive=5:eg_ms=1500")
     p.add_argument("--games-per-pair", type=bench._positive_int, default=20)
     p.add_argument("--out", type=Path, help="output dir, e.g. data/league/<run-id>")
     p.add_argument("--rate-only", type=Path, metavar="DIR", help="recompute results from DIR/games.jsonl")
