@@ -1475,6 +1475,51 @@ mod tests {
         assert!(obs.cat[b..b + 7].iter().all(|&i| i == crate::features_v4::IDX_UNKNOWN as i16));
     }
 
+    /// An opponent that was asleep (or KO'd before moving) shows no visible action in the observer's history.
+    #[test]
+    fn unexecuted_opponent_moves_are_not_in_the_history() {
+        use crate::state::PokemonStatus;
+        let mut hidden_cases = 0;
+        let mut visible_cases = 0;
+        for seed in 0..60u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let mut st = TEAM_DATA.sample_state(&mut rng);
+            {
+                let a = st.side_two.get_active();
+                a.status = PokemonStatus::SLEEP;
+                a.sleep_turns = 0;
+            }
+            let mut g = Game::from_state(st, seed);
+            let m = |g: &Game, s: usize| {
+                let sd = side_of(&g.state, s);
+                (0..4).find_map(|i| {
+                    let c = MoveChoice::Move(match i { 0 => PokemonMoveIndex::M0, 1 => PokemonMoveIndex::M1, 2 => PokemonMoveIndex::M2, _ => PokemonMoveIndex::M3 });
+                    g.opts[s].contains(&c).then_some((c, sd.get_active_immutable().moves[&PokemonMoveIndex::M0].id))
+                })
+            };
+            let (c0, _) = m(&g, 0).unwrap();
+            let (c1, _) = m(&g, 1).unwrap();
+            let pp_before = g.state.side_two.get_active_immutable().moves.m0.pp;
+            g.apply([c0, c1]);
+            let e = g.hist[0].front().unwrap();
+            assert!(e.own.present && e.own.kind == 1, "own chosen action is known to its player");
+            assert!(e.opp.present);
+            let spent = g.state.side_two.pokemon.pkmn[0].moves.m0.pp < pp_before
+                || (0..4).any(|i| g.reveal[1].mv[0][i]);
+            if spent {
+                assert!(e.opp.kind > 0, "an executed move is visible");
+                visible_cases += 1;
+            } else {
+                assert!(e.opp.kind == 0 && e.opp.aid == 0, "an unexecuted move must not reach the observer");
+                hidden_cases += 1;
+            }
+            // and the opponent's own view still knows what it chose
+            let o = g.hist[1].front().unwrap();
+            assert!(o.own.kind > 0 && o.own.aid > 0);
+        }
+        assert!(hidden_cases > 0, "no asleep turn was exercised ({} visible)", visible_cases);
+    }
+
     #[test]
     fn history_rows_follow_the_game() {
         let mut pool = SelfPlayPool::new(4, 8, 1, 200);
