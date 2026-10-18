@@ -80,6 +80,7 @@ class PPOConfig:
     infer_batch: int = 2048
     window: int = 400  # games in the rolling win-rate windows
     # architecture of the learner: "init" keeps the checkpoint's, "d192L4" distils a smaller net first
+    zero_history: bool = False  # feed padding history rows (what token-policy / net-search do today)
     arch: str = "init"
     distill_updates: int = 40
 
@@ -191,12 +192,13 @@ class Obs:
 class TokenBatcher:
     """Turns raw ``cat`` / ``cont`` rows (numpy or torch) into the dict of tensors ``TokenNet`` consumes."""
 
-    def __init__(self, device: str) -> None:
+    def __init__(self, device: str, zero_history: bool = False) -> None:
         import torch
 
         from showdown_bot import token_net, tokens
 
         self.torch = torch
+        self.zero_history = zero_history
         self.device = torch.device(device)
         lay = tokens.layout()
         self.fields = {k: v for k, v in lay.items() if k in token_net.INPUT_FIELDS}
@@ -221,6 +223,9 @@ class TokenBatcher:
             b[name] = src[:, fd["offset"] : fd["offset"] + size].reshape(n, *fd["shape"])
         b["hist_cat"] = up(hist_cat, None)
         b["hist_cont"] = up(hist_cont, t.float16)
+        if self.zero_history:  # what the live bots feed today (padding rows)
+            b["hist_cat"] = t.zeros_like(b["hist_cat"])
+            b["hist_cont"] = t.zeros_like(b["hist_cont"])
         return b
 
 
@@ -345,7 +350,7 @@ class Arena:
         self.cfg = cfg
         self.device = device
         self.pool = poke_engine.SelfPlayPool(cfg.games, cfg.seed, cfg.threads, cfg.turn_cap)
-        self.batcher = TokenBatcher(device)
+        self.batcher = TokenBatcher(device, cfg.zero_history)
         self.rng = random.Random(cfg.seed + 17)
         self.learner = Policy(learner, device, cfg.amp, cfg.infer_batch)
         self.opponents: dict[int, Policy] = {ANCHOR: Policy(anchor, device, cfg.amp, cfg.infer_batch)}
@@ -719,7 +724,7 @@ def distill(teacher: Any, student: Any, cfg: PPOConfig, device: str, updates: in
 
     from showdown_bot import token_net  # noqa: F401
 
-    batcher = TokenBatcher(device)
+    batcher = TokenBatcher(device, cfg.zero_history)
     import poke_engine
 
     pool = poke_engine.SelfPlayPool(cfg.games, cfg.seed + 101, cfg.threads, cfg.turn_cap)
