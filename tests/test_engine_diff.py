@@ -75,11 +75,15 @@ def test_report_renders_from_rows():
 
 
 @needs_sim
-def test_pp_is_not_decremented_by_the_engine_above_nine():
-    """Documents the known engine behaviour: only low PP is tracked (engine/README.md)."""
+def test_pp_tracking_above_nine_depends_on_max_pp_support():
+    """sdb.22+: moves built with max_pp decrement at any PP and match the simulator; older wheels only
+    track PP below 10 (engine/README.md)."""
     high = []
     for rec in ed.node_records(1, 1000, 3):
         high += [o for o in ed.analyse_turn(rec)["pp_obs"] if o[0] >= 10]
     assert high
-    assert all(engine_delta == 0 for _pre, engine_delta, _sim in high)
     assert any(sim_delta != 0 for _pre, _e, sim_delta in high)
+    if ed.ENGINE_HAS_MAX_PP:
+        assert all(engine_delta == sim_delta for _pre, engine_delta, sim_delta in high)
+    else:
+        assert all(engine_delta == 0 for _pre, engine_delta, _sim in high)

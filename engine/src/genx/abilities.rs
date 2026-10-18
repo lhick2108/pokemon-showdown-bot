@@ -518,6 +518,76 @@ fn quarkdrive_volatile_from_side(side: &Side) -> PokemonVolatileStatus {
     }
 }
 
+/// Protosynthesis / Quark Drive for a Pokemon that is already out when sun / Electric Terrain
+/// starts (Showdown `onWeatherChange` / `onTerrainChange`). The switch-in case is handled by
+/// `ability_on_switch_in`; this covers Sunny Day / Drought / Electric Terrain set by either
+/// side after the Pokemon entered. Runs after each half-turn.
+pub fn ability_field_change_activation(
+    state: &mut State,
+    side_ref: &SideReference,
+    instructions: &mut StateInstructions,
+) {
+    let sun = state.weather_is_active(&Weather::SUN);
+    let electric = state.terrain_is_active(&Terrain::ELECTRICTERRAIN);
+    if !sun && !electric {
+        return;
+    }
+    let side = state.get_side(side_ref);
+    let active = side.get_active_immutable();
+    if active.hp <= 0 {
+        return;
+    }
+    match active.ability {
+        Abilities::PROTOSYNTHESIS if sun => {
+            let boosted = [
+                PokemonVolatileStatus::PROTOSYNTHESISATK,
+                PokemonVolatileStatus::PROTOSYNTHESISDEF,
+                PokemonVolatileStatus::PROTOSYNTHESISSPA,
+                PokemonVolatileStatus::PROTOSYNTHESISSPD,
+                PokemonVolatileStatus::PROTOSYNTHESISSPE,
+            ]
+            .iter()
+            .any(|v| side.volatile_statuses.contains(v));
+            if !boosted {
+                let volatile = protosynthesis_volatile_from_side(side);
+                side.volatile_statuses.insert(volatile);
+                instructions
+                    .instruction_list
+                    .push(Instruction::ApplyVolatileStatus(
+                        ApplyVolatileStatusInstruction {
+                            side_ref: *side_ref,
+                            volatile_status: volatile,
+                        },
+                    ));
+            }
+        }
+        Abilities::QUARKDRIVE if electric => {
+            let boosted = [
+                PokemonVolatileStatus::QUARKDRIVEATK,
+                PokemonVolatileStatus::QUARKDRIVEDEF,
+                PokemonVolatileStatus::QUARKDRIVESPA,
+                PokemonVolatileStatus::QUARKDRIVESPD,
+                PokemonVolatileStatus::QUARKDRIVESPE,
+            ]
+            .iter()
+            .any(|v| side.volatile_statuses.contains(v));
+            if !boosted {
+                let volatile = quarkdrive_volatile_from_side(side);
+                side.volatile_statuses.insert(volatile);
+                instructions
+                    .instruction_list
+                    .push(Instruction::ApplyVolatileStatus(
+                        ApplyVolatileStatusInstruction {
+                            side_ref: *side_ref,
+                            volatile_status: volatile,
+                        },
+                    ));
+            }
+        }
+        _ => {}
+    }
+}
+
 pub fn ability_before_move(
     state: &mut State,
     choice: &mut Choice,
@@ -558,7 +628,8 @@ pub fn ability_before_move(
             if (choice.category == MoveCategory::Physical
                 || choice.category == MoveCategory::Special)
                 && (defending_pkmn.id == PokemonName::MIMIKYU
-                    || defending_pkmn.id == PokemonName::MIMIKYUTOTEM) =>
+                    || defending_pkmn.id == PokemonName::MIMIKYUTOTEM)
+                && type_effectiveness_modifier(&choice.move_type, defending_pkmn) > 0.0 =>
         {
             choice.base_power = 0.0;
             instructions
@@ -574,7 +645,8 @@ pub fn ability_before_move(
             if (choice.category == MoveCategory::Physical
                 || choice.category == MoveCategory::Special)
                 && (defending_pkmn.id == PokemonName::MIMIKYU
-                    || defending_pkmn.id == PokemonName::MIMIKYUTOTEM) =>
+                    || defending_pkmn.id == PokemonName::MIMIKYUTOTEM)
+                && type_effectiveness_modifier(&choice.move_type, defending_pkmn) > 0.0 =>
         {
             choice.base_power = 0.0;
             instructions
@@ -621,7 +693,11 @@ pub fn ability_before_move(
                 .contains(&PokemonVolatileStatus::TYPECHANGE)
             {
                 let active_pkmn = attacking_side.get_active();
-                if !active_pkmn.has_type(&choice.move_type) && !active_pkmn.terastallized {
+                // Showdown compares the whole type list: a Water/Dark Greninja using a Water
+                // move still becomes pure Water (once per switch-in, via TYPECHANGE)
+                if active_pkmn.types != (choice.move_type, PokemonType::TYPELESS)
+                    && !active_pkmn.terastallized
+                {
                     instructions
                         .instruction_list
                         .push(Instruction::ChangeType(ChangeType {
@@ -859,6 +935,28 @@ pub fn ability_after_damage_hit(
                 });
                 defending_pkmn.types = (choice.move_type, PokemonType::TYPELESS);
                 instructions.instruction_list.push(change_type_instruction);
+            }
+        }
+        // Electromorphosis (any damaging hit) / Wind Power (wind moves): the holder gets Charge
+        Abilities::ELECTROMORPHOSIS | Abilities::WINDPOWER => {
+            if damage_dealt > 0
+                && defending_pkmn.hp != 0
+                && (defending_pkmn.ability == Abilities::ELECTROMORPHOSIS || choice.flags.wind)
+                && !defending_side
+                    .volatile_statuses
+                    .contains(&PokemonVolatileStatus::CHARGE)
+            {
+                instructions
+                    .instruction_list
+                    .push(Instruction::ApplyVolatileStatus(
+                        ApplyVolatileStatusInstruction {
+                            side_ref: side_ref.get_other_side(),
+                            volatile_status: PokemonVolatileStatus::CHARGE,
+                        },
+                    ));
+                defending_side
+                    .volatile_statuses
+                    .insert(PokemonVolatileStatus::CHARGE);
             }
         }
         Abilities::STAMINA => {
@@ -1140,6 +1238,96 @@ pub fn ability_on_switch_out(
     }
 }
 
+/// Weather residual abilities (Showdown `onWeather`, fired with the weather's own residual at
+/// order 1: before Future Sight / Wish / Leftovers / status damage). Heal Block stops the heals.
+pub fn ability_weather_residual(
+    state: &mut State,
+    side_ref: &SideReference,
+    instructions: &mut StateInstructions,
+) {
+    let (own_side, other_side) = state.get_both_sides_immutable(side_ref);
+    if other_side.get_active_immutable().ability == Abilities::NEUTRALIZINGGAS {
+        return;
+    }
+    let blocked = own_side
+        .volatile_statuses
+        .contains(&PokemonVolatileStatus::HEALBLOCK);
+    let ability = own_side.get_active_immutable().ability;
+    let rain = state.weather_is_active(&Weather::RAIN) || state.weather_is_active(&Weather::HEAVYRAIN);
+    let active_pkmn = state.get_side(side_ref).get_active();
+    if active_pkmn.hp <= 0 {
+        return;
+    }
+    let mut heal_frac: i16 = 0; // denominator; 0 = none
+    let mut damage_frac: i16 = 0;
+    match ability {
+        Abilities::SOLARPOWER => {
+            if state.weather_is_active(&Weather::HARSHSUN) || state.weather_is_active(&Weather::SUN) {
+                damage_frac = 8;
+            }
+        }
+        Abilities::DRYSKIN => {
+            if state.weather_is_active(&Weather::RAIN) || state.weather_is_active(&Weather::HEAVYRAIN) {
+                heal_frac = 8;
+            } else if state.weather_is_active(&Weather::HARSHSUN) || state.weather_is_active(&Weather::SUN) {
+                damage_frac = 8;
+            }
+        }
+        Abilities::RAINDISH if rain => heal_frac = 16,
+        Abilities::ICEBODY if state.weather_is_active(&Weather::HAIL) => heal_frac = 16,
+        _ => return,
+    }
+    let active_pkmn = state.get_side(side_ref).get_active();
+    if heal_frac > 0 && !blocked {
+        let amount = cmp::min(active_pkmn.maxhp / heal_frac, active_pkmn.maxhp - active_pkmn.hp);
+        if amount > 0 {
+            instructions.instruction_list.push(Instruction::Heal(HealInstruction {
+                side_ref: *side_ref,
+                heal_amount: amount,
+            }));
+            active_pkmn.hp += amount;
+        }
+    } else if damage_frac > 0 && active_pkmn.ability != Abilities::MAGICGUARD {
+        let amount = cmp::min(active_pkmn.maxhp / damage_frac, active_pkmn.hp);
+        if amount > 0 {
+            instructions.instruction_list.push(Instruction::Damage(DamageInstruction {
+                side_ref: *side_ref,
+                damage_amount: amount,
+            }));
+            active_pkmn.hp -= amount;
+        }
+    }
+}
+
+/// Hydration / Shed Skin (Showdown residual order 5, sub-order 3: after Wish and Grassy Terrain,
+/// before Leftovers and before poison / burn damage). Shed Skin's 1/3 chance is not branched on.
+pub fn ability_status_cure_residual(
+    state: &mut State,
+    side_ref: &SideReference,
+    instructions: &mut StateInstructions,
+) {
+    let (own_side, other_side) = state.get_both_sides_immutable(side_ref);
+    if other_side.get_active_immutable().ability == Abilities::NEUTRALIZINGGAS {
+        return;
+    }
+    let active = own_side.get_active_immutable();
+    if active.hp <= 0 || active.status == PokemonStatus::NONE {
+        return;
+    }
+    let cure = match active.ability {
+        Abilities::HYDRATION => {
+            state.weather_is_active(&Weather::RAIN) || state.weather_is_active(&Weather::HEAVYRAIN)
+        }
+        Abilities::SHEDSKIN => true,
+        _ => false,
+    };
+    if cure {
+        let side = state.get_side(side_ref);
+        let active_index = side.active_index;
+        add_remove_status_instructions(instructions, active_index, *side_ref, side);
+    }
+}
+
 pub fn ability_end_of_turn(
     state: &mut State,
     side_ref: &SideReference,
@@ -1232,54 +1420,6 @@ pub fn ability_end_of_turn(
                 defender.hp -= damage_dealt;
             }
         }
-        Abilities::SOLARPOWER => {
-            if state.weather_is_active(&Weather::HARSHSUN) || state.weather_is_active(&Weather::SUN)
-            {
-                let active_pkmn = state.get_side(side_ref).get_active();
-                let damage_dealt =
-                    cmp::min(active_pkmn.maxhp / 8, active_pkmn.maxhp - active_pkmn.hp);
-                if damage_dealt > 0 {
-                    instructions
-                        .instruction_list
-                        .push(Instruction::Damage(DamageInstruction {
-                            side_ref: *side_ref,
-                            damage_amount: damage_dealt,
-                        }));
-                    active_pkmn.hp -= damage_dealt;
-                }
-            }
-        }
-        Abilities::ICEBODY => {
-            if state.weather_is_active(&Weather::HAIL) {
-                let active_pkmn = state.get_side(side_ref).get_active();
-                let health_recovered =
-                    cmp::min(active_pkmn.maxhp / 16, active_pkmn.maxhp - active_pkmn.hp);
-                if health_recovered > 0 {
-                    instructions
-                        .instruction_list
-                        .push(Instruction::Heal(HealInstruction {
-                            side_ref: *side_ref,
-                            heal_amount: health_recovered,
-                        }));
-                    active_pkmn.hp += health_recovered;
-                }
-            }
-        }
-        Abilities::POISONHEAL => {
-            if active_pkmn.hp < active_pkmn.maxhp
-                && (active_pkmn.status == PokemonStatus::POISON
-                    || active_pkmn.status == PokemonStatus::TOXIC)
-            {
-                let heal_amount =
-                    cmp::min(active_pkmn.maxhp / 8, active_pkmn.maxhp - active_pkmn.hp);
-                let ins = Instruction::Heal(HealInstruction {
-                    side_ref: side_ref.clone(),
-                    heal_amount: heal_amount,
-                });
-                active_pkmn.hp += heal_amount;
-                instructions.instruction_list.push(ins);
-            }
-        }
         Abilities::SPEEDBOOST => {
             if attacking_side.speed_boost < 6 {
                 let ins = Instruction::Boost(BoostInstruction {
@@ -1289,72 +1429,6 @@ pub fn ability_end_of_turn(
                 });
                 attacking_side.speed_boost += 1;
                 instructions.instruction_list.push(ins);
-            }
-        }
-        Abilities::RAINDISH => {
-            if state.weather_is_active(&Weather::RAIN)
-                || state.weather_is_active(&Weather::HEAVYRAIN)
-            {
-                let active_pkmn = state.get_side(side_ref).get_active();
-                let health_recovered =
-                    cmp::min(active_pkmn.maxhp / 16, active_pkmn.maxhp - active_pkmn.hp);
-                if health_recovered > 0 {
-                    instructions
-                        .instruction_list
-                        .push(Instruction::Heal(HealInstruction {
-                            side_ref: *side_ref,
-                            heal_amount: health_recovered,
-                        }));
-                    active_pkmn.hp += health_recovered;
-                }
-            }
-        }
-        Abilities::DRYSKIN => {
-            if state.weather_is_active(&Weather::RAIN) {
-                let active_pkmn = state.get_side(side_ref).get_active();
-                if active_pkmn.hp < active_pkmn.maxhp {
-                    let heal_amount =
-                        cmp::min(active_pkmn.maxhp / 8, active_pkmn.maxhp - active_pkmn.hp);
-                    let ins = Instruction::Heal(HealInstruction {
-                        side_ref: side_ref.clone(),
-                        heal_amount: heal_amount,
-                    });
-                    active_pkmn.hp += heal_amount;
-                    instructions.instruction_list.push(ins);
-                }
-            }
-        }
-        Abilities::HYDRATION => {
-            if active_pkmn.status != PokemonStatus::NONE
-                && (state.weather_is_active(&Weather::RAIN)
-                    || state.weather_is_active(&Weather::HEAVYRAIN))
-            {
-                let attacking_side = state.get_side(side_ref);
-                let active_index = attacking_side.active_index;
-                let active_pkmn = attacking_side.get_active();
-
-                add_remove_status_instructions(
-                    instructions,
-                    active_index,
-                    *side_ref,
-                    attacking_side,
-                );
-            }
-        }
-        // Shed skin only has a 1/3 chance of activating at the end of the turn
-        // but I'm not going to branch on that here
-        Abilities::SHEDSKIN => {
-            if active_pkmn.status != PokemonStatus::NONE {
-                let attacking_side = state.get_side(side_ref);
-                let active_index = attacking_side.active_index;
-                let active_pkmn = attacking_side.get_active();
-
-                add_remove_status_instructions(
-                    instructions,
-                    active_index,
-                    *side_ref,
-                    attacking_side,
-                );
             }
         }
         _ => {}
@@ -2349,7 +2423,8 @@ pub fn ability_modify_attack_being_used(
             if attacker_choice.secondaries.is_some() || sheer_force_volatile_boosted {
                 attacker_choice.base_power *= 1.3;
                 attacker_choice.secondaries = None;
-                attacker_choice.volatile_status = None
+                attacker_choice.volatile_status = None;
+                attacker_choice.sheer_force_applied = true;
             }
         }
         Abilities::IRONFIST => {

@@ -268,3 +268,86 @@ Engine damage = probability-weighted over all engine branches (includes crit / m
 | supreme_overlord: Kingambit with 5 fainted allies, Kowtow Cleave vs Snorlax | 30 | 262.2 | 238-393 | 266.5 | 1.02 |
 | flash_fire: Heatran after absorbing Flamethrower, Flamethrower vs Blissey | 30 | 159.9 | 141-231 | 162.5 | 1.02 |
 | flash_fire control: Heatran (not activated) Flamethrower vs Blissey | 30 | 109.7 | 94-156 | 109.4 | 1.00 |
+
+---
+
+# After sdb.22 (589.68.4): same 200 seeds, engine `0.0.48+sdb.22`
+
+`python scripts/engine_diff.py run --games 200 --seed 5000` with the sdb.22 wheel (6,992 turns, 6,983 comparable, one
+process, 23 s). The harness also changed slightly: it now passes the simulator's `maxpp` (`Move.max_pp`), the
+Heal Block / Throat Chop durations, and marks Protean / Libero as used from the simulator's ability state. To separate
+engine from harness effects the sdb.21 wheel was re-run with the *same* harness.
+
+| | sdb.19 report (old harness) | sdb.21 wheel, new harness | **sdb.22** |
+|---|---|---|---|
+| diverging turns, PP excluded | 591 / 6,983 = 8.5% | 577 = 8.3% | **383 = 5.5%** |
+| clean turns only | 581 / 6,928 = 8.4% | 567 = 8.2% | 376 / 6,928 = 5.4% |
+| turns differing in anything, PP included | 5,882 = 84.2% (PP only) | 5,962 = 85.4% | **403 = 5.8%** (383 diverge + 20 PP-only) |
+| `healblock` / `throatchop` volatile mismatches | 49 / 12 | | 0 / 0 |
+
+PP now agrees with the simulator on 99.5-99.8% of changed slots in every PP bucket (was 0% at 10 and above); PP
+differs in 25 of 6,983 turns. What is left: a move used against a target that fainted earlier in the turn (the
+simulator still spends the PP, the engine skips the move before the deduction; 5000:34) and a few Pressure /
+Sleep Talk interactions.
+
+## What changed in the engine
+
+* **Residual order** (`add_end_of_turn_instructions`) now follows Showdown's `onResidualOrder`: weather damage and
+  weather abilities (Solar Power, Dry Skin, Rain Dish, Ice Body; order 1), Future Sight (3), Wish (4), Grassy Terrain heal
+  (5/2, and not on the terrain's last turn), Hydration / Shed Skin (5/3), **Leftovers / Black Sludge (5/4)**, Leech Seed (8),
+  poison / toxic / Poison Heal (9), burn (10), then Salt Cure and bind (13), Yawn, Perish Song, Roost, and finally the
+  orbs / Speed Boost / form checks. Fixed on the way: Black Sludge damage and Solar Power damage were clamped to the
+  *missing* HP instead of the current HP; Hydration / Shed Skin cured after the poison tick.
+* **Heal Block** (5 turns, Psychic Noise 2, Persistent 7) is a real timer; it blocks Leftovers, Black Sludge, Grassy
+  Terrain, Wish, Leech Seed's heal, Poison Heal, Ice Body / Rain Dish / Dry Skin and heal moves (which are no longer
+  offered as choices). **Throat Chop** lasts 2 turns, blocks sound moves, and (like Psychic Noise's Heal Block) is now a
+  100% *secondary*, so Protect / Substitute / Covert Cloak / Sheer Force stop it.
+* **PP** is tracked at any value for moves with `max_pp > 0`, clamped at 0 (Pressure), not spent when the user is
+  asleep / fully paralysed / flinched or on the continuation turn of a charge / locked move, still spent by a failed
+  Protect and by a Sleep Talk used while asleep; Leppa Berry restores at most up to `max_pp`. Moves with unknown max PP
+  (`max_pp == 0`, hand-built states and old records) keep the old "track below 10" behaviour.
+  MCTS cost: see `scripts/engine_bench_pp.py`, about 6% fewer iterations/s with full tracking (0.92-0.99x over three
+  states and four runs, single thread, noisy because the ladder was running). The live bot therefore does not turn
+  it on (`engine_state.TRACK_PP`, env `SHOWDOWN_ENGINE_TRACK_PP=1`); self-play and this harness do.
+* Take Heart (+1 SpA/SpD and status cure); Sheer Force removes Life Orb recoil; a KO with Giga Impact / Hyper Beam keeps
+  its recharge (the follow-up `(switch, none)` call used to consume it); Protean / Libero retype Water/Dark Greninja to
+  pure Water on a Water move (whole type list compared, once per switch-in); Protosynthesis / Quark Drive activate when
+  sun / Electric Terrain starts with the mon already out; Disguise survives an immune hit; Electromorphosis / Wind Power
+  give Charge and Charge is used up by the next Electric move; Seismic Toss, Night Shade, Super Fang, Endeavor, Final
+  Gambit no longer go through Protect.
+
+## New top-10 (turns, % of 6,983)
+
+| # | field / mechanic | turns | note |
+|---|---|---|---|
+| 1 | item, Harvest | 18 (0.3%) | Harvest not implemented (needs the consumed berry; plan below) |
+| 2 | active, no sim event | 10 | Mimikyu-Busted (5045:31), Terapagos shift, forme changes (plan below) |
+| 3 | hp, Sitrus Berry | 9 | mostly Harvest-regrown Sitrus (5067:60) |
+| 4 | volatile `slowstart` still on in the engine | 9 | Slow Start timer (Regigigas) |
+| 5 | hp, Recover | 8 | harness artifact: heal + damage in one turn is compared as a net change with a tolerance sized to the net |
+| 6 | hp, Knock Off | 8 | Knock Off + item interactions (Harvest, Unburden, Sitrus) |
+| 7 | volatile `disable` missing | 8 | Cursed Body not implemented |
+| 8 | volatile `unburden` missing | 7 | Unburden not implemented |
+| 9 | active, residual | 7 | forme changes at end of turn (Shields Down, Hunger Switch) |
+| 10 | hp, Roost | 7 | same harness artifact as Recover |
+
+Then: `curse` volatile left on non-Ghost Curse (cosmetic, 25), confusion length of Outrage / Thrash (random 2-3 turns
+in Showdown), Imposter's `transformed` (5), Speed Boost (9, engine ticks on a turn the sim does not), Synchronize
+(5028:9), Life Orb after a Disguise-absorbed hit (5045:31).
+
+## Not done (plans)
+
+* **Harvest** (about 0.6% of turns incl. Sitrus follow-ups). Needs (1) `Pokemon.last_item: Items` (serialized as an
+  optional trailing field, py binding `last_item`), (2) set when a berry is *eaten* (all `ChangeItem berry -> none` sites
+  in `items.rs`, but not Knock Off / Thief / Trick), cleared when it regrows, via a new reversible
+  `Instruction::SetLastItem{side, new, previous}` (fits the 8-byte `Instruction`), (3) a last-in-turn Harvest step with
+  probability 1 in sun else 0.5: `add_end_of_turn_instructions` would return the "did not regrow" branch (a clone of the
+  instruction list before the Harvest step with probability x (1-p)) for the 4 call sites in
+  `generate_instructions_from_move_pair` to push, then re-run `item_end_of_turn` for the regrown Sitrus.
+* **Forme changes** (about 0.3%): Terapagos -> Terastal on switch-in (and Stellar on Tera: HP/stat/type/ability
+  recalculation via `recalculate_stats`, the pattern `Abilities::SHIELDSDOWN`/`SCHOOLING` already use), Mimikyu-Busted
+  on Disguise bust (already switches id but the harness shows the *active* mismatch; check `FormeChange` in the
+  best-matching-branch path), Eiscue -> Noice (exists for physical hits; Hail restores Ice Face, missing), Morpeko-Hangry
+  (`Abilities::HUNGERSWITCH` exists; the stats / move Aura Wheel type are not recalculated), Ursaluna-Bloodmoon.
+* Slow Start (9 turns), Cursed Body (8), Unburden (7), Synchronize, a real Struggle choice when all PP are spent
+  (currently the side gets `none`), Outrage / Thrash random length.

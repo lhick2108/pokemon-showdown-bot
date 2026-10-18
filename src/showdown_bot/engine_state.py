@@ -72,6 +72,7 @@ track the value). Every one of these is silently approximated or dropped:
 from __future__ import annotations
 
 import logging
+import os
 import math
 import random
 from collections.abc import Mapping, Sequence
@@ -777,7 +778,24 @@ def _clamp8(value: int) -> int:
     return max(-128, min(127, int(value)))
 
 
-def _engine_move(move_id: str, pp: int, disabled: bool = False) -> pe.Move:
+try:  # engine >= 0.0.48+sdb.22: Move.max_pp enables full PP tracking in the search
+    pe.Move(id="tackle", max_pp=8)
+    _ENGINE_HAS_MAX_PP = True
+except TypeError:
+    _ENGINE_HAS_MAX_PP = False
+
+# Full PP tracking costs ~6-8% MCTS iterations/s (one DecrementPP per move) and only matters over
+# whole games (self-play stall loops, Leppa), not over a live search horizon of a few turns. So the
+# live bot keeps the engine's cheap "track PP below 10" mode; self-play / the differential test
+# turn it on with SHOWDOWN_ENGINE_TRACK_PP=1 or `engine_state.TRACK_PP = True`.
+TRACK_PP = os.environ.get("SHOWDOWN_ENGINE_TRACK_PP", "").strip().lower() in ("1", "true", "yes")
+
+
+def _engine_move(move_id: str, pp: int, disabled: bool = False, max_pp: int | None = None) -> pe.Move:
+    if _ENGINE_HAS_MAX_PP and TRACK_PP:
+        cap = _clamp8(max_pp if max_pp else _max_pp(move_id))
+        # the engine caps PP restores at max_pp; never let the observed PP exceed it
+        return pe.Move(id=to_id(move_id), pp=_clamp8(pp), disabled=disabled, max_pp=max(cap, _clamp8(pp), 1))
     return pe.Move(id=to_id(move_id), pp=_clamp8(pp), disabled=disabled)
 
 
@@ -874,7 +892,7 @@ def _own_moves(battle: Any, mon: Any, is_active: bool) -> list[pe.Move]:
             if pp is None:
                 known = mon.moves.get(move_id)
                 pp = known.current_pp if known is not None else _max_pp(move_id)
-            out.append(_engine_move(move_id, pp, bool(entry.get("disabled", False))))
+            out.append(_engine_move(move_id, pp, bool(entry.get("disabled", False)), entry.get("maxpp")))
         return out[:4]
     for move_id, move in list(mon.moves.items())[:4]:
         out.append(_engine_move(move_id, move.current_pp))
@@ -1224,7 +1242,7 @@ def _apply_transform(
             changes["ability"] = ability
             changes["base_ability"] = pokemon.base_ability
         copied = [
-            _engine_move(move_id, min(5, move.current_pp))
+            _engine_move(move_id, min(5, move.current_pp), max_pp=5)
             for move_id, move in list(mon.moves.items())[:4]
         ]
         if copied:

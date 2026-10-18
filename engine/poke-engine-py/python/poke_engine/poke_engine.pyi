@@ -18,6 +18,10 @@ class VolatileStatusDurations:
     :type taunt: int
     :param yawn: Yawn turns remaining
     :type yawn: int
+    :param healblock: Heal Block turns remaining (sdb.22; 0 with the volatile set = fresh 5)
+    :type healblock: int
+    :param throatchop: Throat Chop turns remaining (sdb.22; 0 with the volatile set = fresh 2)
+    :type throatchop: int
     """
 
     confusion: int
@@ -26,6 +30,8 @@ class VolatileStatusDurations:
     slowstart: int
     taunt: int
     yawn: int
+    healblock: int
+    throatchop: int
 
     def __init__(
         self,
@@ -35,6 +41,8 @@ class VolatileStatusDurations:
         slowstart: int = 0,
         taunt: int = 0,
         yawn: int = 0,
+        healblock: int = 0,
+        throatchop: int = 0,
     ) -> None: ...
 
 class SideConditions:
@@ -134,17 +142,21 @@ class Move:
     :type disabled: bool
     :param pp: Remaining PP
     :type pp: int
+    :param max_pp: Maximum PP; 0 = unknown (engine then tracks PP only below 10)
+    :type max_pp: int
     """
 
     id: str
     disabled: bool
     pp: int
+    max_pp: int
 
     def __init__(
         self,
         id: str = "none",
         pp: int = 16,
         disabled: bool = False,
+        max_pp: int = 0,
     ) -> None: ...
 
 class Pokemon:

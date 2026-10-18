@@ -12815,10 +12815,12 @@ pub static MOVES: LazyLock<HashMap<Choices, Choice>> = LazyLock::new(|| {
                 sound: true,
                 ..Default::default()
             },
-            volatile_status: Some(VolatileStatus {
+            // Showdown: a 100% secondary (Heal Block for 2 turns)
+            secondaries: Some(vec![Secondary {
+                chance: 100.0,
                 target: MoveTarget::Opponent,
-                volatile_status: PokemonVolatileStatus::HEALBLOCK,
-            }),
+                effect: Effect::VolatileStatus(PokemonVolatileStatus::HEALBLOCK),
+            }]),
             ..Default::default()
         },
     );
@@ -17105,6 +17107,18 @@ pub static MOVES: LazyLock<HashMap<Choices, Choice>> = LazyLock::new(|| {
             flags: Flags {
                 ..Default::default()
             },
+            // +1 SpA / +1 SpD; the status cure is in `choice_special_effect`
+            boost: Some(Boost {
+                target: MoveTarget::User,
+                boosts: StatBoosts {
+                    attack: 0,
+                    defense: 0,
+                    special_attack: 1,
+                    special_defense: 1,
+                    speed: 0,
+                    accuracy: 0,
+                },
+            }),
             ..Default::default()
         },
     );
@@ -17472,10 +17486,12 @@ pub static MOVES: LazyLock<HashMap<Choices, Choice>> = LazyLock::new(|| {
                 protect: true,
                 ..Default::default()
             },
-            volatile_status: Some(VolatileStatus {
+            // Showdown: a 100% secondary, so Protect / Substitute / Covert Cloak / Sheer Force stop it
+            secondaries: Some(vec![Secondary {
+                chance: 100.0,
                 target: MoveTarget::Opponent,
-                volatile_status: PokemonVolatileStatus::THROATCHOP,
-            }),
+                effect: Effect::VolatileStatus(PokemonVolatileStatus::THROATCHOP),
+            }]),
             ..Default::default()
         },
     );
@@ -20518,6 +20534,8 @@ pub struct Choice {
 
     pub first_move: bool,
     pub sleep_talk_move: bool,
+    /// Set by Sheer Force when it removed this move's secondary effects (Life Orb recoil is then skipped)
+    pub sheer_force_applied: bool,
 }
 
 impl fmt::Debug for Choice {
@@ -20647,6 +20665,7 @@ impl Default for Choice {
             target: MoveTarget::Opponent,
             first_move: true,
             sleep_talk_move: false,
+            sheer_force_applied: false,
         }
     }
 }

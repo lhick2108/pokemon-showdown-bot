@@ -83,6 +83,25 @@ GUESS_FEATURES = ("sleep", "rest", "confusion", "encore", "taunt", "lockedmove",
 _VOL_OK: dict[str, bool] = {}
 
 
+def _wheel_supports_sdb22() -> tuple[bool, bool]:
+    """(Heal Block / Throat Chop durations, Move.max_pp) available in the loaded poke_engine wheel (>= sdb.22)."""
+    dur = mx = False
+    try:
+        pe.VolatileStatusDurations(healblock=1)
+        dur = True
+    except TypeError:
+        pass
+    try:
+        pe.Move(id="tackle", max_pp=8)
+        mx = True
+    except TypeError:
+        pass
+    return dur, mx
+
+
+ENGINE_HAS_DURATIONS, ENGINE_HAS_MAX_PP = _wheel_supports_sdb22()
+
+
 def engine_supports_volatile(name: str) -> bool:
     ok = _VOL_OK.get(name)
     if ok is None:
@@ -165,6 +184,12 @@ def sim_volatiles_to_engine(mon: dict, unrep: set, guess: set) -> tuple[set, dic
         elif vid == "yawn":
             dur["yawn"] = 1
             guess.add("yawn")
+        elif vid == "healblock" and ENGINE_HAS_DURATIONS:
+            dur["healblock"] = max(1, int(st.get("duration") or 5))
+        elif vid == "throatchop" and ENGINE_HAS_DURATIONS:
+            dur["throatchop"] = max(1, int(st.get("duration") or 2))
+    if mon.get("abilityOnce") and engine_supports_volatile("typechange"):
+        vols.add("typechange")
     return vols, dur, sub_hp
 
 
@@ -193,7 +218,8 @@ def build_pokemon(m: dict, req_moves: list | None, unrep: set, guess: set):
                 disabled = mv["id"] != forced
             elif i < len(req_moves):
                 disabled = bool(req_moves[i]["disabled"])
-        moves.append(pe.Move(id=to_id(mv["id"]), pp=max(-128, min(127, int(mv["pp"]))), disabled=disabled))
+        mkw = {"max_pp": max(1, min(127, int(mv["maxpp"])))} if ENGINE_HAS_MAX_PP and mv.get("maxpp") else {}
+        moves.append(pe.Move(id=to_id(mv["id"]), pp=max(-128, min(127, int(mv["pp"]))), disabled=disabled, **mkw))
     while len(moves) < 4:
         moves.append(pe.Move(id="none", pp=0, disabled=True))
     types = [to_id(t) for t in m["types"] if t != "???"] or ["typeless"]

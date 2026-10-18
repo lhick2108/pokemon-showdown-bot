@@ -34,8 +34,10 @@ First report (200 games, 6,983 turns): [engine-diff-report.md](engine-diff-repor
 branches. A sim damage `d_s` and engine damage `d_e` agree when `|d_s - d_e| <= max(3, 0.11 x max(d_e, d_s), 3% of max HP)`.
 Real errors below ~11% of the damage are invisible per turn (the aggregate ratio tables resolve ~1-2%).
 
-**PP is reported separately.** The engine only decrements PP below 10 (`generate_instructions.rs`, `pp < 10`), so
-PP differs in ~84% of turns. A "diverge" status therefore ignores PP; PP-only turns are `pp_only`.
+**PP is reported separately.** Up to sdb.21 the engine only decremented PP below 10 (`pp < 10`), so PP differed in ~84%
+of turns. sdb.22 tracks PP at any value for moves built with a known `Move.max_pp` (the harness passes the simulator's
+`maxpp`; with a pre-sdb.22 wheel the old behaviour and the 84% remain). A "diverge" status ignores PP; PP-only turns are
+`pp_only`.
 
 ## Running
 

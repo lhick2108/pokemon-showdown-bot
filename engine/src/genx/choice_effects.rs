@@ -1294,6 +1294,22 @@ pub fn choice_special_effect(
     attacking_side_ref: &SideReference,
     instructions: &mut StateInstructions,
 ) {
+    // fixed-damage moves are applied here, so a Protect-ed target (the choice was turned into a
+    // Status move by `remove_effects_for_protect`) must not take them
+    if choice.category == MoveCategory::Status
+        && matches!(
+            choice.move_id,
+            Choices::SEISMICTOSS
+                | Choices::NIGHTSHADE
+                | Choices::SUPERFANG
+                | Choices::NATURESMADNESS
+                | Choices::RUINATION
+                | Choices::ENDEAVOR
+                | Choices::FINALGAMBIT
+        )
+    {
+        return;
+    }
     let (attacking_side, defending_side) = state.get_both_sides(attacking_side_ref);
     match choice.move_id {
         Choices::BELLYDRUM => {
@@ -1392,7 +1408,7 @@ pub fn choice_special_effect(
                 attacking_side.wish = (2, attacking_side.get_active_immutable().maxhp / 2);
             }
         }
-        Choices::REFRESH => {
+        Choices::REFRESH | Choices::TAKEHEART => {
             let active_index = attacking_side.active_index;
             let active_pkmn = attacking_side.get_active();
             if active_pkmn.status != PokemonStatus::NONE {

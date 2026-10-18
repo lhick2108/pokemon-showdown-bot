@@ -290,7 +290,7 @@ impl PySide {
         active_index="0".to_string(),
         baton_passing=false,
         shed_tailing=false,
-        volatile_status_durations=PyVolatileStatusDurations::new(0, 0, 0, 0, 0, 0),
+        volatile_status_durations=PyVolatileStatusDurations::new(0, 0, 0, 0, 0, 0, 0, 0),
         wish=(0, 0),
         future_sight=(0, "0".to_string()),
         force_switch=false,
@@ -384,6 +384,8 @@ pub struct PyVolatileStatusDurations {
     pub slowstart: i8,
     pub taunt: i8,
     pub yawn: i8,
+    pub healblock: i8,
+    pub throatchop: i8,
 }
 
 impl From<VolatileStatusDurations> for PyVolatileStatusDurations {
@@ -395,6 +397,8 @@ impl From<VolatileStatusDurations> for PyVolatileStatusDurations {
             slowstart: other.slowstart,
             taunt: other.taunt,
             yawn: other.yawn,
+            healblock: other.healblock,
+            throatchop: other.throatchop,
         }
     }
 }
@@ -408,6 +412,8 @@ impl Into<VolatileStatusDurations> for PyVolatileStatusDurations {
             slowstart: self.slowstart,
             taunt: self.taunt,
             yawn: self.yawn,
+            healblock: self.healblock,
+            throatchop: self.throatchop,
         }
     }
 }
@@ -422,6 +428,8 @@ impl PyVolatileStatusDurations {
         slowstart=0,
         taunt=0,
         yawn=0,
+        healblock=0,
+        throatchop=0,
     ))]
     fn new(
         confusion: i8,
@@ -430,6 +438,8 @@ impl PyVolatileStatusDurations {
         slowstart: i8,
         taunt: i8,
         yawn: i8,
+        healblock: i8,
+        throatchop: i8,
     ) -> PyVolatileStatusDurations {
         PyVolatileStatusDurations {
             confusion,
@@ -438,6 +448,8 @@ impl PyVolatileStatusDurations {
             slowstart,
             taunt,
             yawn,
+            healblock,
+            throatchop,
         }
     }
 }
@@ -814,6 +826,7 @@ pub struct PyMove {
     pub id: String,
     pub disabled: bool,
     pub pp: i8,
+    pub max_pp: i8,
 }
 
 impl From<Move> for PyMove {
@@ -822,6 +835,7 @@ impl From<Move> for PyMove {
             id: other.id.to_string(),
             disabled: other.disabled,
             pp: other.pp,
+            max_pp: other.max_pp,
         }
     }
 }
@@ -832,6 +846,7 @@ impl Into<Move> for PyMove {
             id: Choices::from_str(&self.id).unwrap(),
             disabled: self.disabled,
             pp: self.pp,
+            max_pp: self.max_pp,
             choice: MOVES
                 .get(&Choices::from_str(&self.id).unwrap())
                 .unwrap()
@@ -846,20 +861,23 @@ impl PyMove {
             id: String::new(),
             disabled: true,
             pp: 0,
+            max_pp: 0,
         }
     }
 }
 
 #[pymethods]
 impl PyMove {
+    /// `max_pp` 0 = unknown: the engine then only tracks PP below 10 (legacy behaviour).
     #[new]
     #[pyo3(signature = (
         id="none".to_string(),
         pp=16,
         disabled=false,
+        max_pp=0,
     ))]
-    fn new(id: String, pp: i8, disabled: bool) -> Self {
-        PyMove { id, disabled, pp }
+    fn new(id: String, pp: i8, disabled: bool, max_pp: i8) -> Self {
+        PyMove { id, disabled, pp, max_pp }
     }
 }
 

@@ -590,11 +590,20 @@ pub struct Move {
     pub id: Choices,
     pub disabled: bool,
     pub pp: i8,
+    /// Maximum PP (sdb.22). 0 = unknown: the engine then tracks PP only below 10 and does not
+    /// cap restores (hand-built states and records serialized before sdb.22).
+    pub max_pp: i8,
     pub choice: Choice,
 }
 impl Move {
+    /// `id;disabled;pp`, plus `;max_pp` only when it is known (> 0), so unknown-max moves
+    /// serialize exactly as before sdb.22 and old strings still parse.
     pub fn serialize(&self) -> String {
-        format!("{:?};{};{}", self.id, self.disabled, self.pp)
+        if self.max_pp > 0 {
+            format!("{:?};{};{};{}", self.id, self.disabled, self.pp, self.max_pp)
+        } else {
+            format!("{:?};{};{}", self.id, self.disabled, self.pp)
+        }
     }
     pub fn deserialize(serialized: &str) -> Move {
         let split: Vec<&str> = serialized.split(";").collect();
@@ -602,6 +611,7 @@ impl Move {
             id: Choices::from_str(split[0]).unwrap(),
             disabled: split[1].parse::<bool>().unwrap(),
             pp: split[2].parse::<i8>().unwrap(),
+            max_pp: split.get(3).map_or(0, |v| v.parse::<i8>().unwrap()),
             choice: MOVES
                 .get(&Choices::from_str(split[0]).unwrap())
                 .unwrap()
@@ -615,6 +625,7 @@ impl Default for Move {
             id: Choices::NONE,
             disabled: false,
             pp: 32,
+            max_pp: 0,
             choice: Choice::default(),
         }
     }
@@ -839,6 +850,11 @@ pub struct VolatileStatusDurations {
     pub slowstart: i8,
     pub taunt: i8,
     pub yawn: i8,
+    /// Heal Block turns remaining (5; Psychic Noise 2; Persistent 7). 0 with the volatile set
+    /// (states serialized before sdb.22) is read as a fresh 5-turn Heal Block.
+    pub healblock: i8,
+    /// Throat Chop turns remaining (2). 0 with the volatile set is read as a fresh 2.
+    pub throatchop: i8,
 }
 
 impl Default for VolatileStatusDurations {
@@ -850,6 +866,8 @@ impl Default for VolatileStatusDurations {
             slowstart: 0,
             taunt: 0,
             yawn: 0,
+            healblock: 0,
+            throatchop: 0,
         }
     }
 }
@@ -863,6 +881,8 @@ impl VolatileStatusDurations {
             ("slowstart", self.slowstart),
             ("taunt", self.taunt),
             ("yawn", self.yawn),
+            ("healblock", self.healblock),
+            ("throatchop", self.throatchop),
         ];
 
         let mut output = String::new();
@@ -877,15 +897,25 @@ impl VolatileStatusDurations {
         output
     }
 
+    /// `confusion;encore;lockedmove;slowstart;taunt;yawn`, plus `;healblock;throatchop` only
+    /// when either is non-zero (sdb.22). Old 6-field strings still parse (new fields = 0).
     pub fn serialize(&self) -> String {
-        format!(
+        let base = format!(
             "{};{};{};{};{};{}",
             self.confusion, self.encore, self.lockedmove, self.slowstart, self.taunt, self.yawn
-        )
+        );
+        if self.healblock != 0 || self.throatchop != 0 {
+            format!("{};{};{}", base, self.healblock, self.throatchop)
+        } else {
+            base
+        }
     }
     pub fn deserialize(serialized: &str) -> VolatileStatusDurations {
         let split: Vec<&str> = serialized.split(";").collect();
+        let extra = |i: usize| split.get(i).map_or(0, |v| v.parse::<i8>().unwrap());
         VolatileStatusDurations {
+            healblock: extra(6),
+            throatchop: extra(7),
             confusion: split[0].parse::<i8>().unwrap(),
             encore: split[1].parse::<i8>().unwrap(),
             lockedmove: split[2].parse::<i8>().unwrap(),
@@ -1683,6 +1713,12 @@ impl State {
             }
             PokemonVolatileStatus::YAWN => {
                 side.volatile_status_durations.yawn += amount;
+            }
+            PokemonVolatileStatus::HEALBLOCK => {
+                side.volatile_status_durations.healblock += amount;
+            }
+            PokemonVolatileStatus::THROATCHOP => {
+                side.volatile_status_durations.throatchop += amount;
             }
             _ => panic!(
                 "Invalid volatile status for increment_volatile_status_duration: {:?}",

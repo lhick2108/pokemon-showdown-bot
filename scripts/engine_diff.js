@@ -48,6 +48,8 @@ function dumpMon(p) {
 		volatiles, weightkg: p.weighthg / 10, timesAttacked: p.timesAttacked || 0,
 		lastMove: p.lastMove ? p.lastMove.id : null, activeTurns: p.activeTurns, trapped: p.trapped || false,
 		transformed: !!p.volatiles['transform'],
+		// Protean / Libero (gen 9): once per switch-in, tracked in the ability state, not a volatile
+		abilityOnce: !!((p.abilityState || {}).protean || (p.abilityState || {}).libero),
 	};
 }
 

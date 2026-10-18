@@ -1,5 +1,7 @@
 ﻿use super::abilities::{
     ability_after_damage_hit, ability_before_move, ability_end_of_turn,
+    ability_field_change_activation, ability_status_cure_residual,
+    ability_weather_residual,
     ability_modify_attack_against, ability_modify_attack_being_used, ability_on_switch_in,
     ability_on_switch_out, Abilities,
 };
@@ -29,7 +31,7 @@ use crate::instruction::{DecrementPPInstruction, SetLastUsedMoveInstruction};
 use super::damage_calc::calculate_futuresight_damage;
 use super::damage_calc::{calculate_damage, type_effectiveness_modifier, DamageRolls};
 use super::items::{
-    item_before_move, item_end_of_turn, item_modify_attack_against, item_modify_attack_being_used,
+    item_before_move, item_end_of_turn, item_residual_heal, item_modify_attack_against, item_modify_attack_being_used,
     item_on_switch_in, Items,
 };
 use super::state::{MoveChoice, PokemonVolatileStatus, Terrain, Weather};
@@ -739,6 +741,97 @@ fn get_instructions_from_volatile_statuses(
         side.volatile_statuses
             .insert(volatile_status.volatile_status);
         incoming_instructions.instruction_list.push(ins);
+
+        // timed volatiles: remaining turns (Showdown `duration`; ticks down in the residual step)
+        let start = match volatile_status.volatile_status {
+            PokemonVolatileStatus::HEALBLOCK => {
+                if attacker_choice.move_id == Choices::PSYCHICNOISE {
+                    2
+                } else {
+                    5
+                }
+            }
+            PokemonVolatileStatus::THROATCHOP => 2,
+            _ => 0,
+        };
+        if start != 0 {
+            let start = if volatile_status.volatile_status == PokemonVolatileStatus::HEALBLOCK
+                && attacker_choice.move_id != Choices::PSYCHICNOISE
+                && state
+                    .get_side_immutable(&attacking_side_reference)
+                    .get_active_immutable()
+                    .ability
+                    == Abilities::PERSISTENT
+            {
+                7
+            } else {
+                start
+            };
+            let side = state.get_side(&target_side);
+            let current = match volatile_status.volatile_status {
+                PokemonVolatileStatus::HEALBLOCK => side.volatile_status_durations.healblock,
+                _ => side.volatile_status_durations.throatchop,
+            };
+            match volatile_status.volatile_status {
+                PokemonVolatileStatus::HEALBLOCK => side.volatile_status_durations.healblock = start,
+                _ => side.volatile_status_durations.throatchop = start,
+            }
+            incoming_instructions
+                .instruction_list
+                .push(Instruction::ChangeVolatileStatusDuration(
+                    ChangeVolatileStatusDurationInstruction {
+                        side_ref: target_side,
+                        volatile_status: volatile_status.volatile_status,
+                        amount: start - current,
+                    },
+                ));
+        }
+    }
+}
+
+/// Residual tick for a timed volatile (Heal Block order 20, Throat Chop order 22): the duration
+/// drops by one and the volatile ends when it reaches 0. A volatile carrying duration 0 (a state
+/// serialized before sdb.22) is treated as freshly applied with `fresh_start` turns.
+fn tick_timed_volatile(
+    side: &mut Side,
+    side_ref: &SideReference,
+    volatile_status: PokemonVolatileStatus,
+    fresh_start: i8,
+    instructions: &mut StateInstructions,
+) {
+    if !side.volatile_statuses.contains(&volatile_status) {
+        return;
+    }
+    let current = match volatile_status {
+        PokemonVolatileStatus::HEALBLOCK => side.volatile_status_durations.healblock,
+        _ => side.volatile_status_durations.throatchop,
+    };
+    let remaining = if current <= 0 { fresh_start } else { current } - 1;
+    match volatile_status {
+        PokemonVolatileStatus::HEALBLOCK => side.volatile_status_durations.healblock = remaining,
+        _ => side.volatile_status_durations.throatchop = remaining,
+    }
+    if remaining != current {
+        instructions
+            .instruction_list
+            .push(Instruction::ChangeVolatileStatusDuration(
+                ChangeVolatileStatusDurationInstruction {
+                    side_ref: *side_ref,
+                    volatile_status,
+                    amount: remaining - current,
+                },
+            ));
+    }
+    if remaining == 0 {
+        side.volatile_statuses.remove(&volatile_status);
+        instructions
+            .instruction_list
+            .push(Instruction::RemoveVolatileStatus(
+                RemoveVolatileStatusInstruction {
+                    side_ref: *side_ref,
+                    volatile_status,
+                },
+            ));
     }
 }
 
@@ -1691,6 +1784,12 @@ fn cannot_use_move(state: &State, choice: &Choice, attacking_side_ref: &SideRefe
             .contains(&PokemonVolatileStatus::HEALBLOCK)
     {
         return true;
+    } else if choice.flags.sound
+        && attacking_side
+            .volatile_statuses
+            .contains(&PokemonVolatileStatus::THROATCHOP)
+    {
+        return true;
     }
     false
 }
@@ -2072,6 +2171,12 @@ fn generate_instructions_from_existing_status_conditions(
                     CONSECUTIVE_PROTECT_CHANCE.powi(attacking_side.side_conditions.protect as i32);
                 let mut protect_fail_instruction = incoming_instructions.clone();
                 protect_fail_instruction.update_percentage(1.0 - protect_success_chance);
+                // a failed Protect still spends its PP (deducted after BeforeMove in Showdown)
+                if let Some(pp) = pp_deduction(state, attacking_side_ref, attacker_choice) {
+                    protect_fail_instruction
+                        .instruction_list
+                        .push(Instruction::DecrementPP(pp));
+                }
                 final_instructions.push(protect_fail_instruction);
                 incoming_instructions.update_percentage(protect_success_chance);
             }
@@ -2282,11 +2387,18 @@ pub fn generate_instructions_from_move(
         return;
     }
 
+    // PP is spent when a move starts, not on the 2nd turn of a charge move / locked move
+    let mut continuation_turn = state
+        .get_side_immutable(&attacking_side)
+        .volatile_statuses
+        .contains(&PokemonVolatileStatus::LOCKEDMOVE);
+
     // If the move is a charge move, remove the volatile status if damage was done
     if choice.flags.charge {
         let side = state.get_side(&attacking_side);
         let volatile_status = charge_choice_to_volatile(&choice.move_id);
         if side.volatile_statuses.contains(&volatile_status) {
+            continuation_turn = true;
             choice.flags.charge = false;
             let instruction = Instruction::RemoveVolatileStatus(RemoveVolatileStatusInstruction {
                 side_ref: attacking_side,
@@ -2326,30 +2438,8 @@ pub fn generate_instructions_from_move(
         return;
     }
 
-    // most of the time pp decrement doesn't matter and just adds another instruction
-    // so we only decrement pp if the move is at 10 or less pp since that is when it starts
-    // to matter
-    let (attacker_side, defender_side) = state.get_both_sides(&attacking_side);
-    let active = attacker_side.get_active();
-    // sdb: Sleep Talk spends its own PP (taken by the outer call), not the called move's
-    if !choice.sleep_talk_move && active.moves[&choice.move_index].pp < 10 {
-        let pp_decrement_amount = if choice.target == MoveTarget::Opponent
-            && defender_side.get_active_immutable().ability == Abilities::PRESSURE
-        {
-            2
-        } else {
-            1
-        };
-        incoming_instructions
-            .instruction_list
-            .push(Instruction::DecrementPP(DecrementPPInstruction {
-                side_ref: attacking_side,
-                move_index: choice.move_index,
-                amount: pp_decrement_amount,
-            }));
-        active.moves[&choice.move_index].pp -= pp_decrement_amount;
-    }
-
+    // PP is spent once the move is actually attempted (Showdown deducts it after BeforeMove:
+    // not when asleep / fully paralysed / flinched); see `deduct_pp` below the sleep checks.
     if !choice.sleep_talk_move {
         generate_instructions_from_existing_status_conditions(
             state,
@@ -2364,6 +2454,8 @@ pub fn generate_instructions_from_move(
         .get_active_immutable();
     if choice.move_id == Choices::SLEEPTALK && attacker.status == PokemonStatus::SLEEP {
         let new_choices = attacker.get_sleep_talk_choices();
+        // a sleeping Sleep Talk user still pays for Sleep Talk itself
+        deduct_pp(state, &attacking_side, &choice, &mut incoming_instructions);
         state.reverse_instructions(&incoming_instructions.instruction_list);
         if new_choices.is_empty() {
             // nothing callable: Sleep Talk fails (and must not lose the branch's probability)
@@ -2392,6 +2484,10 @@ pub fn generate_instructions_from_move(
             final_instructions.push(incoming_instructions);
         }
         return;
+    }
+
+    if !continuation_turn {
+        deduct_pp(state, &attacking_side, &choice, &mut incoming_instructions);
     }
 
     if move_has_no_effect(state, &choice, &attacking_side) {
@@ -2924,29 +3020,6 @@ fn add_end_of_turn_instructions(
 
     // Terrain decrement / dissipation
     if state.terrain.turns_remaining > 0 && state.terrain.terrain_type != Terrain::NONE {
-        if state.terrain.terrain_type == Terrain::GRASSYTERRAIN {
-            for side_ref in sides {
-                let side = state.get_side(side_ref);
-                let active_pkmn = side.get_active();
-                if active_pkmn.hp == 0 || !active_pkmn.is_grounded() {
-                    continue;
-                }
-                let heal_amount = cmp::min(
-                    (active_pkmn.maxhp as f32 * 0.0625) as i16,
-                    active_pkmn.maxhp - active_pkmn.hp,
-                );
-                if heal_amount > 0 {
-                    let heal_instruction = Instruction::Heal(HealInstruction {
-                        side_ref: *side_ref,
-                        heal_amount,
-                    });
-                    active_pkmn.hp += heal_amount;
-                    incoming_instructions
-                        .instruction_list
-                        .push(heal_instruction);
-                }
-            }
-        }
         let terrain_dissipate_instruction = Instruction::DecrementTerrainTurnsRemaining;
         incoming_instructions
             .instruction_list
@@ -3070,6 +3143,11 @@ fn add_end_of_turn_instructions(
         }
     }
 
+    // Weather damage abilities / heals (Solar Power, Dry Skin, Rain Dish, Ice Body)
+    for side_ref in sides {
+        ability_weather_residual(state, side_ref, &mut incoming_instructions);
+    }
+
     // future sight
     for side_ref in sides {
         let (attacking_side, defending_side) = state.get_both_sides(side_ref);
@@ -3106,13 +3184,20 @@ fn add_end_of_turn_instructions(
     for side_ref in sides {
         let side = state.get_side(side_ref);
         let side_wish = side.wish;
+        let wish_heal_blocked = side
+            .volatile_statuses
+            .contains(&PokemonVolatileStatus::HEALBLOCK);
         let active_pkmn = side.get_active();
 
         if side_wish.0 > 0 {
             let decrement_wish_instruction = Instruction::DecrementWish(DecrementWishInstruction {
                 side_ref: *side_ref,
             });
-            if side_wish.0 == 1 && 0 < active_pkmn.hp && active_pkmn.hp < active_pkmn.maxhp {
+            if side_wish.0 == 1
+                && 0 < active_pkmn.hp
+                && active_pkmn.hp < active_pkmn.maxhp
+                && !wish_heal_blocked
+            {
                 #[cfg(not(feature = "gen4"))]
                 let heal_amount = cmp::min(active_pkmn.maxhp - active_pkmn.hp, side_wish.1);
 
@@ -3136,10 +3221,91 @@ fn add_end_of_turn_instructions(
         }
     }
 
+    // Grassy Terrain heal (Showdown order 5/2): only while the terrain is still up after its
+    // own duration tick (a terrain on its last turn ends without healing)
+    if state.terrain.terrain_type == Terrain::GRASSYTERRAIN {
+        for side_ref in sides {
+            let side = state.get_side(side_ref);
+            let blocked = side
+                .volatile_statuses
+                .contains(&PokemonVolatileStatus::HEALBLOCK);
+            let active_pkmn = side.get_active();
+            if blocked || active_pkmn.hp == 0 || !active_pkmn.is_grounded() {
+                continue;
+            }
+            let heal_amount = cmp::min(
+                (active_pkmn.maxhp as f32 * 0.0625) as i16,
+                active_pkmn.maxhp - active_pkmn.hp,
+            );
+            if heal_amount > 0 {
+                incoming_instructions
+                    .instruction_list
+                    .push(Instruction::Heal(HealInstruction {
+                        side_ref: *side_ref,
+                        heal_amount,
+                    }));
+                active_pkmn.hp += heal_amount;
+            }
+        }
+    }
+
+    // Hydration / Shed Skin (order 5/3), then Leftovers / Black Sludge (order 5/4)
+    for side_ref in sides {
+        ability_status_cure_residual(state, side_ref, &mut incoming_instructions);
+    }
+    for side_ref in sides {
+        item_residual_heal(state, side_ref, &mut incoming_instructions);
+    }
+
+    // leechseed sap
+    for side_ref in sides {
+        let (leechseed_side, other_side) = state.get_both_sides(side_ref);
+        if leechseed_side
+            .volatile_statuses
+            .contains(&PokemonVolatileStatus::LEECHSEED)
+        {
+            let other_blocked = other_side
+                .volatile_statuses
+                .contains(&PokemonVolatileStatus::HEALBLOCK);
+            let active_pkmn = leechseed_side.get_active();
+            let other_active_pkmn = other_side.get_active();
+            if active_pkmn.hp == 0
+                || other_active_pkmn.hp == 0
+                || active_pkmn.ability == Abilities::MAGICGUARD
+            {
+                continue;
+            }
+
+            let health_sapped = cmp::min((active_pkmn.maxhp as f32 * 0.125) as i16, active_pkmn.hp);
+            let damage_ins = Instruction::Damage(DamageInstruction {
+                side_ref: *side_ref,
+                damage_amount: health_sapped,
+            });
+            active_pkmn.hp -= health_sapped;
+            incoming_instructions.instruction_list.push(damage_ins);
+
+            let health_recovered = cmp::min(
+                health_sapped,
+                other_active_pkmn.maxhp - other_active_pkmn.hp,
+            );
+            if health_recovered > 0 && !other_blocked {
+                let heal_ins = Instruction::Heal(HealInstruction {
+                    side_ref: side_ref.get_other_side(),
+                    heal_amount: health_recovered,
+                });
+                other_active_pkmn.hp += health_recovered;
+                incoming_instructions.instruction_list.push(heal_ins);
+            }
+        }
+    }
+
     // status damage
     for side_ref in sides {
         let (side, other_side) = state.get_both_sides(side_ref);
         let toxic_count = side.side_conditions.toxic_count as f32;
+        let heal_blocked = side
+            .volatile_statuses
+            .contains(&PokemonVolatileStatus::HEALBLOCK);
         let active_pkmn = side.get_active();
         let other_side_active = other_side.get_active();
         if active_pkmn.hp == 0 || active_pkmn.ability == Abilities::MAGICGUARD {
@@ -3169,7 +3335,38 @@ fn add_end_of_turn_instructions(
                     .instruction_list
                     .push(burn_damage_instruction);
             }
-            PokemonStatus::POISON if active_pkmn.ability != Abilities::POISONHEAL => {
+            PokemonStatus::POISON | PokemonStatus::TOXIC
+                if active_pkmn.ability == Abilities::POISONHEAL
+                    && other_side_active.ability != Abilities::NEUTRALIZINGGAS =>
+            {
+                // Poison Heal replaces the poison tick with a heal (blocked by Heal Block);
+                // the toxic counter still advances
+                let is_toxic = active_pkmn.status == PokemonStatus::TOXIC;
+                if is_toxic {
+                    incoming_instructions.instruction_list.push(
+                        Instruction::ChangeSideCondition(ChangeSideConditionInstruction {
+                            side_ref: *side_ref,
+                            side_condition: PokemonSideCondition::ToxicCount,
+                            amount: 1,
+                        }),
+                    );
+                }
+                if !heal_blocked && active_pkmn.hp < active_pkmn.maxhp {
+                    let heal_amount =
+                        cmp::min(active_pkmn.maxhp / 8, active_pkmn.maxhp - active_pkmn.hp);
+                    incoming_instructions
+                        .instruction_list
+                        .push(Instruction::Heal(HealInstruction {
+                            side_ref: *side_ref,
+                            heal_amount,
+                        }));
+                    active_pkmn.hp += heal_amount;
+                }
+                if is_toxic {
+                    side.side_conditions.toxic_count += 1;
+                }
+            }
+            PokemonStatus::POISON => {
                 let damage_amount = cmp::max(
                     1,
                     cmp::min((active_pkmn.maxhp as f32 * 0.125) as i16, active_pkmn.hp),
@@ -3223,54 +3420,50 @@ fn add_end_of_turn_instructions(
         }
     }
 
-    // ability/item end-of-turn effects
+    // bind / Salt Cure (Showdown residual order 13)
     for side_ref in sides {
         let side = state.get_side(side_ref);
-        let active_pkmn = side.get_active();
-        if active_pkmn.hp == 0 {
+        if side.get_active().hp == 0 {
             continue;
         }
 
-        item_end_of_turn(state, side_ref, &mut incoming_instructions);
-        ability_end_of_turn(state, side_ref, &mut incoming_instructions);
-    }
-
-    // leechseed sap
-    for side_ref in sides {
-        let (leechseed_side, other_side) = state.get_both_sides(side_ref);
-        if leechseed_side
+        if side
             .volatile_statuses
-            .contains(&PokemonVolatileStatus::LEECHSEED)
+            .contains(&PokemonVolatileStatus::PARTIALLYTRAPPED)
         {
-            let active_pkmn = leechseed_side.get_active();
-            let other_active_pkmn = other_side.get_active();
-            if active_pkmn.hp == 0
-                || other_active_pkmn.hp == 0
-                || active_pkmn.ability == Abilities::MAGICGUARD
-            {
-                continue;
-            }
-
-            let health_sapped = cmp::min((active_pkmn.maxhp as f32 * 0.125) as i16, active_pkmn.hp);
-            let damage_ins = Instruction::Damage(DamageInstruction {
-                side_ref: *side_ref,
-                damage_amount: health_sapped,
-            });
-            active_pkmn.hp -= health_sapped;
-            incoming_instructions.instruction_list.push(damage_ins);
-
-            let health_recovered = cmp::min(
-                health_sapped,
-                other_active_pkmn.maxhp - other_active_pkmn.hp,
+            let active_pkmn = side.get_active();
+            let damage_amount = cmp::min(
+                (active_pkmn.maxhp as f32 * PARTIALLY_TRAPPED_DAMAGE_PCT) as i16,
+                active_pkmn.hp,
             );
-            if health_recovered > 0 {
-                let heal_ins = Instruction::Heal(HealInstruction {
-                    side_ref: side_ref.get_other_side(),
-                    heal_amount: health_recovered,
-                });
-                other_active_pkmn.hp += health_recovered;
-                incoming_instructions.instruction_list.push(heal_ins);
+            incoming_instructions
+                .instruction_list
+                .push(Instruction::Damage(DamageInstruction {
+                    side_ref: *side_ref,
+                    damage_amount,
+                }));
+            active_pkmn.hp -= damage_amount;
+        }
+        if side
+            .volatile_statuses
+            .contains(&PokemonVolatileStatus::SALTCURE)
+        {
+            let active_pkmn = side.get_active();
+            let mut divisor = SALT_CURE_DAMAGE_DIVISOR;
+            if active_pkmn.has_type(&PokemonType::WATER)
+                || active_pkmn.has_type(&PokemonType::STEEL)
+            {
+                divisor /= 2.0;
             }
+            let damage_amount =
+                cmp::min((active_pkmn.maxhp as f32 / divisor) as i16, active_pkmn.hp);
+            incoming_instructions
+                .instruction_list
+                .push(Instruction::Damage(DamageInstruction {
+                    side_ref: *side_ref,
+                    damage_amount: damage_amount,
+                }));
+            active_pkmn.hp -= damage_amount;
         }
     }
 
@@ -3424,6 +3617,21 @@ fn add_end_of_turn_instructions(
             }
         }
 
+        tick_timed_volatile(
+            side,
+            side_ref,
+            PokemonVolatileStatus::HEALBLOCK,
+            5,
+            incoming_instructions,
+        );
+        tick_timed_volatile(
+            side,
+            side_ref,
+            PokemonVolatileStatus::THROATCHOP,
+            2,
+            incoming_instructions,
+        );
+
         if side
             .volatile_statuses
             .contains(&PokemonVolatileStatus::PERISH1)
@@ -3535,45 +3743,6 @@ fn add_end_of_turn_instructions(
                 ));
         }
 
-        if side
-            .volatile_statuses
-            .contains(&PokemonVolatileStatus::PARTIALLYTRAPPED)
-        {
-            let active_pkmn = side.get_active();
-            let damage_amount = cmp::min(
-                (active_pkmn.maxhp as f32 * PARTIALLY_TRAPPED_DAMAGE_PCT) as i16,
-                active_pkmn.hp,
-            );
-            incoming_instructions
-                .instruction_list
-                .push(Instruction::Damage(DamageInstruction {
-                    side_ref: *side_ref,
-                    damage_amount,
-                }));
-            active_pkmn.hp -= damage_amount;
-        }
-        if side
-            .volatile_statuses
-            .contains(&PokemonVolatileStatus::SALTCURE)
-        {
-            let active_pkmn = side.get_active();
-            let mut divisor = SALT_CURE_DAMAGE_DIVISOR;
-            if active_pkmn.has_type(&PokemonType::WATER)
-                || active_pkmn.has_type(&PokemonType::STEEL)
-            {
-                divisor /= 2.0;
-            }
-            let damage_amount =
-                cmp::min((active_pkmn.maxhp as f32 / divisor) as i16, active_pkmn.hp);
-            incoming_instructions
-                .instruction_list
-                .push(Instruction::Damage(DamageInstruction {
-                    side_ref: *side_ref,
-                    damage_amount: damage_amount,
-                }));
-            active_pkmn.hp -= damage_amount;
-        }
-
         let possible_statuses = [
             PokemonVolatileStatus::PROTECT,
             PokemonVolatileStatus::BANEFULBUNKER,
@@ -3624,6 +3793,70 @@ fn add_end_of_turn_instructions(
             side.side_conditions.protect -= side.side_conditions.protect;
         }
     } // end volatile statuses
+
+    // ability/item end-of-turn effects
+    for side_ref in sides {
+        let side = state.get_side(side_ref);
+        let active_pkmn = side.get_active();
+        if active_pkmn.hp == 0 {
+            continue;
+        }
+
+        item_end_of_turn(state, side_ref, &mut incoming_instructions);
+        ability_end_of_turn(state, side_ref, &mut incoming_instructions);
+    }
+
+}
+
+/// Spend PP for the move the attacker is using (Pressure on the target costs one more).
+///
+/// A move whose `max_pp` is known (> 0: states built from a real battle) always tracks PP and
+/// never goes below 0. A move with unknown max PP (`max_pp == 0`: hand-built states, records
+/// serialized before sdb.22) keeps the legacy behaviour of only tracking PP below 10, because
+/// above that it rarely matters and each decrement is an extra instruction in the search.
+/// A Sleep Talk-called move does not spend PP (the outer Sleep Talk does).
+fn deduct_pp(
+    state: &mut State,
+    attacking_side: &SideReference,
+    choice: &Choice,
+    instructions: &mut StateInstructions,
+) {
+    if let Some(pp) = pp_deduction(state, attacking_side, choice) {
+        state.get_side(attacking_side).get_active().moves[&pp.move_index].pp -= pp.amount;
+        instructions
+            .instruction_list
+            .push(Instruction::DecrementPP(pp));
+    }
+}
+
+/// The PP decrement `deduct_pp` would make, without touching the state (see `deduct_pp`).
+fn pp_deduction(
+    state: &State,
+    attacking_side: &SideReference,
+    choice: &Choice,
+) -> Option<DecrementPPInstruction> {
+    if choice.sleep_talk_move {
+        return None;
+    }
+    let (attacker_side, defender_side) = state.get_both_sides_immutable(attacking_side);
+    let pressure = choice.target == MoveTarget::Opponent
+        && defender_side.get_active_immutable().ability == Abilities::PRESSURE;
+    let mv = &attacker_side.get_active_immutable().moves[&choice.move_index];
+    if mv.max_pp == 0 && mv.pp >= 10 {
+        return None;
+    }
+    let mut amount: i8 = if pressure { 2 } else { 1 };
+    if mv.max_pp > 0 {
+        amount = cmp::min(amount, cmp::max(mv.pp, 0));
+        if amount == 0 {
+            return None;
+        }
+    }
+    Some(DecrementPPInstruction {
+        side_ref: *attacking_side,
+        move_index: choice.move_index,
+        amount,
+    })
 }
 
 fn run_move(
@@ -3679,6 +3912,24 @@ fn run_move(
             get_instructions_from_heal(state, heal, &attacking_side, &mut instructions);
         }
     } // end multi-hit
+
+    // Charge boosts the next Electric move and is used up by it (Showdown `onAfterMove`)
+    if choice.move_type == PokemonType::ELECTRIC && choice.move_id != Choices::CHARGE {
+        let attacker_side = state.get_side(&attacking_side);
+        if attacker_side
+            .volatile_statuses
+            .remove_with_check(&PokemonVolatileStatus::CHARGE)
+        {
+            instructions
+                .instruction_list
+                .push(Instruction::RemoveVolatileStatus(
+                    RemoveVolatileStatusInstruction {
+                        side_ref: attacking_side,
+                        volatile_status: PokemonVolatileStatus::CHARGE,
+                    },
+                ));
+        }
+    }
       // this is wrong, but I am deciding it is good enough for this engine (for now)
       // each multi-hit move should trigger a chance for a secondary effect,
       // but the way this engine was structured makes it difficult to implement
@@ -3841,6 +4092,11 @@ fn run_move(
 fn after_move_finish(state: &mut State, final_instructions: &mut Vec<StateInstructions>) {
     for state_instructions in final_instructions.iter_mut() {
         state.apply_instructions(&state_instructions.instruction_list);
+
+        // Protosynthesis / Quark Drive when sun / Electric Terrain started with the mon out
+        for side_ref in [SideReference::SideOne, SideReference::SideTwo] {
+            ability_field_change_activation(state, &side_ref, state_instructions);
+        }
 
         // check if anybody has negative boosts and a whiteherb
         // if so, consume the item and set the boosts to 0
@@ -4228,6 +4484,22 @@ pub fn generate_instructions_from_move_pair(
         MoveChoice::None => {
             side_two_choice = Choice::default();
         }
+    }
+
+    // sdb: when one side only replaces a fainted Pokemon (`(switch, none)`), the other side's
+    // `none` is not a turn: it must not consume that side's MUSTRECHARGE / TRUANT volatile
+    // (a Giga Impact that KOs would otherwise lose its recharge turn in the follow-up call).
+    if s1_replacing_fainted_pkmn
+        && matches!(side_two_move, MoveChoice::None)
+        && side_two_choice.category != MoveCategory::Switch
+    {
+        side_two_choice.category = MoveCategory::Switch;
+    }
+    if s2_replacing_fainted_pkmn
+        && matches!(side_one_move, MoveChoice::None)
+        && side_one_choice.category != MoveCategory::Switch
+    {
+        side_one_choice.category = MoveCategory::Switch;
     }
 
     let mut state_instructions_vec: Vec<StateInstructions> = Vec::with_capacity(4);
@@ -8764,6 +9036,7 @@ mod tests {
                 id: Choices::TRANSFORM,
                 disabled: false,
                 pp: 16,
+                max_pp: 0,
                 choice: MOVES.get(&Choices::TRANSFORM).unwrap().to_owned(),
             };
             ditto.moves.m1 = Move::default();
@@ -11214,6 +11487,7 @@ mod tests {
                 id: Choices::TACKLE,
                 disabled: false,
                 pp: 32,
+                max_pp: 0,
                 choice: MOVES.get(&Choices::TACKLE).unwrap().clone(),
             };
         }
@@ -11598,6 +11872,7 @@ mod tests {
             id,
             disabled: false,
             pp,
+            max_pp: 0,
             choice: MOVES.get(&id).unwrap().clone(),
         };
     }
@@ -11712,24 +11987,28 @@ mod tests {
             id: Choices::SLEEPTALK,
             disabled: false,
             pp: 16,
+            max_pp: 0,
             choice: MOVES.get(&Choices::SLEEPTALK).unwrap().clone(),
         };
         active.moves.m1 = Move {
             id: Choices::FLY,
             disabled: false,
             pp: 16,
+            max_pp: 0,
             choice: MOVES.get(&Choices::FLY).unwrap().clone(),
         };
         active.moves.m2 = Move {
             id: Choices::REST,
             disabled: false,
             pp: 16,
+            max_pp: 0,
             choice: MOVES.get(&Choices::REST).unwrap().clone(),
         };
         active.moves.m3 = Move {
             id: Choices::UPROAR,
             disabled: false,
             pp: 16,
+            max_pp: 0,
             choice: MOVES.get(&Choices::UPROAR).unwrap().clone(),
         };
         let ids: Vec<Choices> = active
@@ -11953,4 +12232,6 @@ mod tests {
         }
     }
     include!("fail_move_tests.inc.rs");
+    include!("sdb22_tests.inc.rs");
+    include!("sdb22_tests2.inc.rs");
 }

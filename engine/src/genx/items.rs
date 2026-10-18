@@ -417,9 +417,9 @@ fn sitrus_berry(
 }
 
 // Leppa Berry: restores 10 PP to the first move slot at 0 PP, then is consumed.
-// Showdown's onEat also falls back to the first slot below max PP, but the engine
-// only tracks PP once it is below 10 and has no max PP, so only a move at exactly 0 PP
-// (the item's actual trigger) is handled. The restored PP is not capped at the max.
+// Showdown's onEat also falls back to the first slot below max PP; only a move at exactly 0 PP
+// (the item's actual trigger) is handled. The restored PP is capped at the move's max PP when
+// it is known (sdb.22: `Move.max_pp`).
 fn leppa_berry(
     side_ref: &SideReference,
     attacking_side: &mut Side,
@@ -435,14 +435,21 @@ fn leppa_berry(
         }
     }
     if let Some(move_index) = empty_slot {
+        let mv = &mut active_pkmn.moves[&move_index];
+        // restores 10 PP, never above the move's max PP (when it is known)
+        let restored = if mv.max_pp > 0 {
+            cmp::min(10, mv.max_pp - mv.pp)
+        } else {
+            10
+        };
         instructions
             .instruction_list
             .push(Instruction::DecrementPP(DecrementPPInstruction {
                 side_ref: *side_ref,
                 move_index,
-                amount: -10,
+                amount: -restored,
             }));
-        active_pkmn.moves[&move_index].pp += 10;
+        mv.pp += restored;
         instructions
             .instruction_list
             .push(Instruction::ChangeItem(ChangeItemInstruction {
@@ -943,6 +950,54 @@ pub fn item_on_switch_in(
     }
 }
 
+/// Leftovers / Black Sludge residual (Showdown `onResidualOrder: 5, onResidualSubOrder: 4`).
+/// This runs before Leech Seed (8), poison / toxic (9) and burn (10) damage, so the heal comes
+/// first. Heal Block stops the heal; Black Sludge's damage on non-Poison mons is not a heal
+/// (Magic Guard prevents it, and it is clamped to the mon's remaining HP).
+pub fn item_residual_heal(
+    state: &mut State,
+    side_ref: &SideReference,
+    instructions: &mut StateInstructions,
+) {
+    let side = state.get_side(side_ref);
+    let blocked = side
+        .volatile_statuses
+        .contains(&super::state::PokemonVolatileStatus::HEALBLOCK);
+    let active_pkmn = side.get_active();
+    if active_pkmn.hp <= 0 {
+        return;
+    }
+    let heals = match active_pkmn.item {
+        Items::LEFTOVERS => true,
+        Items::BLACKSLUDGE => active_pkmn.has_type(&PokemonType::POISON),
+        _ => return,
+    };
+    if heals {
+        if blocked || active_pkmn.hp >= active_pkmn.maxhp {
+            return;
+        }
+        let heal_amount = cmp::min(active_pkmn.maxhp / 16, active_pkmn.maxhp - active_pkmn.hp);
+        if heal_amount > 0 {
+            instructions.instruction_list.push(Instruction::Heal(HealInstruction {
+                side_ref: *side_ref,
+                heal_amount,
+            }));
+            active_pkmn.hp += heal_amount;
+        }
+    } else if active_pkmn.ability != Abilities::MAGICGUARD {
+        let damage_amount = cmp::min(active_pkmn.maxhp / 16, active_pkmn.hp);
+        if damage_amount > 0 {
+            instructions
+                .instruction_list
+                .push(Instruction::Damage(DamageInstruction {
+                    side_ref: *side_ref,
+                    damage_amount,
+                }));
+            active_pkmn.hp -= damage_amount;
+        }
+    }
+}
+
 pub fn item_end_of_turn(
     state: &mut State,
     side_ref: &SideReference,
@@ -976,29 +1031,6 @@ pub fn item_end_of_turn(
             status_cure_berry(Items::RAWSTBERRY, side_ref, attacking_side, instructions)
         }
         Items::LEPPABERRY => leppa_berry(side_ref, attacking_side, instructions),
-        Items::BLACKSLUDGE => {
-            if active_pkmn.has_type(&PokemonType::POISON) {
-                if active_pkmn.hp < active_pkmn.maxhp {
-                    let heal_amount =
-                        cmp::min(active_pkmn.maxhp / 16, active_pkmn.maxhp - active_pkmn.hp);
-                    let ins = Instruction::Heal(HealInstruction {
-                        side_ref: side_ref.clone(),
-                        heal_amount: heal_amount,
-                    });
-                    active_pkmn.hp += heal_amount;
-                    instructions.instruction_list.push(ins);
-                }
-            } else {
-                let damage_amount =
-                    cmp::min(active_pkmn.maxhp / 16, active_pkmn.maxhp - active_pkmn.hp);
-                let ins = Instruction::Damage(DamageInstruction {
-                    side_ref: side_ref.clone(),
-                    damage_amount: damage_amount,
-                });
-                active_pkmn.hp -= damage_amount;
-                instructions.instruction_list.push(ins);
-            }
-        }
         Items::FLAMEORB => {
             if !immune_to_status(state, &MoveTarget::User, side_ref, &PokemonStatus::BURN) {
                 let side = state.get_side(side_ref);
@@ -1009,18 +1041,6 @@ pub fn item_end_of_turn(
                     old_status: PokemonStatus::NONE,
                 });
                 side.get_active().status = PokemonStatus::BURN;
-                instructions.instruction_list.push(ins);
-            }
-        }
-        Items::LEFTOVERS => {
-            let attacker = state.get_side(side_ref).get_active();
-            if attacker.hp < attacker.maxhp {
-                let heal_amount = cmp::min(attacker.maxhp / 16, attacker.maxhp - attacker.hp);
-                let ins = Instruction::Heal(HealInstruction {
-                    side_ref: side_ref.clone(),
-                    heal_amount: heal_amount,
-                });
-                attacker.hp += heal_amount;
                 instructions.instruction_list.push(ins);
             }
         }
@@ -1261,8 +1281,12 @@ pub fn item_modify_attack_being_used(
                     });
                 }
 
+                // Showdown skips onAfterMoveSecondarySelf (Life Orb recoil) for a move whose
+                // secondaries Sheer Force removed
                 #[cfg(not(feature = "gen4"))]
-                if attacking_side.get_active_immutable().ability != Abilities::MAGICGUARD {
+                if attacking_side.get_active_immutable().ability != Abilities::MAGICGUARD
+                    && !attacking_choice.sheer_force_applied
+                {
                     attacking_choice.add_or_create_secondaries(Secondary {
                         chance: 100.0,
                         effect: Effect::Heal(-0.1),

@@ -7675,6 +7675,7 @@ fn test_switchout_flag_where_faster_switchout_move_knocked_out_opponent() {
         id: Choices::TACKLE,
         disabled: false,
         pp: 35,
+        max_pp: 0,
         choice: MOVES.get(&Choices::TACKLE).unwrap().clone(),
     };
 
@@ -7734,6 +7735,7 @@ fn test_switch_out_move_flag_is_unset_after_next_move() {
         id: Choices::TACKLE,
         disabled: false,
         pp: 35,
+        max_pp: 0,
         choice: MOVES.get(&Choices::TACKLE).unwrap().clone(),
     };
 
@@ -7774,6 +7776,7 @@ fn test_end_of_turn_triggered_when_switchout_flag_is_removed() {
         id: Choices::TACKLE,
         disabled: false,
         pp: 35,
+        max_pp: 0,
         choice: MOVES.get(&Choices::TACKLE).unwrap().clone(),
     };
 
@@ -7916,6 +7919,7 @@ fn test_meteorbeam_volatile_only_allows_meteor_beam_to_be_used() {
         id: Choices::METEORBEAM,
         disabled: false,
         pp: 16,
+        max_pp: 0,
         choice: MOVES.get(&Choices::METEORBEAM).unwrap().clone(),
     };
     let (side_one_moves, _side_two_moves) = state.get_all_options();
@@ -7938,6 +7942,7 @@ fn test_assaultvest_prevents_status_move() {
         id: Choices::TOXIC,
         disabled: false,
         pp: 35,
+        max_pp: 0,
         choice: MOVES.get(&Choices::TOXIC).unwrap().clone(),
     };
 
@@ -7945,6 +7950,7 @@ fn test_assaultvest_prevents_status_move() {
         id: Choices::TACKLE,
         disabled: false,
         pp: 35,
+        max_pp: 0,
         choice: MOVES.get(&Choices::TACKLE).unwrap().clone(),
     };
 
@@ -7952,6 +7958,7 @@ fn test_assaultvest_prevents_status_move() {
         id: Choices::WATERGUN,
         disabled: false,
         pp: 35,
+        max_pp: 0,
         choice: MOVES.get(&Choices::TACKLE).unwrap().clone(),
     };
 
@@ -7959,6 +7966,7 @@ fn test_assaultvest_prevents_status_move() {
         id: Choices::EMBER,
         disabled: false,
         pp: 35,
+        max_pp: 0,
         choice: MOVES.get(&Choices::TACKLE).unwrap().clone(),
     };
 
@@ -7991,6 +7999,7 @@ fn test_taunt_prevents_status_move() {
         id: Choices::TOXIC,
         disabled: false,
         pp: 35,
+        max_pp: 0,
         choice: MOVES.get(&Choices::TOXIC).unwrap().clone(),
     };
 
@@ -7998,6 +8007,7 @@ fn test_taunt_prevents_status_move() {
         id: Choices::TACKLE,
         disabled: false,
         pp: 35,
+        max_pp: 0,
         choice: MOVES.get(&Choices::TACKLE).unwrap().clone(),
     };
 
@@ -8005,6 +8015,7 @@ fn test_taunt_prevents_status_move() {
         id: Choices::WATERGUN,
         disabled: false,
         pp: 35,
+        max_pp: 0,
         choice: MOVES.get(&Choices::TACKLE).unwrap().clone(),
     };
 
@@ -8012,6 +8023,7 @@ fn test_taunt_prevents_status_move() {
         id: Choices::EMBER,
         disabled: false,
         pp: 35,
+        max_pp: 0,
         choice: MOVES.get(&Choices::TACKLE).unwrap().clone(),
     };
 
@@ -10635,6 +10647,7 @@ fn test_using_move_while_asleep_does_not_decrement_pp() {
         id: Choices::TACKLE,
         disabled: false,
         pp: 1,
+        max_pp: 0,
         choice: Default::default(),
     };
 
@@ -11617,7 +11630,7 @@ fn test_gen6_gen7_gen8_protean_does_activate_when_already_typechanged() {
 #[cfg(any(feature = "gen9", feature = "champions"))]
 fn test_protean_does_not_change_type_if_already_has_type() {
     let mut state = State::default();
-    state.side_one.get_active().types = (PokemonType::WATER, PokemonType::DARK);
+    state.side_one.get_active().types = (PokemonType::WATER, PokemonType::TYPELESS);
     state.side_one.get_active().ability = Abilities::PROTEAN;
 
     let vec_of_instructions = set_moves_on_pkmn_and_call_generate_instructions(
@@ -11634,6 +11647,28 @@ fn test_protean_does_not_change_type_if_already_has_type() {
         })],
     }];
     assert_eq!(expected_instructions, vec_of_instructions);
+}
+
+#[test]
+#[cfg(any(feature = "gen9", feature = "champions"))]
+fn test_protean_dual_type_mon_becomes_the_pure_move_type() {
+    // Showdown compares the whole type list ("Water,Dark" != "Water"), so a Water/Dark Greninja
+    // using a Water move still retypes to pure Water (sdb.22)
+    let mut state = State::default();
+    state.side_one.get_active().types = (PokemonType::WATER, PokemonType::DARK);
+    state.side_one.get_active().ability = Abilities::PROTEAN;
+
+    let vec_of_instructions = set_moves_on_pkmn_and_call_generate_instructions(
+        &mut state,
+        Choices::WATERGUN,
+        Choices::SPLASH,
+    );
+
+    assert!(vec_of_instructions[0].instruction_list.contains(&Instruction::ChangeType(ChangeType {
+        side_ref: SideReference::SideOne,
+        new_types: (PokemonType::WATER, PokemonType::TYPELESS),
+        old_types: (PokemonType::WATER, PokemonType::DARK),
+    })));
 }
 
 #[test]
@@ -12484,11 +12519,11 @@ fn test_grassyglide_in_grassyterrain_increased_priority() {
                 side_ref: SideReference::SideTwo,
                 damage_amount: 1,
             }),
+            Instruction::DecrementTerrainTurnsRemaining,
             Instruction::Heal(HealInstruction {
                 side_ref: SideReference::SideOne,
                 heal_amount: 6,
             }),
-            Instruction::DecrementTerrainTurnsRemaining,
         ],
     }];
     assert_eq!(expected_instructions, vec_of_instructions);
@@ -15332,6 +15367,7 @@ fn test_pursuit_into_switch() {
         id: Choices::PURSUIT,
         disabled: false,
         pp: 35,
+        max_pp: 0,
         choice: MOVES.get(&Choices::PURSUIT).unwrap().to_owned(),
     };
 
@@ -15367,6 +15403,7 @@ fn test_pursuit_into_switch_has_residuals_trigger_properly() {
         id: Choices::PURSUIT,
         disabled: false,
         pp: 35,
+        max_pp: 0,
         choice: MOVES.get(&Choices::PURSUIT).unwrap().to_owned(),
     };
 
@@ -15410,6 +15447,7 @@ fn test_pursuit_knocking_out_switching_target_does_not_let_them_switch() {
         id: Choices::PURSUIT,
         disabled: false,
         pp: 35,
+        max_pp: 0,
         choice: MOVES.get(&Choices::PURSUIT).unwrap().to_owned(),
     };
 
@@ -15436,6 +15474,7 @@ fn test_pursuit_into_non_switch() {
         id: Choices::PURSUIT,
         disabled: false,
         pp: 35,
+        max_pp: 0,
         choice: MOVES.get(&Choices::PURSUIT).unwrap().to_owned(),
     };
 
@@ -18550,6 +18589,7 @@ fn test_mega_evolving_using_pursuit_into_switch() {
         id: Choices::PURSUIT,
         disabled: false,
         pp: 12,
+        max_pp: 0,
         choice: MOVES.get(&Choices::PURSUIT).unwrap().to_owned(),
     };
     let vec_of_instructions = generate_instructions_with_state_assertion(
@@ -20238,6 +20278,16 @@ fn test_healblock_prevents_drainpunch() {
                 side_ref: SideReference::SideOne,
                 volatile_status: PokemonVolatileStatus::HEALBLOCK,
             }),
+            Instruction::ChangeVolatileStatusDuration(ChangeVolatileStatusDurationInstruction {
+                side_ref: SideReference::SideOne,
+                volatile_status: PokemonVolatileStatus::HEALBLOCK,
+                amount: 2,
+            }),
+            Instruction::ChangeVolatileStatusDuration(ChangeVolatileStatusDurationInstruction {
+                side_ref: SideReference::SideOne,
+                volatile_status: PokemonVolatileStatus::HEALBLOCK,
+                amount: -1,
+            }),
         ],
     }];
     assert_eq!(expected_instructions, vec_of_instructions);
@@ -20263,6 +20313,16 @@ fn test_healblock_prevents_synthesis() {
             Instruction::ApplyVolatileStatus(ApplyVolatileStatusInstruction {
                 side_ref: SideReference::SideOne,
                 volatile_status: PokemonVolatileStatus::HEALBLOCK,
+            }),
+            Instruction::ChangeVolatileStatusDuration(ChangeVolatileStatusDurationInstruction {
+                side_ref: SideReference::SideOne,
+                volatile_status: PokemonVolatileStatus::HEALBLOCK,
+                amount: 2,
+            }),
+            Instruction::ChangeVolatileStatusDuration(ChangeVolatileStatusDurationInstruction {
+                side_ref: SideReference::SideOne,
+                volatile_status: PokemonVolatileStatus::HEALBLOCK,
+                amount: -1,
             }),
         ],
     }];
@@ -20290,9 +20350,19 @@ fn test_healblock_does_not_prevent_tackle() {
                 side_ref: SideReference::SideOne,
                 volatile_status: PokemonVolatileStatus::HEALBLOCK,
             }),
+            Instruction::ChangeVolatileStatusDuration(ChangeVolatileStatusDurationInstruction {
+                side_ref: SideReference::SideOne,
+                volatile_status: PokemonVolatileStatus::HEALBLOCK,
+                amount: 2,
+            }),
             Instruction::Damage(DamageInstruction {
                 side_ref: SideReference::SideTwo,
                 damage_amount: 48,
+            }),
+            Instruction::ChangeVolatileStatusDuration(ChangeVolatileStatusDurationInstruction {
+                side_ref: SideReference::SideOne,
+                volatile_status: PokemonVolatileStatus::HEALBLOCK,
+                amount: -1,
             }),
         ],
     }];
@@ -21250,10 +21320,7 @@ fn test_shedskin_end_of_turn() {
     let expected_instructions = vec![StateInstructions {
         percentage: 100.0,
         instruction_list: vec![
-            Instruction::Damage(DamageInstruction {
-                side_ref: SideReference::SideTwo,
-                damage_amount: 12,
-            }),
+            // cured at residual order 5, before the poison tick (order 9)
             Instruction::ChangeStatus(ChangeStatusInstruction {
                 side_ref: SideReference::SideTwo,
                 pokemon_index: PokemonIndex::P0,
@@ -21281,10 +21348,7 @@ fn test_hydration_end_of_turn() {
     let expected_instructions = vec![StateInstructions {
         percentage: 100.0,
         instruction_list: vec![
-            Instruction::Damage(DamageInstruction {
-                side_ref: SideReference::SideTwo,
-                damage_amount: 12,
-            }),
+            // cured at residual order 5, before the poison tick (order 9)
             Instruction::ChangeStatus(ChangeStatusInstruction {
                 side_ref: SideReference::SideTwo,
                 pokemon_index: PokemonIndex::P0,
