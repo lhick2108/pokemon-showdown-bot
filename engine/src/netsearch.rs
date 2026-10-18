@@ -23,10 +23,13 @@
 
 use crate::engine::generate_instructions::generate_instructions_from_move_pair;
 use crate::engine::state::MoveChoice;
+use crate::features_v2::moves_of;
+use crate::features_v4::{move_idx, species_idx, IDS_PER_SLOT, IDX_UNKNOWN};
 use crate::instruction::StateInstructions;
+use crate::pokemon::PokemonName;
 use crate::prior::{action_slot, N_ACTIONS};
-use crate::state::{SideReference, State};
-use crate::tokens::{self, Revealed, CAT_LEN, CONT_LEN};
+use crate::state::{Pokemon, Side, SideReference, State};
+use crate::tokens::{self, Revealed, CAT_LEN, CONT_LEN, C_MON, O_MON_CAT, O_MON_CONT};
 use rand::prelude::*;
 use rand::rngs::StdRng;
 use std::collections::VecDeque;
@@ -48,12 +51,183 @@ pub struct Params {
     /// token views written per leaf: 2 = side one's and side two's, 1 = side one's only (the
     /// caller then takes side two's policy from the net's opponent head)
     pub views: u8,
+    /// event-history rows handed out with every leaf (`Collected::hist_*`): 0 = none (the net sees
+    /// padding), 1 = the root's 16 rows for every leaf, 2 = the root's rows pushed down by the
+    /// turns simulated on the way to the leaf (two new rows per turn, most recent first)
+    pub hist: u8,
+    /// worker threads for tokenising the leaves of a batch (1 = in the calling thread)
+    pub threads: u8,
 }
 
 impl Default for Params {
     fn default() -> Params {
-        Params { c_puct: 2.0, fpu: 0.0, depth: 4, eps: 0.01, views: 2 }
+        Params { c_puct: 2.0, fpu: 0.0, depth: 4, eps: 0.01, views: 2, hist: 0, threads: 1 }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Event history (docs/tokens.md "Event history", `tokens.build_history` in Python)
+// ---------------------------------------------------------------------------
+
+pub const HIST_ROWS: usize = 16;
+pub const HIST_CAT_W: usize = 4;
+pub const HIST_CONT_W: usize = 5;
+pub const HIST_CAT_LEN: usize = HIST_ROWS * HIST_CAT_W;
+pub const HIST_CONT_LEN: usize = HIST_ROWS * HIST_CONT_W;
+/// Turns between two consecutive history decisions are 1 in the tree: `turns_ago / 16`.
+const AGO_STEP: f32 = 1.0 / 16.0;
+
+/// The 16 event rows of the token net, side one's view: row `2 (k - 1)` is our action `k` turns ago,
+/// row `2 (k - 1) + 1` the opponent's. `cat` rows: `[side (0 pad, 1 own, 2 opp), kind + 1, action id,
+/// species row of the actor's active Pokemon]`; `cont` rows: `[turns_ago / 16, hp change of the
+/// actor's active, hp change of the other active, fainted on the actor's side / 6, fainted on the other
+/// side / 6]`.
+#[derive(Clone, Debug)]
+pub struct Hist {
+    pub cat: [i16; HIST_CAT_LEN],
+    pub cont: [f32; HIST_CONT_LEN],
+}
+
+impl Default for Hist {
+    fn default() -> Hist {
+        Hist { cat: [0; HIST_CAT_LEN], cont: [0.0; HIST_CONT_LEN] }
+    }
+}
+
+impl Hist {
+    /// The same history from the other side's view: the two rows of every turn swap and the side
+    /// ids flip (the changes are relative to the actor already).
+    pub fn mirrored(&self) -> Hist {
+        let mut m = Hist::default();
+        for k in 0..HIST_ROWS / 2 {
+            for (dst, src) in [(2 * k, 2 * k + 1), (2 * k + 1, 2 * k)] {
+                m.cat[dst * HIST_CAT_W..(dst + 1) * HIST_CAT_W]
+                    .copy_from_slice(&self.cat[src * HIST_CAT_W..(src + 1) * HIST_CAT_W]);
+                m.cont[dst * HIST_CONT_W..(dst + 1) * HIST_CONT_W]
+                    .copy_from_slice(&self.cont[src * HIST_CONT_W..(src + 1) * HIST_CONT_W]);
+                let side = &mut m.cat[dst * HIST_CAT_W];
+                *side = match *side {
+                    1 => 2,
+                    2 => 1,
+                    x => x,
+                };
+            }
+        }
+        m
+    }
+
+    /// `self` one turn later with `rows` (our action, the opponent's) in front: older rows get
+    /// `turns_ago + 1` (padding stays padding) and the two oldest rows fall off.
+    fn pushed(&self, rows: &[([i16; HIST_CAT_W], [f32; HIST_CONT_W]); 2]) -> Hist {
+        let mut h = Hist::default();
+        for (r, (c, f)) in rows.iter().enumerate() {
+            h.cat[r * HIST_CAT_W..(r + 1) * HIST_CAT_W].copy_from_slice(c);
+            h.cont[r * HIST_CONT_W..(r + 1) * HIST_CONT_W].copy_from_slice(f);
+        }
+        h.cat[2 * HIST_CAT_W..].copy_from_slice(&self.cat[..HIST_CAT_LEN - 2 * HIST_CAT_W]);
+        h.cont[2 * HIST_CONT_W..].copy_from_slice(&self.cont[..HIST_CONT_LEN - 2 * HIST_CONT_W]);
+        for r in 2..HIST_ROWS {
+            if h.cat[r * HIST_CAT_W] > 0 {
+                let a = &mut h.cont[r * HIST_CONT_W];
+                *a = (*a + AGO_STEP).min(1.0);
+            }
+        }
+        h
+    }
+}
+
+/// Public per-decision quantities of side one's (scrubbed) token view that the history deltas are
+/// built from (`tokens._summary`): species of both active Pokemon and the hp fraction of every
+/// alive, revealed Pokemon by species row.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Summary {
+    active: [i16; 2],
+    n: [u8; 2],
+    sp: [[i16; 6]; 2],
+    hp: [[f32; 6]; 2],
+}
+
+impl Summary {
+    pub fn of(cat: &[i16], cont: &[f32]) -> Summary {
+        let mut s = Summary { active: [cat[O_MON_CAT], cat[O_MON_CAT + 6 * IDS_PER_SLOT]], ..Summary::default() };
+        for m in 0..12 {
+            let id = cat[O_MON_CAT + m * IDS_PER_SLOT];
+            let alive = cont[O_MON_CONT + m * C_MON + 1] > 0.5;
+            if alive && id > 1 {
+                let side = m / 6;
+                let k = s.n[side] as usize;
+                // a repeated species keeps the last hp, as the Python dict does
+                if let Some(j) = s.sp[side][..k].iter().position(|&x| x == id) {
+                    s.hp[side][j] = cont[O_MON_CONT + m * C_MON];
+                } else {
+                    s.sp[side][k] = id;
+                    s.hp[side][k] = cont[O_MON_CONT + m * C_MON];
+                    s.n[side] += 1;
+                }
+            }
+        }
+        s
+    }
+
+    fn hp_of(&self, side: usize, species: i16) -> Option<f32> {
+        self.sp[side][..self.n[side] as usize].iter().position(|&x| x == species).map(|j| self.hp[side][j])
+    }
+
+    /// hp change of the Pokemon active before, from `self` to `after` (0 if fainted or unknown).
+    fn hp_delta(&self, after: &Summary, side: usize) -> f32 {
+        let x = self.active[side];
+        if x <= 1 {
+            return 0.0;
+        }
+        match self.hp_of(side, x) {
+            Some(b) => after.hp_of(side, x).unwrap_or(0.0) - b,
+            None => 0.0,
+        }
+    }
+
+    fn fainted(&self, after: &Summary, side: usize) -> u32 {
+        self.sp[side][..self.n[side] as usize].iter().filter(|&&x| after.hp_of(side, x).is_none()).count() as u32
+    }
+}
+
+/// Action row ingredients: `(kind, id)` with kind 0 move, 1 tera move, 2 switch, -1 none; id the
+/// move or species vocabulary row (1 = unknown for a switch target the viewer has never seen).
+type ActRow = (i8, i16);
+
+/// The history rows of one simulated turn from `before` to `after` (`tokens.build_history`).
+fn turn_rows(before: &Summary, after: &Summary, own: ActRow, opp: ActRow) -> [([i16; HIST_CAT_W], [f32; HIST_CONT_W]); 2] {
+    let (d_own, d_opp) = (before.hp_delta(after, 0), before.hp_delta(after, 1));
+    let (f_own, f_opp) = (before.fainted(after, 0) as f32 / 6.0, before.fainted(after, 1) as f32 / 6.0);
+    [
+        ([1, own.0 as i16 + 1, own.1, before.active[0]], [AGO_STEP, d_own, d_opp, f_own, f_opp]),
+        ([2, opp.0 as i16 + 1, opp.1, before.active[1]], [AGO_STEP, d_opp, d_own, f_opp, f_own]),
+    ]
+}
+
+fn norm_name(s: &str) -> String {
+    s.chars().filter(|c| c.is_ascii_alphanumeric()).map(|c| c.to_ascii_lowercase()).collect()
+}
+
+/// `(kind, id)` of `choice` taken by `side`. A switch to a Pokemon that `hidden` says the viewer
+/// has not seen has the unknown species row.
+fn act_row(side: &Side, choice: &MoveChoice, hidden: &dyn Fn(&Pokemon) -> bool) -> ActRow {
+    let active = side.get_active_immutable();
+    match choice {
+        MoveChoice::Move(m) | MoveChoice::MoveMega(m) => (0, move_idx(moves_of(active)[*m as usize].id) as i16),
+        MoveChoice::MoveTera(m) => (1, move_idx(moves_of(active)[*m as usize].id) as i16),
+        MoveChoice::Switch(p) => {
+            let target = &side.pokemon.pkmn[*p as usize];
+            (2, if hidden(target) { IDX_UNKNOWN as i16 } else { species_idx(target) as i16 })
+        }
+        _ => (-1, 0),
+    }
+}
+
+/// What a node keeps for the history of its children (`hist` mode 2).
+#[derive(Clone, Debug)]
+struct NodeInfo {
+    summary: Summary,
+    hist: Hist,
 }
 
 #[derive(Clone, Debug)]
@@ -98,6 +272,8 @@ struct Node {
     s2: Vec<Opt>,
     /// `chance[a1 * s2.len() + a2]`
     chance: Vec<Option<Box<[Outcome]>>>,
+    /// summary and history of the node's state (`hist` mode 2, set when its tokens are written)
+    info: Option<Box<NodeInfo>>,
 }
 
 impl Node {
@@ -112,6 +288,7 @@ impl Node {
             s1: Vec::new(),
             s2: Vec::new(),
             chance: Vec::new(),
+            info: None,
         }
     }
 }
@@ -135,6 +312,12 @@ struct PendingLeaf {
     world: u32,
     node: u32,
     path: Vec<Step>,
+    /// the leaf's state until its tokens are written (they are written after the descents, in parallel)
+    state: Option<State>,
+    /// hist mode 2: the parent's summary / history and the joint action taken to get here
+    parent: Option<(Summary, Hist, ActRow, ActRow)>,
+    /// hist mode 2: filled by the token writer
+    info: Option<Box<NodeInfo>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -160,6 +343,10 @@ pub struct Collected {
     pub cat: Vec<i16>,
     /// `[n][views][CONT_LEN]`
     pub cont: Vec<f32>,
+    /// `[n][views][HIST_CAT_LEN]` / `[n][views][HIST_CONT_LEN]` (empty when `hist` = 0); view 1
+    /// (side two) holds the mirrored history
+    pub hist_cat: Vec<i16>,
+    pub hist_cont: Vec<f32>,
 }
 
 /// Evaluation of one leaf: policies over the 13 slots of each side (any non-negative
@@ -174,6 +361,12 @@ pub struct NetSearch {
     worlds: Vec<World>,
     params: Params,
     reveal1: Option<Vec<Revealed>>,
+    /// what the opponent has seen of our team, applied to side two's view (None = side two sees all)
+    reveal2: Option<Vec<Revealed>>,
+    /// normalised species names listed in `reveal1`
+    names1: Option<Vec<String>>,
+    /// the root's event rows from side one's view (`hist` > 0)
+    root_hist: Hist,
     rng: StdRng,
     inflight: VecDeque<Vec<PendingLeaf>>,
     cursor: usize,
@@ -249,12 +442,25 @@ impl NetSearch {
         NetSearch {
             worlds,
             params,
+            names1: reveal1.as_ref().map(|r| r.iter().map(|x| norm_name(&x.species)).collect()),
             reveal1,
+            reveal2: None,
+            root_hist: Hist::default(),
             rng: StdRng::seed_from_u64(seed),
             inflight: VecDeque::new(),
             cursor: 0,
             stats: Stats::default(),
         }
+    }
+
+    /// Side two's token view is scrubbed to `rows` (what the opponent knows about our team).
+    pub fn set_reveal2(&mut self, rows: Option<Vec<Revealed>>) {
+        self.reveal2 = rows;
+    }
+
+    /// The root's event history from side one's view (used when `Params::hist` > 0).
+    pub fn set_root_hist(&mut self, h: Hist) {
+        self.root_hist = h;
     }
 
     pub fn n_worlds(&self) -> usize {
@@ -272,10 +478,7 @@ impl NetSearch {
     /// net call).
     pub fn collect(&mut self, max_batch: usize) -> Collected {
         let t0 = Instant::now();
-        let tok0 = self.stats.tokenise_ns;
         let mut leaves: Vec<PendingLeaf> = Vec::new();
-        let mut cat: Vec<i16> = Vec::new();
-        let mut cont: Vec<f32> = Vec::new();
         let nw = self.worlds.len();
         for w in &mut self.worlds {
             w.stuck = 0;
@@ -295,7 +498,7 @@ impl NetSearch {
                 }
                 attempts += 1;
                 progressed = true;
-                if let Some(l) = self.descend(wi, &mut cat, &mut cont) {
+                if let Some(l) = self.descend(wi) {
                     self.worlds[wi].stuck = 0;
                     leaves.push(l);
                 } else if self.worlds[wi].stuck < STUCK {
@@ -309,14 +512,76 @@ impl NetSearch {
             }
         }
         let n = leaves.len();
+        let tree_ns = t0.elapsed().as_nanos() as u64;
+        let (cat, cont, hist_cat, hist_cont) = self.write_tokens(&mut leaves);
         if n > 0 {
             self.stats.batches += 1;
             self.inflight.push_back(leaves);
         }
         // tree time excludes tokenisation (counted separately)
-        let total = t0.elapsed().as_nanos() as u64;
-        self.stats.tree_ns += total.saturating_sub(self.stats.tokenise_ns - tok0);
-        Collected { n, cat, cont }
+        self.stats.tree_ns += tree_ns;
+        Collected { n, cat, cont, hist_cat, hist_cont }
+    }
+
+    /// Writes the token buffers (and event rows) of the leaves, on up to `params.threads` threads.
+    #[allow(clippy::type_complexity)]
+    fn write_tokens(&mut self, leaves: &mut [PendingLeaf]) -> (Vec<i16>, Vec<f32>, Vec<i16>, Vec<f32>) {
+        let t1 = Instant::now();
+        let n = leaves.len();
+        let views = self.params.views.clamp(1, 2) as usize;
+        let hist_mode = self.params.hist.min(2);
+        let hv = if hist_mode > 0 { n * views } else { 0 };
+        let mut cat = vec![0i16; n * views * CAT_LEN];
+        let mut cont = vec![0f32; n * views * CONT_LEN];
+        let mut hcat = vec![0i16; hv * HIST_CAT_LEN];
+        let mut hcont = vec![0f32; hv * HIST_CONT_LEN];
+        {
+            let ctx = TokCtx {
+                views,
+                hist_mode,
+                reveal1: self.reveal1.as_deref(),
+                reveal2: self.reveal2.as_deref(),
+                root_hist: &self.root_hist,
+            };
+            let threads = (self.params.threads.clamp(1, 4) as usize).min(n.max(1));
+            if threads <= 1 || n < 8 {
+                fill_chunk(&ctx, leaves, &mut cat, &mut cont, &mut hcat, &mut hcont);
+            } else {
+                let per = n.div_ceil(threads);
+                let ctx = &ctx;
+                std::thread::scope(|sc| {
+                    let (mut lv, mut c, mut f, mut hc, mut hf) =
+                        (&mut *leaves, &mut cat[..], &mut cont[..], &mut hcat[..], &mut hcont[..]);
+                    while !lv.is_empty() {
+                        let take = per.min(lv.len());
+                        let (l, lr) = lv.split_at_mut(take);
+                        let (cc, cr) = c.split_at_mut(take * views * CAT_LEN);
+                        let (ff, fr) = f.split_at_mut(take * views * CONT_LEN);
+                        let hn = if hv > 0 { take * views } else { 0 };
+                        let (hcc, hcr) = hc.split_at_mut(hn * HIST_CAT_LEN);
+                        let (hff, hfr) = hf.split_at_mut(hn * HIST_CONT_LEN);
+                        lv = lr;
+                        c = cr;
+                        f = fr;
+                        hc = hcr;
+                        hf = hfr;
+                        sc.spawn(move || fill_chunk(ctx, l, cc, ff, hcc, hff));
+                    }
+                });
+            }
+        }
+        if hist_mode == 2 {
+            for l in leaves.iter_mut() {
+                if let Some(info) = l.info.take() {
+                    let node = &mut self.worlds[l.world as usize].nodes[l.node as usize];
+                    if node.depth < self.params.depth {
+                        node.info = Some(info);
+                    }
+                }
+            }
+        }
+        self.stats.tokenise_ns += t1.elapsed().as_nanos() as u64;
+        (cat, cont, hcat, hcont)
     }
 
     /// Completes the OLDEST in-flight batch. `evals.len()` must equal its size.
@@ -381,11 +646,13 @@ impl NetSearch {
     /// One descent in world `wi`. Returns a pending leaf (its tokens appended to `cat` /
     /// `cont`), or None when the descent backed up a known value or collided with a pending
     /// node.
-    fn descend(&mut self, wi: usize, cat: &mut Vec<i16>, cont: &mut Vec<f32>) -> Option<PendingLeaf> {
+    fn descend(&mut self, wi: usize) -> Option<PendingLeaf> {
         let params = self.params.clone();
         let mut state = self.worlds[wi].root_state.clone();
         let mut path: Vec<Step> = Vec::new();
         let mut cur: u32 = 0;
+        // hist mode 2: (node, our action, the opponent's) of the joint action last applied
+        let mut last_act: Option<(u32, ActRow, ActRow)> = None;
         loop {
             let status = self.worlds[wi].nodes[cur as usize].status;
             match status {
@@ -415,8 +682,7 @@ impl NetSearch {
                         self.backprop(wi, cur, &path, v);
                         return None;
                     }
-                    // an unevaluated node: queue it for the net
-                    let t1 = Instant::now();
+                    // an unevaluated node: queue it for the net (its tokens are written after the descents)
                     {
                         let node = &mut self.worlds[wi].nodes[cur as usize];
                         node.status = Status::Pending;
@@ -427,29 +693,14 @@ impl NetSearch {
                             node.chance = (0..node.s1.len() * node.s2.len()).map(|_| None).collect();
                         }
                     }
-                    let base_c = cat.len();
-                    let base_f = cont.len();
-                    let views = params.views.clamp(1, 2) as usize;
-                    cat.resize(base_c + views * CAT_LEN, 0);
-                    cont.resize(base_f + views * CONT_LEN, 0.0);
-                    tokens::state_tokens_into(
-                        &state,
-                        SideReference::SideOne,
-                        self.reveal1.as_deref(),
-                        &mut cat[base_c..base_c + CAT_LEN],
-                        &mut cont[base_f..base_f + CONT_LEN],
-                    );
-                    if views == 2 {
-                        tokens::state_tokens_into(
-                            &state,
-                            SideReference::SideTwo,
-                            None,
-                            &mut cat[base_c + CAT_LEN..base_c + 2 * CAT_LEN],
-                            &mut cont[base_f + CONT_LEN..base_f + 2 * CONT_LEN],
-                        );
-                    }
-                    self.stats.tokenise_ns += t1.elapsed().as_nanos() as u64;
-                    return Some(PendingLeaf { world: wi as u32, node: cur, path });
+                    let parent = match last_act {
+                        Some((pn, own, opp)) if params.hist == 2 => self.worlds[wi].nodes[pn as usize]
+                            .info
+                            .as_ref()
+                            .map(|i| (i.summary, i.hist.clone(), own, opp)),
+                        _ => None,
+                    };
+                    return Some(PendingLeaf { world: wi as u32, node: cur, path, state: Some(state), parent, info: None });
                 }
                 Status::Ready => {
                     let (a1, a2, depth, n2, both_none) = {
@@ -474,6 +725,17 @@ impl NetSearch {
                     }
                     path.push(Step { node: cur, a1: a1 as u16, a2: a2 as u16 });
                     let key = a1 * n2 + a2;
+                    if params.hist == 2 {
+                        let node = &self.worlds[wi].nodes[cur as usize];
+                        let names = self.names1.as_deref();
+                        let hidden_opp = |p: &Pokemon| match names {
+                            Some(v) => !v.contains(&norm_name(PokemonName::NAMES[p.id as usize])),
+                            None => false,
+                        };
+                        let own = act_row(&state.side_one, &node.s1[a1].choice, &|_| false);
+                        let opp = act_row(&state.side_two, &node.s2[a2].choice, &hidden_opp);
+                        last_act = Some((cur, own, opp));
+                    }
                     if self.worlds[wi].nodes[cur as usize].chance[key].is_none() {
                         let (c1, c2) = {
                             let node = &self.worlds[wi].nodes[cur as usize];
@@ -557,6 +819,53 @@ impl NetSearch {
             }
         }
         out
+    }
+}
+
+/// Read-only inputs of the token writer, shared by its threads.
+struct TokCtx<'a> {
+    views: usize,
+    hist_mode: u8,
+    reveal1: Option<&'a [Revealed]>,
+    reveal2: Option<&'a [Revealed]>,
+    root_hist: &'a Hist,
+}
+
+/// Writes the tokens (and event rows) of a chunk of leaves into their slices of the batch buffers.
+fn fill_chunk(ctx: &TokCtx, leaves: &mut [PendingLeaf], cat: &mut [i16], cont: &mut [f32], hcat: &mut [i16], hcont: &mut [f32]) {
+    let v = ctx.views;
+    for (i, leaf) in leaves.iter_mut().enumerate() {
+        let state = leaf.state.take().expect("pending leaf without a state");
+        let (c, f) = (&mut cat[i * v * CAT_LEN..(i + 1) * v * CAT_LEN], &mut cont[i * v * CONT_LEN..(i + 1) * v * CONT_LEN]);
+        tokens::state_tokens_into(&state, SideReference::SideOne, ctx.reveal1, &mut c[..CAT_LEN], &mut f[..CONT_LEN]);
+        if v == 2 {
+            tokens::state_tokens_into(&state, SideReference::SideTwo, ctx.reveal2, &mut c[CAT_LEN..], &mut f[CONT_LEN..]);
+        }
+        if ctx.hist_mode == 0 {
+            continue;
+        }
+        let (hist, info) = if ctx.hist_mode == 2 {
+            let summary = Summary::of(&c[..CAT_LEN], &f[..CONT_LEN]);
+            let h = match &leaf.parent {
+                Some((ps, ph, own, opp)) => ph.pushed(&turn_rows(ps, &summary, *own, *opp)),
+                None => ctx.root_hist.clone(),
+            };
+            (h.clone(), Some(Box::new(NodeInfo { summary, hist: h })))
+        } else {
+            (ctx.root_hist.clone(), None)
+        };
+        leaf.info = info;
+        let (hc, hf) = (
+            &mut hcat[i * v * HIST_CAT_LEN..(i + 1) * v * HIST_CAT_LEN],
+            &mut hcont[i * v * HIST_CONT_LEN..(i + 1) * v * HIST_CONT_LEN],
+        );
+        hc[..HIST_CAT_LEN].copy_from_slice(&hist.cat);
+        hf[..HIST_CONT_LEN].copy_from_slice(&hist.cont);
+        if v == 2 {
+            let m = hist.mirrored();
+            hc[HIST_CAT_LEN..].copy_from_slice(&m.cat);
+            hf[HIST_CONT_LEN..].copy_from_slice(&m.cont);
+        }
     }
 }
 
@@ -812,5 +1121,157 @@ mod tests {
         let va: Vec<u32> = a.root(0).0.iter().map(|o| o.1).collect();
         let vb: Vec<u32> = b.root(0).0.iter().map(|o| o.1).collect();
         assert_eq!(va, vb);
+    }
+
+    // ---------------------------------------------------------------- sdb.25: threads, history, reveal2
+
+    fn collect_all(ns: &mut NetSearch, batch: usize, rounds: usize) -> Vec<(usize, Vec<i16>, Vec<f32>, Vec<i16>, Vec<f32>)> {
+        let mut out = Vec::new();
+        for _ in 0..rounds {
+            let c = ns.collect(batch);
+            if c.n == 0 {
+                break;
+            }
+            ns.feed(&fake(c.n, [1.0; N_ACTIONS], [1.0; N_ACTIONS], 0.5)).unwrap();
+            out.push((c.n, c.cat, c.cont, c.hist_cat, c.hist_cont));
+        }
+        out
+    }
+
+    #[test]
+    fn threaded_tokenisation_is_identical() {
+        let st = states();
+        let worlds: Vec<State> = st.iter().take(8).cloned().collect();
+        let rev = vec![Revealed { species: "x".into(), ..Default::default() }];
+        let mut a = NetSearch::new(worlds.clone(), Params::default(), Some(rev.clone()), 21);
+        let mut b = NetSearch::new(worlds, Params { threads: 3, hist: 2, ..Params::default() }, Some(rev), 21);
+        let ra = collect_all(&mut a, 40, 6);
+        let rb = collect_all(&mut b, 40, 6);
+        assert_eq!(ra.len(), rb.len());
+        for (x, y) in ra.iter().zip(&rb) {
+            assert_eq!(x.0, y.0);
+            assert!(x.1 == y.1 && x.2 == y.2, "tokens must not depend on the number of threads");
+        }
+        assert!(ra.iter().map(|r| r.0).sum::<usize>() > 100);
+    }
+
+    #[test]
+    fn root_history_is_given_to_every_leaf_and_mirrored() {
+        let st = states();
+        let mut root = Hist::default();
+        for r in 0..4 {
+            root.cat[r * HIST_CAT_W..(r + 1) * HIST_CAT_W].copy_from_slice(&[1 + (r % 2) as i16, 2, 100 + r as i16, 7]);
+            root.cont[r * HIST_CONT_W..(r + 1) * HIST_CONT_W].copy_from_slice(&[0.0625 * (1 + r / 2) as f32, -0.25, 0.5, 0.0, 0.1667]);
+        }
+        let mut ns = NetSearch::new(vec![st[0].clone(); 2], Params { hist: 1, ..Params::default() }, None, 22);
+        ns.set_root_hist(root.clone());
+        let rounds = collect_all(&mut ns, 16, 4);
+        let m = root.mirrored();
+        for (n, _, _, hc, hf) in &rounds {
+            assert_eq!(hc.len(), n * 2 * HIST_CAT_LEN);
+            for i in 0..*n {
+                assert_eq!(hc[i * 2 * HIST_CAT_LEN..i * 2 * HIST_CAT_LEN + HIST_CAT_LEN], root.cat);
+                assert_eq!(hc[(i * 2 + 1) * HIST_CAT_LEN..(i * 2 + 2) * HIST_CAT_LEN], m.cat);
+                assert_eq!(hf[(i * 2 + 1) * HIST_CONT_LEN..(i * 2 + 2) * HIST_CONT_LEN], m.cont);
+            }
+        }
+        // mirrored: the two rows of a turn swap, side ids flip, the actor-relative numbers stay with the row
+        assert_eq!(m.cat[0..4], [1, 2, 101, 7]);
+        assert_eq!(m.cat[4..8], [2, 2, 100, 7]);
+        assert_eq!(m.mirrored().cat, root.cat);
+    }
+
+    #[test]
+    fn tree_history_pushes_simulated_turns() {
+        let st = states();
+        let mut root = Hist::default();
+        root.cat[0..4].copy_from_slice(&[1, 1, 55, 9]);
+        root.cont[0..5].copy_from_slice(&[0.0625, -0.1, -0.2, 0.0, 0.0]);
+        root.cat[60..64].copy_from_slice(&[2, 3, 44, 8]); // the oldest row
+        root.cont[75..80].copy_from_slice(&[0.9375, 0.0, 0.0, 0.0, 0.0]);
+        let mut ns = NetSearch::new(vec![st[0].clone()], Params { hist: 2, ..Params::default() }, None, 23);
+        ns.set_root_hist(root.clone());
+        let r0 = ns.collect(4); // the root alone: its own rows are the root's
+        assert_eq!(r0.n, 1);
+        assert_eq!(r0.hist_cat[..HIST_CAT_LEN], root.cat);
+        ns.feed(&fake(1, [1.0; N_ACTIONS], [1.0; N_ACTIONS], 0.5)).unwrap();
+        let c = ns.collect(16); // depth-1 leaves
+        assert!(c.n > 3);
+        for i in 0..c.n {
+            let hc = &c.hist_cat[i * 2 * HIST_CAT_LEN..i * 2 * HIST_CAT_LEN + HIST_CAT_LEN];
+            let hf = &c.hist_cont[i * 2 * HIST_CONT_LEN..i * 2 * HIST_CONT_LEN + HIST_CONT_LEN];
+            // two new rows in front: our action (side 1) and the opponent's (side 2), one turn ago
+            assert_eq!(hc[0], 1);
+            assert_eq!(hc[4], 2);
+            assert!(hc[1] >= 0 && hc[1] <= 3 && hc[5] >= 0 && hc[5] <= 3);
+            assert_eq!(hf[0], 0.0625);
+            assert_eq!(hf[5], 0.0625);
+            // the active Pokemon of the root, as the summary of the root's tokens says
+            assert!(hc[3] > 1 && hc[7] > 1, "{:?}", &hc[..12]);
+            // the root's rows moved down by two rows and got one turn older; the oldest pair fell off
+            assert_eq!(hc[8..12], [1, 1, 55, 9]);
+            assert!((hf[10] - 0.125).abs() < 1e-6 && (hf[11] + 0.1).abs() < 1e-6);
+            assert_eq!(hc[60..64], [0, 0, 0, 0]);
+        }
+        // a switch is kind 3 with the species row, a move kind 1 / 2 with the move row
+        assert!((0..c.n).any(|i| c.hist_cat[i * 2 * HIST_CAT_LEN + 1] == 3 || c.hist_cat[i * 2 * HIST_CAT_LEN + 1] == 1));
+        ns.feed(&fake(c.n, [1.0; N_ACTIONS], [1.0; N_ACTIONS], 0.5)).unwrap();
+        // depth 2: four new-ish rows, the depth-1 turn is one turn older
+        let mut seen2 = false;
+        for _ in 0..30 {
+            let c2 = ns.collect(64);
+            for i in 0..c2.n {
+                let hf = &c2.hist_cont[i * 2 * HIST_CONT_LEN..i * 2 * HIST_CONT_LEN + HIST_CONT_LEN];
+                let hc = &c2.hist_cat[i * 2 * HIST_CAT_LEN..i * 2 * HIST_CAT_LEN + HIST_CAT_LEN];
+                if hc[16] > 0 && hc[24] == 0 && (hf[5] - 0.0625).abs() < 1e-6 && (hf[10] - 0.125).abs() < 1e-6 {
+                    seen2 = true;
+                    assert_eq!(hc[16..20], [1, 1, 55, 9]);
+                    assert!((hf[20] - 0.1875).abs() < 1e-6);
+                }
+            }
+            if c2.n == 0 {
+                break;
+            }
+            ns.feed(&fake(c2.n, [1.0; N_ACTIONS], [1.0; N_ACTIONS], 0.5)).unwrap();
+        }
+        assert!(seen2, "depth-2 leaves must carry two simulated turns plus the root rows");
+    }
+
+    #[test]
+    fn history_summary_deltas() {
+        let mut a = Summary { active: [10, 20], ..Summary::default() };
+        a.n = [2, 2];
+        a.sp = [[10, 11, 0, 0, 0, 0], [20, 21, 0, 0, 0, 0]];
+        a.hp = [[1.0, 0.5, 0.0, 0.0, 0.0, 0.0], [0.8, 1.0, 0.0, 0.0, 0.0, 0.0]];
+        let mut b = a;
+        b.hp[0][0] = 0.75; // our active lost 0.25
+        b.n[1] = 1; // the opponent's second Pokemon fainted
+        b.sp[1][1] = 0;
+        let rows = turn_rows(&a, &b, (0, 300), (-1, 0));
+        assert_eq!(rows[0].0, [1, 1, 300, 10]);
+        assert_eq!(rows[1].0, [2, 0, 0, 20]);
+        assert!((rows[0].1[1] + 0.25).abs() < 1e-6 && rows[0].1[2].abs() < 1e-6);
+        assert!(rows[1].1[1].abs() < 1e-6 && (rows[1].1[2] + 0.25).abs() < 1e-6);
+        assert!((rows[0].1[4] - 1.0 / 6.0).abs() < 1e-6 && (rows[1].1[3] - 1.0 / 6.0).abs() < 1e-6);
+        assert_eq!(rows[0].1[0], 0.0625);
+    }
+
+    #[test]
+    fn reveal2_scrubs_side_twos_view_of_our_team() {
+        let st = states();
+        let mut all = NetSearch::new(vec![st[3].clone()], Params::default(), None, 24);
+        let mut scr = NetSearch::new(vec![st[3].clone()], Params::default(), None, 24);
+        scr.set_reveal2(Some(Vec::new())); // the opponent has seen nothing of our team
+        let a = all.collect(4);
+        let b = scr.collect(4);
+        // side one's view is identical, side two's is not
+        assert_eq!(a.cat[..CAT_LEN], b.cat[..CAT_LEN]);
+        assert_ne!(a.cont[CONT_LEN..], b.cont[CONT_LEN..]);
+        assert_eq!(b.cat[CAT_LEN + tokens::O_META + 2], 1, "meta[2] marks a scrubbed view");
+        assert_eq!(a.cat[CAT_LEN + tokens::O_META + 2], 0);
+        // every non-active member of our team is hidden from side two's view: all 'known' flags 0
+        let known = &b.cat[CAT_LEN + tokens::O_MON_KNOWN..CAT_LEN + tokens::O_MON_KNOWN + 12 * tokens::KNOWN_W];
+        let opp_half = &known[6 * tokens::KNOWN_W..];
+        assert!(opp_half[tokens::KNOWN_W..].iter().all(|&k| k == 0), "bench of ours unknown to the opponent");
     }
 }

@@ -9,11 +9,18 @@ instead and ``net_errors`` counts it. Spec (docs/net-search.md)::
 
     net-search:model=models\\tok-d256.pt:device=cuda:worlds=32:time_ms=1000:max_evals=20000:batch=128
                :c_puct=2:depth=4:fpu=0:vavg=0:scrub=1:pipe=1:views=2
+               :fast=0:fp16res=0:hist=0:scrub2=0:tokthreads=1
+
+The last row (bead 589.68.7) is off by default, which is the old behaviour: ``fast`` runs the forward through
+CUDA graphs on compacted tokens, ``hist`` feeds the live history rows (1 = the root's rows for every leaf, 2 = plus
+the simulated turns), ``scrub2`` scrubs side two's view of our team to what the opponent has seen,
+``tokthreads`` tokenises the leaves of a batch on that many threads.
 """
 
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -62,9 +69,15 @@ class NetSearchPlayer(TokenPolicyPlayer):
         views: int = ns.DEFAULTS["views"],
         mode: str = "argmax",
         seed: int = 0,
+        fast: int = ns.DEFAULTS["fast"],
+        fp16res: int = ns.DEFAULTS["fp16res"],
+        hist: int = ns.DEFAULTS["hist"],
+        scrub2: int = ns.DEFAULTS["scrub2"],
+        tokthreads: int = ns.DEFAULTS["tokthreads"],
         **kwargs: Any,
     ):
-        super().__init__(*args, model=model, device=device, seed=seed, **kwargs)
+        # the token-policy fallback uses the live rows too whenever the search does
+        super().__init__(*args, model=model, device=device, seed=seed, hist=min(int(hist), 1), **kwargs)
         if mode not in ns.MODES:
             raise ValueError(f"mode must be one of {ns.MODES}, got {mode!r}")
         if worlds < 1 or time_ms < 1 or max_evals < 1 or batch < 1 or depth < 1:
@@ -74,12 +87,18 @@ class NetSearchPlayer(TokenPolicyPlayer):
         self.searcher = ns.NetSearcher(
             self.policy_net, worlds=worlds, time_ms=time_ms, max_evals=max_evals, batch=batch,
             c_puct=c_puct, depth=depth, fpu=fpu, vavg=bool(vavg), scrub=bool(scrub), pipe=pipe, views=views, seed=seed,
+            fast=bool(fast), fp16res=bool(fp16res), hist=int(hist), scrub2=bool(scrub2), tokthreads=int(tokthreads),
         )
+        self.search_hist = int(hist)
+        self.scrub2 = bool(scrub2)
         self.net_errors = 0
         self.net_searches = 0
         self.net_evals = 0
         self.net_ms = 0.0
         self.net_batches = 0
+
+    def _tracks_events(self) -> bool:
+        return self.search_hist > 0 or self.scrub2
 
     async def _choose(self, battle: Any) -> BattleOrder | None:
         legal = battle.valid_orders
@@ -92,8 +111,13 @@ class NetSearchPlayer(TokenPolicyPlayer):
             trackers = self.opponent_model.update(battle)
             reveal = tokens.reveal_rows(_opp_facts(battle, trackers))
             _slots, states, built = self._sample_worlds(battle, trackers, self.worlds)
+            hist = self._live_hist(battle, states[0], reveal) if self.search_hist else None
+            reveal2 = None
+            if self.scrub2:
+                reveal2 = tokens.reveal_rows(self._history(battle.battle_tag).our_facts())
             loop = asyncio.get_running_loop()
-            policy, info = await loop.run_in_executor(_pool(), self.searcher.search, states, reveal)
+            policy, info = await loop.run_in_executor(
+                _pool(), functools.partial(self.searcher.search, states, reveal, hist=hist, reveal2=reveal2))
             orders: dict[str, BattleOrder] = {}
             for choice in policy:
                 order = built.choice_to_order(choice, battle)
@@ -112,6 +136,7 @@ class NetSearchPlayer(TokenPolicyPlayer):
             self.net_errors += 1
             logger.exception("net search failed in %s; token policy argmax", battle.battle_tag)
             return await self._fallback_policy(battle)
+        self._hist_done(battle, choice)
         self.last_choice = choice
         self.last_policy = policy
         self.stats.searched += 1

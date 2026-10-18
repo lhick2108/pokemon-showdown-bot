@@ -144,6 +144,7 @@ def collect(args: argparse.Namespace) -> list[dict[str, Any]]:
             for gi, g in enumerate(recs):
                 others = [o for oi, o in enumerate(recs) if oi != gi]
                 peer = others[0] if len(others) == 1 else None
+                peer_by_turn = {pd.get("turn"): pd for pd in (peer["decisions"] if peer else [])}
                 stats: Counter = Counter()
                 samples = tokens.game_samples(g, peer, source_idx=0, kind="selfplay", opts=opts, vocab=vocab,
                                               fields=fields, lay=lay, stats=stats)
@@ -157,8 +158,10 @@ def collect(args: argparse.Namespace) -> list[dict[str, Any]]:
                         continue
                     cand.append((idx, d, s))
                 for idx, d, s in rng.sample(cand, min(args.per_game, len(cand))):
+                    # what the peer (our opponent) knew of our team at its decision of the same turn
+                    peer_facts = (peer_by_turn.get(d.get("turn")) or {}).get("opp_facts")
                     rows.append({"gen": gen, "tag": g["header"]["battle_tag"], "role": g["header"].get("role"),
-                                 "idx": idx, "d": d, "s": s})
+                                 "idx": idx, "d": d, "s": s, "peer_facts": peer_facts})
                     got += 1
         print(f"{gen}: {got} decisions from {len(games)} val battles available", file=sys.stderr)
     return rows

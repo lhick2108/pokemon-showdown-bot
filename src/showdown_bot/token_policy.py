@@ -14,8 +14,9 @@ Two users (docs/token-net.md):
   (``root_prior_s1`` of ``monte_carlo_tree_search``), computed once per decision in the parent
   process (GPU if available) and shipped to every world's search worker.
 
-The live history rows are padding (the network was trained with the last 16 events; the live bot does
-not track them yet).
+History rows: padding by default (``hist`` not given); with ``hist=(hist_cat [16,4], hist_cont [16,5])`` the
+live rows built by ``history_tokens.BattleHistory`` are used for every state (they are public information, the
+same for all worlds). The network was trained with the last 16 events.
 """
 
 from __future__ import annotations
@@ -95,7 +96,7 @@ class TokenPolicy:
 
     # ------------------------------------------------------------------ tokenise
     @staticmethod
-    def tokenise(states: Sequence[str], reveal: Any) -> tuple[dict[str, np.ndarray], list[list[str]]]:
+    def tokenise(states: Sequence[str], reveal: Any, hist: Any = None) -> tuple[dict[str, np.ndarray], list[list[str]]]:
         """Batch dict + the own-action choice names (13 per state, ``""`` for an empty slot)."""
         import poke_engine
 
@@ -107,28 +108,32 @@ class TokenPolicy:
             cat, cont, ch = poke_engine.state_tokens_str(s, 1, reveal, True)
             bufs.append(tokens.split_buffers(cat, cont, lay))
             names.append([str(c) for c in ch[:N_ACT]])
+        if hist is not None:
+            hc = np.broadcast_to(np.asarray(hist[0], np.int16), (len(bufs), token_net.N_HIST, 4)).copy()
+            hf = np.broadcast_to(np.asarray(hist[1], np.float32), (len(bufs), token_net.N_HIST, 5)).copy()
+            return token_net.batch_from_engine(bufs, hc, hf), names
         return token_net.batch_from_engine(bufs), names
 
     # ------------------------------------------------------------------ inference
-    def predict_states(self, states: Sequence[str], reveal: Any) -> tuple[list[list[str]], np.ndarray, np.ndarray]:
+    def predict_states(self, states: Sequence[str], reveal: Any, hist: Any = None) -> tuple[list[list[str]], np.ndarray, np.ndarray]:
         """``(names [n][13], policy [n,13], legal [n,13])`` for ``states`` in ONE batched forward."""
         if not states:
             return [], np.zeros((0, N_ACT), np.float32), np.zeros((0, N_ACT), bool)
         t0 = time.perf_counter()
-        batch, names = self.tokenise(states, reveal)
+        batch, names = self.tokenise(states, reveal, hist)
         out = self.net.predict(batch, device=self.device)
         self.last_ms = (time.perf_counter() - t0) * 1000.0
         self.calls += 1
         self.total_ms += self.last_ms
         return names, out["policy"], batch["act_legal"][:, 0] > 0
 
-    def distribution(self, states: Sequence[str], reveal: Any) -> dict[str, float]:
+    def distribution(self, states: Sequence[str], reveal: Any, hist: Any = None) -> dict[str, float]:
         """The policy over our legal choices, averaged over ``states`` (worlds), normalised.
 
         Our own side is identical in every world; the worlds only differ in what the scrubbed
         opponent view still reveals, so the mean is the natural single vector.
         """
-        names, pol, legal = self.predict_states(states, reveal)
+        names, pol, legal = self.predict_states(states, reveal, hist)
         if not names:
             return {}
         acc: dict[str, float] = {}

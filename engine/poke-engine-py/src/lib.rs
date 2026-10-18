@@ -1428,6 +1428,8 @@ type OptRow = (String, u32, f32, f32);
 #[pyclass(name = "NetSearch", module = "poke_engine")]
 struct PyNetSearch {
     inner: netsearch::NetSearch,
+    /// event rows of the last `collect` (`hist` > 0), taken by `take_hist`
+    last_hist: Option<(Vec<i16>, Vec<f32>)>,
 }
 
 fn le_f32(b: &[u8]) -> Vec<f32> {
@@ -1439,7 +1441,8 @@ impl PyNetSearch {
     /// `states`: serialized world states (side one = us). `reveal` (optional rows as in
     /// `state_tokens_str`) scrubs the opponent in side one's token view only.
     #[new]
-    #[pyo3(signature = (states, c_puct=2.0, fpu=0.0, depth=4, eps=0.01, seed=0, reveal=None, views=2))]
+    #[pyo3(signature = (states, c_puct=2.0, fpu=0.0, depth=4, eps=0.01, seed=0, reveal=None, views=2, reveal2=None, hist=0, hist_cat=None, hist_cont=None, threads=1))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         states: Vec<String>,
         c_puct: f32,
@@ -1449,6 +1452,11 @@ impl PyNetSearch {
         seed: u64,
         reveal: RevealArg,
         views: u8,
+        reveal2: RevealArg,
+        hist: u8,
+        hist_cat: Option<&[u8]>,
+        hist_cont: Option<&[u8]>,
+        threads: u8,
     ) -> PyResult<PyNetSearch> {
         if states.is_empty() {
             return Err(value_err("NetSearch needs at least one world".to_string()));
@@ -1459,8 +1467,32 @@ impl PyNetSearch {
             )));
         }
         let worlds: Vec<State> = states.iter().map(|s| State::deserialize(s)).collect();
-        let params = netsearch::Params { c_puct, fpu, depth, eps, views };
-        Ok(PyNetSearch { inner: netsearch::NetSearch::new(worlds, params, reveal_of(reveal), seed) })
+        if hist > 2 || !(1..=4).contains(&threads) {
+            return Err(value_err(format!("need hist 0, 1 or 2 and 1 <= threads <= 4 (got hist={hist}, threads={threads})")));
+        }
+        let params = netsearch::Params { c_puct, fpu, depth, eps, views, hist, threads };
+        let mut inner = netsearch::NetSearch::new(worlds, params, reveal_of(reveal), seed);
+        inner.set_reveal2(reveal_of(reveal2));
+        if hist > 0 {
+            let mut h = netsearch::Hist::default();
+            if let (Some(c), Some(f)) = (hist_cat, hist_cont) {
+                if c.len() != netsearch::HIST_CAT_LEN * 2 || f.len() != netsearch::HIST_CONT_LEN * 4 {
+                    return Err(value_err(format!(
+                        "hist_cat needs {} bytes (int16 [16,4]) and hist_cont {} bytes (float32 [16,5]), got {} / {}",
+                        netsearch::HIST_CAT_LEN * 2,
+                        netsearch::HIST_CONT_LEN * 4,
+                        c.len(),
+                        f.len()
+                    )));
+                }
+                for (d, ch) in h.cat.iter_mut().zip(c.chunks_exact(2)) {
+                    *d = i16::from_le_bytes([ch[0], ch[1]]);
+                }
+                h.cont.copy_from_slice(&le_f32(f));
+            }
+            inner.set_root_hist(h);
+        }
+        Ok(PyNetSearch { inner, last_hist: None })
     }
 
     /// `(n, cat bytes [n,views,CAT_LEN] int16, cont bytes [n,views,CONT_LEN] float32)` of up
@@ -1472,7 +1504,19 @@ impl PyNetSearch {
         compile_error!("NetSearch::collect hands out host-endian buffers; port the byte view first");
         let cat = unsafe { std::slice::from_raw_parts(c.cat.as_ptr() as *const u8, c.cat.len() * 2) };
         let cont = unsafe { std::slice::from_raw_parts(c.cont.as_ptr() as *const u8, c.cont.len() * 4) };
-        (c.n, PyBytes::new(py, cat), PyBytes::new(py, cont))
+        let out = (c.n, PyBytes::new(py, cat), PyBytes::new(py, cont));
+        self.last_hist = if c.hist_cat.is_empty() { None } else { Some((c.hist_cat, c.hist_cont)) };
+        out
+    }
+
+    /// `(hist_cat bytes [n,views,16,4] int16, hist_cont bytes [n,views,16,5] float32)` of the last
+    /// `collect` (None when the search was built with `hist` = 0). View 1 holds the mirrored rows.
+    fn take_hist<'py>(&mut self, py: Python<'py>) -> Option<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)> {
+        self.last_hist.take().map(|(c, f)| {
+            let cat = unsafe { std::slice::from_raw_parts(c.as_ptr() as *const u8, c.len() * 2) };
+            let cont = unsafe { std::slice::from_raw_parts(f.as_ptr() as *const u8, f.len() * 4) };
+            (PyBytes::new(py, cat), PyBytes::new(py, cont))
+        })
     }
 
     /// Completes the oldest collected batch: float32 little-endian bytes `policy1 [n,13]`,
