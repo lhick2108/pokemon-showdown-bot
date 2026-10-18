@@ -17,6 +17,7 @@ use poke_engine::features::{
 };
 use poke_engine::features_v4;
 use poke_engine::tokens;
+use poke_engine::netsearch;
 use poke_engine::learned::{Evaluator, Scratch};
 use poke_engine::mcts::{perform_mcts_export, ExportConfig, MctsResult, MctsSideResult};
 use poke_engine::prior::{
@@ -1416,6 +1417,136 @@ fn token_constants() -> Vec<(String, usize)> {
     .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Net-guided search (bead showdown-bot-589.68.5, docs/net-search.md)
+// ---------------------------------------------------------------------------
+
+type OptRow = (String, u32, f32, f32);
+
+/// Batched net-guided search over sampled worlds: `collect` returns the token buffers of the
+/// leaves to evaluate, `feed` takes the evaluations back. Tree work releases the GIL.
+#[pyclass(name = "NetSearch", module = "poke_engine")]
+struct PyNetSearch {
+    inner: netsearch::NetSearch,
+}
+
+fn le_f32(b: &[u8]) -> Vec<f32> {
+    b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+}
+
+#[pymethods]
+impl PyNetSearch {
+    /// `states`: serialized world states (side one = us). `reveal` (optional rows as in
+    /// `state_tokens_str`) scrubs the opponent in side one's token view only.
+    #[new]
+    #[pyo3(signature = (states, c_puct=2.0, fpu=0.0, depth=4, eps=0.01, seed=0, reveal=None, views=2))]
+    fn new(
+        states: Vec<String>,
+        c_puct: f32,
+        fpu: f32,
+        depth: u16,
+        eps: f32,
+        seed: u64,
+        reveal: RevealArg,
+        views: u8,
+    ) -> PyResult<PyNetSearch> {
+        if states.is_empty() {
+            return Err(value_err("NetSearch needs at least one world".to_string()));
+        }
+        if !(c_puct.is_finite() && c_puct > 0.0) || !fpu.is_finite() || !(0.0..1.0).contains(&eps) || depth == 0 || !(1..=2).contains(&views) {
+            return Err(value_err(format!(
+                "need c_puct > 0, finite fpu, 0 <= eps < 1, depth >= 1, views 1 or 2 (got c_puct={c_puct}, fpu={fpu}, eps={eps}, depth={depth}, views={views})"
+            )));
+        }
+        let worlds: Vec<State> = states.iter().map(|s| State::deserialize(s)).collect();
+        let params = netsearch::Params { c_puct, fpu, depth, eps, views };
+        Ok(PyNetSearch { inner: netsearch::NetSearch::new(worlds, params, reveal_of(reveal), seed) })
+    }
+
+    /// `(n, cat bytes [n,views,CAT_LEN] int16, cont bytes [n,views,CONT_LEN] float32)` of up
+    /// to `max_batch` leaves; view 0 is side one's, view 1 (when `views` = 2) side two's.
+    fn collect<'py>(&mut self, py: Python<'py>, max_batch: usize) -> (usize, Bound<'py, PyBytes>, Bound<'py, PyBytes>) {
+        let c = py.detach(|| self.inner.collect(max_batch));
+        // zero-copy views of the buffers (the wire format is little endian = the host's)
+        #[cfg(not(target_endian = "little"))]
+        compile_error!("NetSearch::collect hands out host-endian buffers; port the byte view first");
+        let cat = unsafe { std::slice::from_raw_parts(c.cat.as_ptr() as *const u8, c.cat.len() * 2) };
+        let cont = unsafe { std::slice::from_raw_parts(c.cont.as_ptr() as *const u8, c.cont.len() * 4) };
+        (c.n, PyBytes::new(py, cat), PyBytes::new(py, cont))
+    }
+
+    /// Completes the oldest collected batch: float32 little-endian bytes `policy1 [n,13]`,
+    /// `policy2 [n,13]` (each side's policy over its own action slots) and `value [n]`
+    /// (P(side one wins)).
+    fn feed(&mut self, py: Python<'_>, policy1: &[u8], policy2: &[u8], value: &[u8]) -> PyResult<()> {
+        let (p1, p2, v) = (le_f32(policy1), le_f32(policy2), le_f32(value));
+        let n = v.len();
+        if p1.len() != n * N_ACTIONS || p2.len() != n * N_ACTIONS {
+            return Err(value_err(format!(
+                "feed shapes: {} values, {} / {} policy entries (need {} each)",
+                n,
+                p1.len(),
+                p2.len(),
+                n * N_ACTIONS
+            )));
+        }
+        let evals: Vec<netsearch::Eval> = (0..n)
+            .map(|i| {
+                let mut e = netsearch::Eval { policy1: [0.0; N_ACTIONS], policy2: [0.0; N_ACTIONS], value: v[i] };
+                e.policy1.copy_from_slice(&p1[i * N_ACTIONS..(i + 1) * N_ACTIONS]);
+                e.policy2.copy_from_slice(&p2[i * N_ACTIONS..(i + 1) * N_ACTIONS]);
+                e
+            })
+            .collect();
+        py.detach(|| self.inner.feed(&evals)).map_err(value_err)
+    }
+
+    /// Leaves handed out and not yet fed.
+    fn pending(&self) -> usize {
+        self.inner.pending()
+    }
+
+    fn n_worlds(&self) -> usize {
+        self.inner.n_worlds()
+    }
+
+    /// Per world `(side one options, side two options, root value, root visits)`; an option
+    /// row is `(choice, visits, mean value from that side's view, prior)`.
+    #[allow(clippy::type_complexity)]
+    fn result(&self) -> Vec<(Vec<OptRow>, Vec<OptRow>, f32, u32)> {
+        (0..self.inner.n_worlds())
+            .map(|w| {
+                let (r1, r2) = self.inner.root(w);
+                let st = self.inner.root_state(w);
+                let conv = |rows: Vec<(MoveChoice, u32, f32, f32)>, side: &Side| -> Vec<OptRow> {
+                    rows.into_iter().map(|(c, n, q, p)| (movechoice_to_string(side, &c), n, q, p)).collect()
+                };
+                (conv(r1, &st.side_one), conv(r2, &st.side_two), self.inner.root_value(w), self.inner.root_visits(w))
+            })
+            .collect()
+    }
+
+    fn stats(&self) -> std::collections::HashMap<String, f64> {
+        let s = &self.inner.stats;
+        [
+            ("evals", s.evals as f64),
+            ("batches", s.batches as f64),
+            ("collisions", s.collisions as f64),
+            ("terminal", s.terminal as f64),
+            ("leaf_reuse", s.leaf_reuse as f64),
+            ("both_none", s.both_none as f64),
+            ("max_depth", s.max_depth as f64),
+            ("nodes", s.nodes as f64),
+            ("tree_ms", s.tree_ns as f64 / 1e6),
+            ("tokenise_ms", s.tokenise_ns as f64 / 1e6),
+            ("feed_ms", s.feed_ns as f64 / 1e6),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect()
+    }
+}
+
 #[pyfunction(name = "evaluate")]
 fn stock_evaluate(py_state: PyState) -> f32 {
     let state: State = py_state.into();
@@ -1848,6 +1979,7 @@ fn py_poke_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("N_POLICY_ACTIONS", N_ACTIONS)?;
     m.add("N_POLICY_AFEAT", N_AFEAT)?;
     m.add("N_POLICY_EMB", N_EMB)?;
+    m.add_class::<PyNetSearch>()?;
     m.add_class::<PyState>()?;
     m.add_class::<PySide>()?;
     m.add_class::<PySideConditions>()?;

@@ -85,6 +85,10 @@ SPEC_KEYS = {
     # a no-search bot that plays the token transformer's policy head (players.tokenpolicy):
     # argmax unless temp (or pick=sample) is given
     "token-policy": {"model": str, "device": str, "temp": float, "pick": str},
+    # Jaxcalibur-style net-guided search with the token transformer (players.netsearch, docs/net-search.md)
+    "net-search": {"model": str, "device": str, "worlds": int, "time_ms": int, "max_evals": int,
+                   "batch": int, "c_puct": float, "depth": int, "fpu": float, "vavg": int,
+                   "scrub": int, "pipe": int, "views": int, "mode": str},
     "search": {"evaluator": str, "scale": float, "time_ms": int, "worlds": int,
                "selection": str, "gamma": float, "mode": str,
                "tendency": str, "tkappa": float, "tdelta": float,
@@ -204,7 +208,16 @@ def parse_spec(text: str) -> BotSpec:
                 raise ValueError(f"selection must be ucb1, exp3 or rm in bot spec {raw!r}")
             if key == "gamma" and not (math.isfinite(parsed) and 0 < parsed <= 1):
                 raise ValueError(f"gamma must be in (0, 1] in bot spec {raw!r}")
-            if key == "mode" and parsed.lower() not in ("mixed", "argmax", "nash", "bayes"):
+            if key in ("max_evals", "batch", "depth", "pipe") and parsed < 1:
+                raise ValueError(f"{key} must be >= 1 in bot spec {raw!r}")
+            if key == "views" and parsed not in (1, 2):
+                raise ValueError(f"views must be 1 or 2 in bot spec {raw!r}")
+            if key in ("vavg", "scrub") and parsed not in (0, 1):
+                raise ValueError(f"{key} must be 0 or 1 in bot spec {raw!r}")
+            if key == "mode" and type_name == "net-search":
+                if parsed.lower() not in ("argmax", "mixed"):
+                    raise ValueError(f"mode must be argmax or mixed for net-search in bot spec {raw!r}")
+            elif key == "mode" and parsed.lower() not in ("mixed", "argmax", "nash", "bayes"):
                 raise ValueError(f"mode must be mixed, argmax, nash or bayes in bot spec {raw!r}")
             if key == "bargmax" and parsed not in (0, 1):
                 raise ValueError(f"bargmax must be 0 or 1 in bot spec {raw!r}")
@@ -262,12 +275,14 @@ def parse_spec(text: str) -> BotSpec:
                 parsed = parsed.lower()
             params.append((key, parsed.lower() if key in ("selection", "mode", "tendency", "endgame", "pick", "blend") else parsed))
     keys = dict(params)
-    if "prior" not in keys and "tok_prior" not in keys and any(
+    if type_name != "net-search" and "prior" not in keys and "tok_prior" not in keys and any(
             k in keys for k in ("prior_opp", "c_puct", "prior_eps", "fpu", "prior_human")):
         raise ValueError(f"prior_opp / c_puct / prior_eps / fpu / prior_human need prior=<path.ppol> "
                          f"or tok_prior=<token net .pt> in bot spec {raw!r}")
     if "tok_device" in keys and "tok_prior" not in keys:
         raise ValueError(f"tok_device needs tok_prior=<token net .pt> in bot spec {raw!r}")
+    if type_name == "net-search" and "model" not in keys:
+        raise ValueError(f"net-search spec {raw!r} needs model=<token net .pt>")
     if type_name == "token-policy" and "model" not in keys:
         raise ValueError(f"token-policy spec {raw!r} needs model=<token net .pt>")
     if "scale2" in keys and "ev2" not in keys:
@@ -867,6 +882,13 @@ def _make_player(spec: BotSpec, cfg: LeagueConfig, recorder, concurrency: int, s
             if spec.param(key) is not None:
                 kwargs[key] = spec.param(key)
         kwargs["seed"] = cfg.seed * 1000 + salt
+    if spec.type == "net-search":
+        kwargs["model"] = spec.param("model")
+        for key in ("device", "worlds", "time_ms", "max_evals", "batch", "c_puct", "depth", "fpu",
+                    "vavg", "scrub", "pipe", "views", "mode"):
+            if spec.param(key) is not None:
+                kwargs[key] = spec.param(key)
+        kwargs["seed"] = cfg.seed * 1000 + salt
     if spec.type == "humansearch":
         kwargs["model"] = spec.param("model")
         if spec.param("w") is not None:
@@ -1424,7 +1446,7 @@ def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     p.add_argument("--bots", help="comma-separated label=type[:key=value...] or plain type. Types: "
                    + ", ".join(sorted(bench.PLAYER_REGISTRY)) + ", foulplay. search keys: "
-                   "evaluator, scale, time_ms, worlds, selection (ucb1|exp3|rm), gamma, mode (mixed|argmax|nash|bayes), npc (matrix pseudocount), bargmax (0|1, bayes picks its best move), tendency (on|off), tkappa, tdelta, endgame (off|safest|nash), eg_alive, eg_side, eg_ms, eg_worlds, eg_cap, opp_model, opp_elo, exploit_delta, exploit_weight, exploit_kappa, exploit_gain (docs/human-policy.md), prior, prior_opp (self|none|human|path), c_puct, prior_eps, fpu, prior_human (docs/policy-prior.md). human keys: model, pick (sample|argmax), temp, elo. token-policy keys: model, device (auto|cpu|cuda), temp, pick; search bots also take tok_prior=<token net .pt>, tok_device (docs/token-net.md). humansearch: search keys + model, w (human weight 0..1), pick, blend (geo|mix), temp, elo. e.g. net=search-net:evaluator=m.pev:scale=4:endgame=safest:eg_alive=5:eg_ms=1500")
+                   "evaluator, scale, time_ms, worlds, selection (ucb1|exp3|rm), gamma, mode (mixed|argmax|nash|bayes), npc (matrix pseudocount), bargmax (0|1, bayes picks its best move), tendency (on|off), tkappa, tdelta, endgame (off|safest|nash), eg_alive, eg_side, eg_ms, eg_worlds, eg_cap, opp_model, opp_elo, exploit_delta, exploit_weight, exploit_kappa, exploit_gain (docs/human-policy.md), prior, prior_opp (self|none|human|path), c_puct, prior_eps, fpu, prior_human (docs/policy-prior.md). human keys: model, pick (sample|argmax), temp, elo. token-policy keys: model, device (auto|cpu|cuda), temp, pick; net-search keys: model, device, worlds, time_ms, max_evals, batch, c_puct, depth, fpu, vavg (0|1), scrub (0|1), pipe, views (1|2), mode (argmax|mixed) (docs/net-search.md); search bots also take tok_prior=<token net .pt>, tok_device (docs/token-net.md). humansearch: search keys + model, w (human weight 0..1), pick, blend (geo|mix), temp, elo. e.g. net=search-net:evaluator=m.pev:scale=4:endgame=safest:eg_alive=5:eg_ms=1500")
     p.add_argument("--games-per-pair", type=bench._positive_int, default=20)
     p.add_argument("--out", type=Path, help="output dir, e.g. data/league/<run-id>")
     p.add_argument("--rate-only", type=Path, metavar="DIR", help="recompute results from DIR/games.jsonl")
