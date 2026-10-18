@@ -30,6 +30,7 @@ pub mod selection;
 pub mod pokemon;
 pub mod prior;
 pub mod search;
+pub mod selfplay;
 pub mod state;
 pub mod tokens;
 

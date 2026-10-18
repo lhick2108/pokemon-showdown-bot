@@ -1,5 +1,5 @@
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyType};
+use pyo3::types::{PyBytes, PyDict, PyType};
 use pyo3::{pyfunction, pymethods, pymodule, wrap_pyfunction, Bound, PyResult};
 use std::collections::HashSet;
 
@@ -18,6 +18,7 @@ use poke_engine::features::{
 use poke_engine::features_v4;
 use poke_engine::tokens;
 use poke_engine::netsearch;
+use poke_engine::selfplay;
 use poke_engine::learned::{Evaluator, Scratch};
 use poke_engine::mcts::{perform_mcts_export, ExportConfig, MctsResult, MctsSideResult};
 use poke_engine::prior::{
@@ -1547,6 +1548,127 @@ impl PyNetSearch {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Self-play pool for RL (bead showdown-bot-589.68.6, docs/selfplay-ppo.md)
+// ---------------------------------------------------------------------------
+
+fn bytes_of<'py, T>(py: Python<'py>, v: &[T]) -> Bound<'py, PyBytes> {
+    #[cfg(not(target_endian = "little"))]
+    compile_error!("SelfPlayPool hands out host-endian buffers; port the byte view first");
+    let b = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) };
+    PyBytes::new(py, b)
+}
+
+/// N random-battle games simulated in Rust. `observe()` lists every (game, side) with a real
+/// decision, with the side's own scrubbed token buffers and history; `step(actions)` plays one
+/// action slot (0..13) per row, samples chance, and resets finished games.
+#[pyclass(name = "SelfPlayPool", module = "poke_engine")]
+struct PySelfPlayPool {
+    inner: selfplay::SelfPlayPool,
+}
+
+#[pymethods]
+impl PySelfPlayPool {
+    #[new]
+    #[pyo3(signature = (n_games=512, seed=0, threads=4, turn_cap=200))]
+    fn new(py: Python<'_>, n_games: usize, seed: u64, threads: usize, turn_cap: u32) -> PyResult<PySelfPlayPool> {
+        if n_games == 0 || threads == 0 || turn_cap == 0 {
+            return Err(value_err("SelfPlayPool needs n_games, threads and turn_cap >= 1".to_string()));
+        }
+        let inner = py.detach(|| selfplay::SelfPlayPool::new(n_games, seed, threads, turn_cap));
+        Ok(PySelfPlayPool { inner })
+    }
+
+    /// dict of little-endian byte buffers for the `n` rows needing a decision: `game` int32[n],
+    /// `side` uint8[n] (0 = side one), `turn` int32[n], `cat` int16[n,CAT_LEN], `cont`
+    /// float32[n,CONT_LEN] (tokens.layout), `hist_cat` int16[n,16,4], `hist_cont` float32[n,16,5],
+    /// `legal` uint8[n,13] (the row's legal action slots).
+    fn observe<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let o = py.detach(|| self.inner.observe());
+        let n = o.rows.len();
+        let game: Vec<i32> = o.rows.iter().map(|r| r.game as i32).collect();
+        let side: Vec<u8> = o.rows.iter().map(|r| r.side).collect();
+        let turn: Vec<i32> = o.rows.iter().map(|r| r.turn as i32).collect();
+        let d = PyDict::new(py);
+        d.set_item("n", n)?;
+        d.set_item("game", bytes_of(py, &game))?;
+        d.set_item("side", bytes_of(py, &side))?;
+        d.set_item("turn", bytes_of(py, &turn))?;
+        d.set_item("cat", bytes_of(py, &o.cat))?;
+        d.set_item("cont", bytes_of(py, &o.cont))?;
+        d.set_item("hist_cat", bytes_of(py, &o.hist_cat))?;
+        d.set_item("hist_cont", bytes_of(py, &o.hist_cont))?;
+        // legal action slots of each row's own side (uint8[n, 13]); also inside `cat` as `act_legal[0]`
+        let legal: Vec<u8> = (0..n)
+            .flat_map(|i| (0..N_ACTIONS).map(move |s| (i, s)))
+            .map(|(i, s)| (o.cat[i * tokens::CAT_LEN + tokens::O_ACT_LEGAL + s] > 0) as u8)
+            .collect();
+        d.set_item("legal", PyBytes::new(py, &legal))?;
+        Ok(d)
+    }
+
+    /// `actions`: one byte (action slot 0..12) per observed row, in row order. Returns
+    /// `(reward float32[n] bytes, done uint8[n] bytes, finished [(game, winner, turns)])`; the
+    /// reward is +1 / -1 / 0 for the row's side at the end of its game, else 0. `finished` lists
+    /// every game that ended in this step (winner 1 / 2, 0 = draw or turn cap), also those whose
+    /// loser/winner had no row in the step.
+    #[allow(clippy::type_complexity)]
+    fn step<'py>(&mut self, py: Python<'py>, actions: &[u8]) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, PyBytes>, Vec<(u32, i8, u32)>)> {
+        let r = py.detach(|| self.inner.step(actions)).map_err(value_err)?;
+        Ok((bytes_of(py, &r.reward), PyBytes::new(py, &r.done), r.finished))
+    }
+
+    fn n_games(&self) -> usize {
+        self.inner.n_games()
+    }
+
+    fn n_rows(&self) -> usize {
+        self.inner.rows().len()
+    }
+
+    fn set_threads(&mut self, n: usize) {
+        self.inner.set_threads(n);
+    }
+
+    /// Serialized truth state of one game (debugging, tests).
+    fn game_state(&self, game: usize) -> PyResult<String> {
+        self.inner.games.get(game).map(|g| g.state.serialize()).ok_or_else(|| value_err("no such game".to_string()))
+    }
+
+    fn stats(&self) -> std::collections::HashMap<String, f64> {
+        let s = &self.inner.stats;
+        [
+            ("games", s.games as f64),
+            ("draws", s.draws as f64),
+            ("cap_draws", s.cap_draws as f64),
+            ("p1_wins", s.p1_wins as f64),
+            ("p2_wins", s.p2_wins as f64),
+            ("panics", s.panics as f64),
+            ("illegal", s.illegal as f64),
+            ("steps", s.steps as f64),
+            ("decisions", s.decisions as f64),
+            ("turns_total", s.turns_total as f64),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect()
+    }
+}
+
+/// `n` serialized random-battle starting states (side one team 1, side two team 2) from `seed`.
+#[pyfunction]
+fn selfplay_teams(seed: u64, n: usize) -> Vec<String> {
+    selfplay::sample_states(seed, n).iter().map(|s| s.serialize()).collect()
+}
+
+/// `(species, sets, dropped species ids, dropped sets)` of the baked team data.
+#[pyfunction]
+fn selfplay_data_info() -> (usize, usize, Vec<String>, usize) {
+    let d = &*selfplay::TEAM_DATA;
+    (d.species.len(), d.species.iter().map(|s| s.sets.len()).sum(), d.dropped_species.clone(), d.dropped_sets)
+}
+
 #[pyfunction(name = "evaluate")]
 fn stock_evaluate(py_state: PyState) -> f32 {
     let state: State = py_state.into();
@@ -1980,6 +2102,9 @@ fn py_poke_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("N_POLICY_AFEAT", N_AFEAT)?;
     m.add("N_POLICY_EMB", N_EMB)?;
     m.add_class::<PyNetSearch>()?;
+    m.add_class::<PySelfPlayPool>()?;
+    m.add_function(wrap_pyfunction!(selfplay_teams, m)?)?;
+    m.add_function(wrap_pyfunction!(selfplay_data_info, m)?)?;
     m.add_class::<PyState>()?;
     m.add_class::<PySide>()?;
     m.add_class::<PySideConditions>()?;
