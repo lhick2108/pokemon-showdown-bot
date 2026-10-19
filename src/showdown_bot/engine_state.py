@@ -936,7 +936,45 @@ def _status_of(mon: Any) -> str:
     return _STATUS_IDS.get(status, "none") if status is not None else "none"
 
 
-def _volatiles_for(mon: Any) -> tuple[set[str], dict[str, int]]:
+# Charge moves that skip the charge turn in a weather: poke-env still leaves
+# ``preparing_move`` set because the protocol shows ``|-prepare|`` then the damage.
+_INSTANT_CHARGE_WEATHER = {
+    "solarbeam": ("sun", "harshsun"), "solarblade": ("sun", "harshsun"),
+    "electroshot": ("rain", "heavyrain"),
+}
+
+
+def charge_is_instant(battle: Any, mon: Any, move_id: str, *, is_ours: bool) -> bool:
+    """True when ``mon``'s ``preparing_move`` already executed (no charge turn pending).
+
+    Our own side: the request is authoritative. A really charging Pokemon is locked into
+    the one move, so a request offering several moves means the move fired at once (Solar
+    Beam in sun, Electro Shot in rain; a consumed Power Herb is cleared by poke-env's
+    ``end_item``). Otherwise (opponent, or no request) infer from the weather, unless
+    the Pokemon holds a Utility Umbrella.
+    """
+    if is_ours and battle is not None and mon is not None and getattr(mon, "active", False):
+        active = (getattr(battle, "last_request", None) or {}).get("active") or [{}]
+        moves = (active[0] or {}).get("moves") or ()
+        if len(moves) > 1:
+            return True
+        if len(moves) == 1:
+            return False
+    # A visible Power Herb consumption (``|-enditem|..|Power Herb``) leaves the item empty; poke-env
+    # only clears ``preparing_move`` for the id spelling "powerherb", not the logged "Power Herb".
+    if getattr(mon, "item", "unknown_item") in (None, ""):
+        return True
+    weathers = _INSTANT_CHARGE_WEATHER.get(move_id)
+    if not weathers or battle is None:
+        return False
+    if to_id(getattr(mon, "item", "") or "") == "utilityumbrella":
+        return False
+    return any(_WEATHER_IDS.get(w) in weathers for w in getattr(battle, "weather", {}) or {})
+
+
+def _volatiles_for(
+    mon: Any, battle: Any = None, *, is_ours: bool = False
+) -> tuple[set[str], dict[str, int]]:
     """Engine volatile ids and duration counters for an active Pokemon."""
     volatiles: set[str] = set()
     durations = {"confusion": 0, "encore": 0, "lockedmove": 0, "slowstart": 0, "taunt": 0, "yawn": 0}
@@ -960,8 +998,9 @@ def _volatiles_for(mon: Any) -> tuple[set[str], dict[str, int]]:
             durations["yawn"] = 1 if counter >= 1 else 0
     preparing = getattr(mon, "preparing_move", None)
     if preparing is not None:
-        charging = _CHARGING_VOLATILES.get(to_id(getattr(preparing, "id", preparing)))
-        if charging:
+        preparing_id = to_id(getattr(preparing, "id", preparing))
+        charging = _CHARGING_VOLATILES.get(preparing_id)
+        if charging and not charge_is_instant(battle, mon, preparing_id, is_ours=is_ours):
             volatiles.add(charging)
     return volatiles, durations
 
@@ -1064,6 +1103,10 @@ def _opponent_pokemon(slot: OpponentSlot, battle: Any) -> tuple[pe.Pokemon, list
     if mon is not None:
         if mon.item is None or mon.item == "":
             item = ""
+        elif mon.item != "unknown_item" and to_id(mon.item) != item:
+            # Revealed item differs from the world's (Trick / Switcheroo / Thief gave it a new
+            # one): trust the log, otherwise a stale Choice item keeps the lock.
+            item = to_id(mon.item)
         if mon.is_terastallized and mon.tera_type is not None:
             tera_type = _type_id(mon.tera_type)
         else:
@@ -1295,7 +1338,7 @@ def _make_side(
     toxic_count = 0
     protect_counter = 0
     if active_mon is not None and not active_mon.fainted:
-        volatiles, durations = _volatiles_for(active_mon)
+        volatiles, durations = _volatiles_for(active_mon, battle, is_ours=is_ours)
         if _ENGINE_TRANSFORMS and getattr(active_mon, "transformed", False):
             # Imposter / Transform already happened: it must not re-copy, and
             # nothing may copy-from a transformed Pokemon (Showdown's rules).

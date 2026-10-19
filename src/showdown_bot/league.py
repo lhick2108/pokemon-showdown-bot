@@ -97,7 +97,7 @@ SPEC_KEYS = {
                "tendency": str, "tkappa": float, "tdelta": float,
                "belief": int, "btau": float, "bfloor": float, "strat": int,
                 "escalate": int, "escalate_gap": float, "escalate_factor": float,
-                "escalate_steps": int, "escalate_cap_ms": int, "prune_noop": int, "noop_switches": int,
+                "escalate_steps": int, "escalate_cap_ms": int, "prune_noop": int, "noop_switches": int, "noop": str,
                 "tera_margin": float, "ev2": str, "scale2": float,
                 "material": float, "ko_tiebreak": float,
                 "npc": float, "bargmax": int,
@@ -108,7 +108,7 @@ SPEC_KEYS = {
                     "tendency": str, "tkappa": float, "tdelta": float,
                     "belief": int, "btau": float, "bfloor": float, "strat": int,
                     "escalate": int, "escalate_gap": float, "escalate_factor": float,
-                    "escalate_steps": int, "escalate_cap_ms": int, "prune_noop": int, "noop_switches": int,
+                    "escalate_steps": int, "escalate_cap_ms": int, "prune_noop": int, "noop_switches": int, "noop": str,
                     "tera_margin": float, "ev2": str, "scale2": float,
                 "material": float, "ko_tiebreak": float,
                     "npc": float, "bargmax": int,
@@ -118,12 +118,18 @@ SPEC_KEYS = {
                "tendency": str, "tkappa": float, "tdelta": float,
                "belief": int, "btau": float, "bfloor": float, "strat": int,
                 "escalate": int, "escalate_gap": float, "escalate_factor": float,
-                "escalate_steps": int, "escalate_cap_ms": int, "prune_noop": int, "noop_switches": int,
+                "escalate_steps": int, "escalate_cap_ms": int, "prune_noop": int, "noop_switches": int, "noop": str,
                 "tera_margin": float, "ev2": str, "scale2": float,
                 "material": float, "ko_tiebreak": float,
                 "npc": float, "bargmax": int,
                 **ENDGAME_KEYS, **EXPLOIT_KEYS, **PRIOR_KEYS},
 }
+
+
+# ``noop=`` spec key: no-op pruning off (default), strict (a move must also be a no-op against every
+# opponent switch) or relaxed (only against the opponent's current active staying in: Glare into an
+# already-paralysed target, a Normal move into a Ghost). Never prunes switches or every move.
+NOOP_MODES = ("off", "strict", "relaxed")
 
 
 @dataclass(frozen=True)
@@ -197,6 +203,12 @@ def parse_spec(text: str) -> BotSpec:
                 raise ValueError(f"bad value {value!r} for {key!r} in bot spec {raw!r}") from None
             if key in ("escalate", "prune_noop", "noop_switches") and parsed not in (0, 1):
                 raise ValueError(f"{key} must be 0 or 1 in bot spec {raw!r}")
+            if key == "noop":
+                if str(parsed).lower() not in NOOP_MODES:
+                    raise ValueError(f"noop must be off, strict or relaxed in bot spec {raw!r}")
+                keys = {i.partition("=")[0].strip() for i in _split_spec_params(rest)}
+                if keys & {"prune_noop", "noop_switches"}:
+                    raise ValueError(f"noop cannot be combined with prune_noop/noop_switches in {raw!r}")
             if key in ("escalate_gap", "tera_margin") and not (math.isfinite(parsed) and parsed >= 0):
                 raise ValueError(f"{key} must be >= 0 in bot spec {raw!r}")
             if key == "escalate_factor" and not (math.isfinite(parsed) and parsed >= 1):
@@ -803,6 +815,11 @@ def _quality_kwargs(spec: BotSpec) -> dict:
     for key in ("escalate", "prune_noop"):
         if spec.param(key) is not None:
             out[key] = bool(spec.param(key))
+    noop_mode = spec.param("noop")
+    if noop_mode is not None:  # off | strict | relaxed (see NOOP_MODES)
+        mode = str(noop_mode).lower()
+        out["prune_noop"] = mode != "off"
+        out["noop_vs_switches"] = mode != "relaxed"
     if spec.param("npc") is not None:  # nash / bayes matrix pseudocount
         out["nash_pseudocount"] = spec.param("npc")
     if spec.param("bargmax") is not None:  # mode=bayes: play the best move instead of sampling

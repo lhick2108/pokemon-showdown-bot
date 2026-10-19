@@ -276,3 +276,68 @@ def test_escalation_ignores_pool_queueing_delay(data, monkeypatch):
     asyncio.run(p.choose_move(_battle()))
     assert calls == [40, 120] and p.stats.escalations == 1
     pool.shutdown(wait=False, cancel_futures=True)
+
+
+# --- relaxed no-op pruning (spec key ``noop``) ------------------------------------------
+
+LOOP_TEAM = [
+    ("Dudunsparce", 80, "Leftovers", "Serene Grace",
+     ["Glare", "Headbutt", "Roost", "Earthquake"], "Ghost"),
+] + TEAM[1:]
+
+
+def _loop_state(player, opp="Gengar", details="Gengar, L80", status=None):
+    battle = make_battle(request_for(LOOP_TEAM))
+    event(battle, "start")
+    opp_switch(battle, opp, details)
+    if status:
+        event(battle, "-status", f"p2a: {opp}", status)
+    trackers = player.opponent_model.update(battle)
+    slots = engine_state.sample_opponent_team(battle, trackers, player._sampler, random.Random(0))
+    return engine_state.build_state(battle, slots).to_string()
+
+
+LOOP_CHOICES = ["glare", "headbutt", "roost", "earthquake", "switch greattusk"]
+
+
+def test_relaxed_noop_prunes_glare_into_paralysed_and_headbutt_into_ghost(player):
+    # Regression: battle 2700189152 (Glare x46 into paralysed Giratina, Headbutt x20 into a Ghost).
+    state = _loop_state(player, status="par")
+    strict = dq.noop_choices([state], LOOP_CHOICES)
+    relaxed = dq.noop_choices([state], LOOP_CHOICES, switches=False)
+    assert "glare" not in strict and "headbutt" not in strict  # a switch-in could be hit
+    assert {"glare", "headbutt"} <= relaxed
+    assert "earthquake" not in relaxed and "switch greattusk" not in relaxed  # real moves / switches stay
+
+
+def test_relaxed_noop_keeps_glare_on_a_healthy_target(player):
+    relaxed = dq.noop_choices([_loop_state(player)], LOOP_CHOICES, switches=False)
+    assert "glare" not in relaxed and "headbutt" in relaxed
+
+
+def test_relaxed_noop_never_prunes_every_move():
+    policy = {"glare": 0.6, "headbutt": 0.4}
+    out, pruned = dq.prune_policy(policy, {"glare", "headbutt"})
+    assert out == policy and pruned == []
+    out, pruned = dq.prune_policy({**policy, "switch greattusk": 0.1}, {"glare", "headbutt"})
+    assert out == {"switch greattusk": 0.1} and sorted(pruned) == ["glare", "headbutt"]
+
+
+def test_noop_spec_key_maps_to_search_config():
+    from showdown_bot import league
+
+    def kwargs(spec):
+        return league._quality_kwargs(league.parse_spec(spec))
+
+    assert kwargs("q=search:noop=relaxed") == {"prune_noop": True, "noop_vs_switches": False}
+    assert kwargs("q=search:noop=strict") == {"prune_noop": True, "noop_vs_switches": True}
+    assert kwargs("q=search:noop=off") == {"prune_noop": False, "noop_vs_switches": True}
+    assert kwargs("q=search:time_ms=500") == {}  # default unchanged
+    for kind in ("search-net",):
+        league.parse_spec(f"q={kind}:noop=relaxed" + (":evaluator=x.pev" if kind == "search-net" else ""))
+    with pytest.raises(ValueError):
+        league.parse_spec("q=search:noop=loose")
+    with pytest.raises(ValueError):
+        league.parse_spec("q=search:noop=relaxed:prune_noop=1")
+    with pytest.raises(ValueError):
+        league.parse_spec("q=search:noop=relaxed:noop=strict")
