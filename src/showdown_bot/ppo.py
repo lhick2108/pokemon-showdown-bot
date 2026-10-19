@@ -395,6 +395,8 @@ class Arena:
             drop = self.rng.choice(self.past_ids)
             self.past_ids.remove(drop)
             del self.opponents[drop]
+            # games still playing the dropped snapshot continue against the new one
+            self.opp[self.opp == drop] = pid
         self.opponents[pid] = Policy(copy_net, self.device, self.cfg.amp, self.cfg.infer_batch)
         self.past_ids.append(pid)
         return pid

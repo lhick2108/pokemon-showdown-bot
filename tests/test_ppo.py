@@ -190,6 +190,24 @@ def tiny_net(seed: int = 0):
     return token_net.TokenNet(cfg)
 
 
+def test_full_snapshot_pool_drops_one_and_keeps_games_playable(tmp_path):
+    cfg = ppo.PPOConfig(games=32, threads=2, rollout_steps=4, epochs=1, minibatch=64, value_warmup=0, max_past=2,
+                        p_self=0.0, p_anchor=0.0, amp=False, window=50)
+    learner, anchor = tiny_net(0), tiny_net(1)
+    tr = ppo.Trainer(cfg, learner, anchor, "cpu", tmp_path)
+    a = tr.arena
+    for _ in range(2):
+        a.add_snapshot(learner)
+    for g in range(cfg.games):
+        a._assign(g)
+    for _ in range(3):
+        a.add_snapshot(learner)
+        assert len(a.past_ids) == 2
+        live = set(np.unique(a.opp).tolist()) - {ppo.SELF, ppo.ANCHOR}
+        assert live <= set(a.opponents), "every game's opponent is still in the pool"
+        a.step(None)
+
+
 def test_trainer_updates_and_exports_a_loadable_checkpoint(tmp_path):
     cfg = ppo.PPOConfig(games=16, threads=2, rollout_steps=6, epochs=1, minibatch=64, value_warmup=1, ckpt_every=2,
                         snapshot_every=1, amp=False, window=50)
