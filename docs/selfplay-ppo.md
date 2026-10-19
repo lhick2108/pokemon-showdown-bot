@@ -213,6 +213,28 @@ from 1.46 to 0.68 in 25 minutes (a sampled-play win rate of 0.83 but only +61 El
 only getting sharper. A smaller net: add `--arch d192L4 --distill-updates 60` (distils from `--init` first, 2.70 M params).
 Larger games (1024) buy nothing: the GPU forward dominates. `--zero-history true` trains with padding history rows (what the live bots feed).
 
+### Asymmetric critic (`--critic asym`)
+
+`--critic shared` (default) is the behaviour above. With `--critic asym` the value baseline comes from a **separate** TokenNet
+(a copy of `--init`, own value head, own AdamW at `--critic-lr`, default 5e-5) that is fed the **unscrubbed** token view of the same
+decision: the same encoding and layout, but built from the pool's true game state (`SelfPlayPool.game_state` ->
+`poke_engine.state_tokens_str(state, side, None)`), so the opponent's real items, abilities, moves, Tera type and bench are visible.
+No engine change or wheel rebuild is needed (Python-only; ~0.11 ms per row single-threaded, small next to the GPU forward; a
+`observe(truth=True)` in Rust would only be a speed-up). The actor loss is `pg - ent + beta*KL` with no value term, so actor updates
+never fight the value regression; during `--value-warmup` only the critic trains and the actor does not move at all. Rollout values,
+GAE and bootstraps use the critic; `value_loss` and `explained_var` in `metrics.jsonl` are the critic's. Opponent snapshots and the
+anchor stay actor-only nets in the pool. `latest.pt` / `ckpt-*.pt` remain actor-only exports (load with `TokenPolicy.load`, net-search);
+the critic is `critic.pt` (+ optimizer in `state.pt`, restored by `--resume`). `--kl-off-after N` sets the anchor-KL weight to exactly 0
+from update N (`--kl-beta1 0` also reaches 0 at the end of the linear decay). Cost: one more d256 net in memory, one extra forward and
+backward per minibatch.
+
+```
+python -m showdown_bot.ppo train --init models\tok-d256.pt --out runs\ppo2 --minutes 600 ^
+  --critic asym --games 512 --threads 4 --rollout-steps 48 --epochs 2 --minibatch 512 --lr 2e-5 --critic-lr 5e-5 ^
+  --ent-coef 0.01 --kl-beta0 0.1 --kl-beta1 0.02 --kl-decay-updates 150 --kl-off-after 200 --value-warmup 30 ^
+  --snapshot-every 20 --max-past 6 --ckpt-every 20 --gpu-mem-gb 6
+```
+
 ## Evaluating a checkpoint against the gen7 search bot (league)
 
 Do this only when the machine is idle enough (`--search-workers 18`). Candidate first, baseline second; `--teams swap` is implied.

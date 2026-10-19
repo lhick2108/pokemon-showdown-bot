@@ -83,6 +83,11 @@ class PPOConfig:
     zero_history: bool = False  # feed padding history rows (what token-policy / net-search do today)
     arch: str = "init"
     distill_updates: int = 40
+    # critic: "shared" = the actor's own value head (default); "asym" = a separate net (initialised from the anchor)
+    # fed the UNSCRUBBED token view (the opponent's true items/abilities/moves/tera), trained only on the value loss
+    critic: str = "shared"
+    critic_lr: float = 5e-5
+    kl_off_after: int = 0  # >0: the anchor KL penalty is exactly 0 from this update on (0: never switched off)
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +169,8 @@ def value_target(returns: np.ndarray) -> np.ndarray:
 
 
 def kl_beta(update: int, cfg: PPOConfig) -> float:
+    if cfg.kl_off_after > 0 and update >= cfg.kl_off_after:
+        return 0.0
     f = min(1.0, update / max(1, cfg.kl_decay_updates))
     return cfg.kl_beta0 + (cfg.kl_beta1 - cfg.kl_beta0) * f
 
@@ -287,6 +294,18 @@ class Policy:
         self.amp = amp and self.device.type == "cuda"
         self.max_batch = max_batch
 
+    def value(self, batch: dict[str, Any]) -> np.ndarray:
+        """Value head only, in reward units (-1..1)."""
+        torch = self.torch
+        n = batch["mon_cat"].shape[0]
+        out = []
+        for s in range(0, n, self.max_batch):
+            sub = {k: v[s : s + self.max_batch] for k, v in batch.items()}
+            with torch.no_grad(), torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=self.amp):
+                o = self.net(sub)
+            out.append((2.0 * torch.sigmoid(o["value"].float()) - 1.0).cpu().numpy())
+        return np.concatenate(out) if out else np.zeros(0, np.float32)
+
     def forward(self, batch: dict[str, Any], greedy: bool = False, probs_out: bool = False) -> Any:
         torch = self.torch
         n = batch["mon_cat"].shape[0]
@@ -336,6 +355,8 @@ class Rollout:
     seat: np.ndarray
     opp: np.ndarray
     stats: dict[str, float] = field(default_factory=dict)
+    cat_t: np.ndarray | None = None  # unscrubbed (critic) token view, asymmetric critic only
+    cont_t: np.ndarray | None = None  # float16
 
     def __len__(self) -> int:
         return len(self.actions)
@@ -344,7 +365,7 @@ class Rollout:
 class Arena:
     """The pool plus the policy/opponent bookkeeping that turns it into PPO rollouts."""
 
-    def __init__(self, cfg: PPOConfig, learner: Any, anchor: Any, device: str) -> None:
+    def __init__(self, cfg: PPOConfig, learner: Any, anchor: Any, device: str, critic: Any = None) -> None:
         import poke_engine
 
         self.cfg = cfg
@@ -353,6 +374,7 @@ class Arena:
         self.batcher = TokenBatcher(device, cfg.zero_history)
         self.rng = random.Random(cfg.seed + 17)
         self.learner = Policy(learner, device, cfg.amp, cfg.infer_batch)
+        self.critic = Policy(critic, device, cfg.amp, cfg.infer_batch) if critic is not None else None
         self.opponents: dict[int, Policy] = {ANCHOR: Policy(anchor, device, cfg.amp, cfg.infer_batch)}
         self.past_ids: list[int] = []
         self._next_id = 1
@@ -401,6 +423,31 @@ class Arena:
         self.past_ids.append(pid)
         return pid
 
+    # --- privileged critic view
+    def truth_tokens(self, obs: Obs, rows: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Token buffers of ``rows`` from the TRUE game state (nothing scrubbed): same encoding and layout as
+        the actor's view, but the opponent's items, abilities, moves, Tera type and bench are real.
+        Python-only path (``game_state`` + ``state_tokens_str``)."""
+        import poke_engine
+
+        cat = np.zeros((len(rows), self.batcher.cat_len), np.int16)
+        cont = np.zeros((len(rows), self.batcher.cont_len), np.float16)
+        cache: dict[int, str] = {}
+        for j, r in enumerate(rows):
+            g = int(obs.game[r])
+            st = cache.get(g)
+            if st is None:
+                st = cache[g] = self.pool.game_state(g)
+            c, f, _ = poke_engine.state_tokens_str(st, int(obs.side[r]) + 1, None)
+            cat[j] = np.frombuffer(c, "<i2")
+            cont[j] = np.frombuffer(f, "<f4").astype(np.float16)
+        return cat, cont
+
+    def critic_values(self, obs: Obs, rows: np.ndarray, truth: tuple[np.ndarray, np.ndarray] | None = None) -> np.ndarray:
+        cat_t, cont_t = truth if truth is not None else self.truth_tokens(obs, rows)
+        b = self.batcher.to_device(cat_t, cont_t, obs.hist_cat[rows], obs.hist_cont[rows])
+        return self.critic.value(b)
+
     # --- one pool step
     def _decode(self) -> Obs:
         return Obs(self.pool.observe(), self.batcher.cat_len, self.batcher.cont_len)
@@ -442,6 +489,11 @@ class Arena:
 
         if store is not None and len(li):
             base = sum(len(a) for a in store["actions"])
+            if self.critic is not None:
+                ct, cf = self.truth_tokens(obs, li)
+                store["cat_t"].append(ct)
+                store["cont_t"].append(cf)
+                value[li] = self.critic_values(obs, li, (ct, cf))
             store["cat"].append(obs.cat[li].copy())
             store["cont"].append(obs.cont[li].astype(np.float16))
             store["hist_cat"].append(obs.hist_cat[li].copy())
@@ -486,7 +538,7 @@ class Arena:
 
     # --- a full rollout
     def rollout(self, steps: int) -> Rollout:
-        store: dict[str, Any] = {k: [] for k in ("cat", "cont", "hist_cat", "hist_cont", "actions", "logp", "value", "seat", "opp", "reward", "done", "next")}
+        store: dict[str, Any] = {k: [] for k in ("cat", "cont", "hist_cat", "hist_cont", "actions", "logp", "value", "seat", "opp", "reward", "done", "next", "cat_t", "cont_t")}
         store["_n"] = 0
         store["_next_flat"] = _Flat()
         store["_reward_flat"] = _Flat()
@@ -517,9 +569,9 @@ class Arena:
             if rows:
                 idx = np.array(rows)
                 batch = self.batcher.to_device(obs.cat[idx], obs.cont[idx], obs.hist_cat[idx], obs.hist_cont[idx])
-                f = self.learner.forward(batch)
+                bv = self.critic_values(obs, idx) if self.critic is not None else self.learner.forward(batch).value
                 for j, r in enumerate(rows):
-                    boot[want[(int(obs.game[r]), int(obs.side[r]))]] = f.value[j]
+                    boot[want[(int(obs.game[r]), int(obs.side[r]))]] = bv[j]
         wall = time.perf_counter() - t0
         ro = Rollout(
             cat=np.concatenate(store["cat"]),
@@ -535,6 +587,8 @@ class Arena:
             bootstrap=boot,
             seat=np.concatenate(store["seat"]),
             opp=np.concatenate(store["opp"]),
+            cat_t=np.concatenate(store["cat_t"]) if store["cat_t"] else None,
+            cont_t=np.concatenate(store["cont_t"]) if store["cont_t"] else None,
         )
         ro.stats = {
             "rollout_s": wall,
@@ -556,9 +610,11 @@ class _Flat(dict):
 
 
 class Trainer:
-    def __init__(self, cfg: PPOConfig, learner: Any, anchor: Any, device: str, out: Path) -> None:
+    def __init__(self, cfg: PPOConfig, learner: Any, anchor: Any, device: str, out: Path, critic: Any = None) -> None:
         import torch
 
+        if cfg.critic not in ("shared", "asym"):
+            raise ValueError(f"critic must be 'shared' or 'asym', got {cfg.critic!r}")
         self.torch = torch
         self.cfg = cfg
         self.device = device
@@ -571,7 +627,16 @@ class Trainer:
         params = [p for p in self.learner.parameters() if p.requires_grad]
         self.opt = torch.optim.AdamW(params, lr=cfg.lr, betas=cfg.betas, weight_decay=cfg.weight_decay)
         self.scaler = torch.amp.GradScaler("cuda", enabled=cfg.amp and device.startswith("cuda"))
-        self.arena = Arena(cfg, learner, anchor, device)
+        self.critic = None
+        if cfg.critic == "asym":
+            # a separate trunk + value head on the unscrubbed view, starting from the anchor's weights
+            self.critic = (critic if critic is not None else copy.deepcopy(anchor)).to(device).train()
+            for p in self.critic.parameters():
+                p.requires_grad_(True)
+            zero_dropout(self.critic)
+            self.opt_c = torch.optim.AdamW(self.critic.parameters(), lr=cfg.critic_lr, betas=cfg.betas, weight_decay=cfg.weight_decay)
+            self.scaler_c = torch.amp.GradScaler("cuda", enabled=cfg.amp and device.startswith("cuda"))
+        self.arena = Arena(cfg, learner, anchor, device, self.critic)
         self.update = 0
         self.log_path = out / "metrics.jsonl"
         self.t_start = time.perf_counter()
@@ -585,12 +650,22 @@ class Trainer:
 
     def save_state(self) -> None:
         torch = self.torch
-        torch.save({"opt": self.opt.state_dict(), "update": self.update, "decisions": self.total_decisions}, self.out / "state.pt")
+        st = {"opt": self.opt.state_dict(), "update": self.update, "decisions": self.total_decisions}
+        if self.critic is not None:
+            # the critic is NOT part of latest.pt (that stays an actor-only TokenNet.export for token-policy / net-search)
+            self.critic.export(self.out / "critic.pt", extra={"update": self.update, "role": "asym-critic"})
+            st["opt_c"] = self.opt_c.state_dict()
+        torch.save(st, self.out / "state.pt")
 
     def resume(self) -> None:
         torch = self.torch
         st = torch.load(self.out / "state.pt", map_location="cpu", weights_only=False)
         self.opt.load_state_dict(st["opt"])
+        if self.critic is not None and (self.out / "critic.pt").exists():
+            blob = torch.load(self.out / "critic.pt", map_location="cpu", weights_only=False)
+            self.critic.load_state_dict(blob["state_dict"])
+            if "opt_c" in st:
+                self.opt_c.load_state_dict(st["opt_c"])
         self.update = int(st["update"])
         self.total_decisions = int(st["decisions"])
 
@@ -605,6 +680,7 @@ class Trainer:
         adv, ret = compute_gae(ro.reward, ro.value, ro.done, ro.next_idx, ro.bootstrap, cfg.gamma, cfg.lam)
         y = value_target(ret)
         warm = self.update < cfg.value_warmup
+        asym = self.critic is not None
         beta = kl_beta(self.update, cfg)
         dev = self.arena.batcher.device
         adv_t = torch.from_numpy(adv).to(dev)
@@ -627,18 +703,41 @@ class Trainer:
                     continue
                 b = self.arena.batcher.to_device(ro.cat[idx], ro.cont[idx], ro.hist_cat[idx], ro.hist_cont[idx])
                 it = torch.from_numpy(idx).to(dev)
-                with torch.autocast(device_type=dev.type, dtype=torch.float16, enabled=cfg.amp and dev.type == "cuda"):
+                amp_on = cfg.amp and dev.type == "cuda"
+                if asym:
+                    # separate critic on the unscrubbed view: value loss only; the actor never sees it
+                    bt = self.arena.batcher.to_device(ro.cat_t[idx], ro.cont_t[idx], ro.hist_cat[idx], ro.hist_cont[idx])
+                    with torch.autocast(device_type=dev.type, dtype=torch.float16, enabled=amp_on):
+                        co = self.critic(bt)
+                    vl = torch.nn.functional.binary_cross_entropy_with_logits(co["value"].float(), y_t[it])
+                    if torch.isfinite(vl):
+                        self.opt_c.zero_grad(set_to_none=True)
+                        self.scaler_c.scale(vl).backward()
+                        self.scaler_c.unscale_(self.opt_c)
+                        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), cfg.grad_clip)
+                        self.scaler_c.step(self.opt_c)
+                        self.scaler_c.update()
+                        agg["value_loss"] = agg.get("value_loss", 0.0) + float(vl.detach())
+                    del co, bt
+                    if warm:  # critic-only warm-up: the policy does not move at all
+                        cnt += 1
+                        continue
+                with torch.autocast(device_type=dev.type, dtype=torch.float16, enabled=amp_on):
                     o = self.learner(b)
                     with torch.no_grad():
                         ao = self.anchor(b)
                 legal = legal_mask(b)
                 terms = ppo_terms(o["policy"], legal, act_t[it], logp_t[it], adv_t[it], ao["policy"], cfg.clip)
-                vl = torch.nn.functional.binary_cross_entropy_with_logits(o["value"].float(), y_t[it])
-                if warm:
-                    # value-only warm-up: the shared trunk moves with the value loss, so keep the policy on the anchor
-                    loss = cfg.vf_coef * vl + cfg.warmup_kl * terms["kl_anchor"]
+                if asym:
+                    vl = torch.zeros((), device=dev)  # logged above
+                    loss = terms["pg"] - cfg.ent_coef * terms["entropy"] + beta * terms["kl_anchor"]
                 else:
-                    loss = terms["pg"] - cfg.ent_coef * terms["entropy"] + beta * terms["kl_anchor"] + cfg.vf_coef * vl
+                    vl = torch.nn.functional.binary_cross_entropy_with_logits(o["value"].float(), y_t[it])
+                    if warm:
+                        # value-only warm-up: the shared trunk moves with the value loss, so keep the policy on the anchor
+                        loss = cfg.vf_coef * vl + cfg.warmup_kl * terms["kl_anchor"]
+                    else:
+                        loss = terms["pg"] - cfg.ent_coef * terms["entropy"] + beta * terms["kl_anchor"] + cfg.vf_coef * vl
                 if not torch.isfinite(loss):
                     logger.warning("non-finite loss; skipping the minibatch")
                     self.opt.zero_grad(set_to_none=True)
@@ -671,6 +770,7 @@ class Trainer:
             minibatches=cnt,
             beta=beta,
             warmup=int(warm),
+            asym=int(asym),
             explained_var=ev,
             train_s=train_s,
             rollout_s=ro.stats["rollout_s"],

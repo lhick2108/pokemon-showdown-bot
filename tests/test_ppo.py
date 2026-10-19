@@ -272,3 +272,80 @@ def test_documented_evaluation_specs_parse():
     league.parse_spec(cand)
     league.parse_spec(best)
     league.parse_spec(r"cand=net-search:model=runs\ppo1\latest.pt:device=cuda:worlds=32:time_ms=1000:batch=256:c_puct=2:depth=4")
+
+
+# ------------------------------------------------------------------ asymmetric critic
+
+
+def test_kl_beta_switches_off():
+    cfg = ppo.PPOConfig(kl_beta0=0.1, kl_beta1=0.02, kl_decay_updates=10, kl_off_after=5)
+    assert ppo.kl_beta(4, cfg) > 0 and ppo.kl_beta(5, cfg) == 0.0 and ppo.kl_beta(50, cfg) == 0.0
+    assert ppo.kl_beta(50, ppo.PPOConfig(kl_beta1=0.0, kl_decay_updates=10)) == 0.0  # kl-beta1 0 already reaches beta 0
+
+
+def _asym_cfg(**kw):
+    base = dict(games=16, threads=2, rollout_steps=70, epochs=1, minibatch=64, value_warmup=1, ckpt_every=2,
+                snapshot_every=1, amp=False, window=50, critic="asym")
+    base.update(kw)
+    return ppo.PPOConfig(**base)
+
+
+def test_critic_view_is_unscrubbed(tmp_path):
+    tr = ppo.Trainer(_asym_cfg(), tiny_net(0), tiny_net(1), "cpu", tmp_path)
+    a = tr.arena
+    for _ in range(4):
+        a.step(None)
+    obs = a._decode()
+    rows = np.arange(obs.n)
+    cat_t, cont_t = a.truth_tokens(obs, rows)
+    assert cat_t.shape == obs.cat.shape and cont_t.shape == obs.cont.shape
+    known = LAY["mon_known"]["offset"]
+    k_act = obs.cat[:, known : known + 12 * 8].reshape(obs.n, 12, 8)
+    k_tru = cat_t[:, known : known + 12 * 8].reshape(obs.n, 12, 8)
+    assert (k_tru[:, :6] == k_act[:, :6]).all(), "own side identical in both views"
+    assert (k_tru[:, 6:, :] == 1).all(), "the whole opposing team is known in the critic view"
+    assert (k_act[:, 6:, :] == 0).any(), "while the actor view still hides part of it"
+    assert (cat_t != obs.cat).any()
+
+
+def test_shared_mode_has_no_critic(tmp_path):
+    cfg = ppo.PPOConfig(games=8, threads=1, rollout_steps=3, epochs=1, minibatch=32, value_warmup=0, amp=False, window=20)
+    tr = ppo.Trainer(cfg, tiny_net(0), tiny_net(1), "cpu", tmp_path)
+    assert tr.critic is None and tr.arena.critic is None
+    ro = tr.arena.rollout(3)
+    assert ro.cat_t is None and ro.cont_t is None
+    tr.train_step()
+    tr.save_state()
+    assert not (tmp_path / "critic.pt").exists()
+
+
+def test_asym_trainer_trains_critic_only_in_warmup_and_saves_separately(tmp_path):
+    cfg = _asym_cfg()
+    learner, anchor = tiny_net(0), tiny_net(1)
+    ppo.zero_dropout(learner)
+    tr = ppo.Trainer(cfg, learner, anchor, "cpu", tmp_path)
+    tr.arena.add_snapshot(learner)
+    actor0 = [p.detach().clone() for p in learner.parameters()]
+    crit0 = [p.detach().clone() for p in tr.critic.parameters()]
+    assert all((a == b).all() for a, b in zip(crit0, anchor.parameters())), "critic starts at the anchor"
+    m1 = tr.train_step()  # warm-up update
+    assert m1["warmup"] == 1 and m1["asym"] == 1
+    assert all((a == b).all() for a, b in zip(actor0, learner.parameters())), "actor untouched during warm-up"
+    assert any((a != b).any() for a, b in zip(crit0, tr.critic.parameters())), "critic trained"
+    rows = [m1] + [tr.train_step() for _ in range(2)]
+    for m in rows:
+        assert np.isfinite(m["value_loss"]) and np.isfinite(m["explained_var"]) and m["pool_illegal"] == 0
+    assert any((a != b).any() for a, b in zip(actor0, learner.parameters())), "actor moves after warm-up"
+    # actor checkpoint stays loadable by the policy loaders; the critic is a separate file
+    from showdown_bot import token_policy
+
+    token_policy.TokenPolicy.load(tmp_path / "latest.pt", device="cpu")
+    assert (tmp_path / "critic.pt").is_file() and (tmp_path / "state.pt").is_file()
+    # resume restores the critic and its optimizer
+    tr2 = ppo.Trainer(cfg, tiny_net(0), tiny_net(1), "cpu", tmp_path)
+    tr2.resume()
+    assert tr2.update == 2  # state.pt is written every ckpt_every=2 updates
+    saved = torch.load(tmp_path / "critic.pt", weights_only=False)["state_dict"]
+    for a, b in zip(saved.values(), tr2.critic.state_dict().values()):
+        assert torch.allclose(a.cpu().float(), b.cpu().float())
+    assert len(tr2.opt_c.state_dict()["state"]) > 0
