@@ -308,6 +308,39 @@ def test_critic_view_is_unscrubbed(tmp_path):
     assert (cat_t != obs.cat).any()
 
 
+def test_critic_view_is_taken_before_the_pool_steps(tmp_path):
+    """The stored critic tokens must describe the state the action was chosen in (regression: they were read
+    after pool.step, i.e. from the next state, so advantages credited the following decision)."""
+    tr = ppo.Trainer(_asym_cfg(), tiny_net(0), tiny_net(1), "cpu", tmp_path)
+    a = tr.arena
+    calls: list[str] = []
+    real_state, real_step = a.pool.game_state, a.pool.step
+
+    class Spy:
+        def __getattr__(self, name):
+            return getattr(real_pool, name)
+
+        def game_state(self, g):
+            calls.append("state")
+            return real_state(g)
+
+        def step(self, acts):
+            calls.append("step")
+            return real_step(acts)
+
+    real_pool = a.pool
+    a.pool = Spy()
+    store = {k: [] for k in ("cat", "cont", "hist_cat", "hist_cont", "cat_t", "cont_t", "actions", "logp", "value")}
+    try:
+        a.step(store)
+    except (KeyError, TypeError):
+        pass  # the rest of the bookkeeping is exercised elsewhere; only the call order matters here
+    finally:
+        a.pool = real_pool
+    assert "state" in calls and "step" in calls
+    assert calls.index("step") > max(i for i, c in enumerate(calls) if c == "state")
+
+
 def test_shared_mode_has_no_critic(tmp_path):
     cfg = ppo.PPOConfig(games=8, threads=1, rollout_steps=3, epochs=1, minibatch=32, value_warmup=0, amp=False, window=20)
     tr = ppo.Trainer(cfg, tiny_net(0), tiny_net(1), "cpu", tmp_path)

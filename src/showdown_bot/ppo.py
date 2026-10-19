@@ -480,6 +480,12 @@ class Arena:
             sub = {k: v[sel] for k, v in batch.items()}
             f = pol.forward(sub)
             actions[idx], logp[idx], value[idx] = f.actions, f.logp, f.value
+        truth = None
+        if store is not None and len(li) and self.critic is not None:
+            # the critic's view must come from the state the action was chosen in, i.e. BEFORE pool.step
+            # (afterwards game_state is the next state, or a fresh game when this one just ended)
+            truth = self.truth_tokens(obs, li)
+            value[li] = self.critic_values(obs, li, truth)
         t2 = time.perf_counter()
         _, _, finished = self.pool.step(actions.tobytes())
         t3 = time.perf_counter()
@@ -489,11 +495,9 @@ class Arena:
 
         if store is not None and len(li):
             base = sum(len(a) for a in store["actions"])
-            if self.critic is not None:
-                ct, cf = self.truth_tokens(obs, li)
-                store["cat_t"].append(ct)
-                store["cont_t"].append(cf)
-                value[li] = self.critic_values(obs, li, (ct, cf))
+            if truth is not None:
+                store["cat_t"].append(truth[0])
+                store["cont_t"].append(truth[1])
             store["cat"].append(obs.cat[li].copy())
             store["cont"].append(obs.cont[li].astype(np.float16))
             store["hist_cat"].append(obs.hist_cat[li].copy())
