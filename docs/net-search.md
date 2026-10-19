@@ -79,6 +79,11 @@ net-search:model=models\tok-d256.pt:device=cuda:worlds=32:time_ms=1000:max_evals
 | `pipe` | 1 | batches in flight (2: collect while the GPU runs); no measurable gain, the GPU is the bottleneck |
 | `views` | 2 | 2: run both sides' views; 1: side one only, opponent prior from the opponent head (faster, weaker) |
 | `mode` | `argmax` | `argmax` or `mixed` over the summed visits |
+| `fast` | 0 | 1: `fast_forward.FastForward` (fp16 weights, drops the masked history tokens when `hist=0`, CUDA graphs per padded shape, pinned buffers); same policy up to fp16 rounding |
+| `fp16res` | 0 | 1 (with `fast`): also compaction, last-layer pruning and an fp16 residual stream; fastest, tiny numeric drift |
+| `hist` | 0 | 0: masked history tokens (training-time padding); 1: live `BattleHistory` of the real battle (`history_tokens.py`) shared by all worlds; 2: 1 plus the per-world action rows the engine's `take_hist()` provides |
+| `scrub2` | 0 | 1: also scrub side two's view to what the OPPONENT has seen of us (`RevealTracker`) instead of showing it our whole team |
+| `tokthreads` | 1 | 1..4 threads for the Rust tokeniser (the GIL is released) |
 
 `showdown_bot.league.parse_spec` validates all of it (duplicate keys, unknown keys, ranges); `c_puct` and `fpu`
 do not require a `.ppol` for this type. The bot is registered as `net-search` in `bench.py` / `league.py`.
@@ -140,6 +145,46 @@ worse on this metric, so the defaults stay `scrub=1`, `views=2`.
 Live smoke (local server, `worlds=32`, `time_ms=1000`, `batch=256`, real net on CUDA, 2 games vs random): 2/2 won, 38 searches,
 0 errors, 7,080 evaluations and 30 batches per decision, 989 ms per search.
 
+### Speedups, history and side-two scrub (bead 589.68.7, engine sdb.25)
+
+Measured while a league SPRT used ~18 CPU cores and another process held the GPU at ~90% utilisation, so absolute
+numbers are lower than the table above (baseline 3.7k evals/s here vs 7.3k there); compare rows within this table
+only. Offline: 300 decisions, batch 256, time_ms 1000. Top-1 is against the recorded search argmax; n = 300 so the
+standard error is about 2.8 points (differences under ~5 points are noise); CE is the visit distribution's cross
+entropy to the target (lower is better).
+
+| config | evals/s | evals/dec | top-1 | CE |
+| --- | ---: | ---: | ---: | ---: |
+| baseline (pipe 1) | 3,702 | 3,778 | 0.643 | 1.370 |
+| `pipe=2` | 3,722 | 3,811 | 0.627 | 1.386 |
+| `fast=1 pipe=2` | 10,742 | 11,027 | 0.643 | 1.340 |
+| `fast=1 fp16res=1 pipe=2` | 16,745 | 16,871 | 0.637 | 1.317 |
+| `tokthreads=2` | 7,326 | 7,368 | 0.653 | 1.341 |
+| `hist=1` | 6,816 | 6,844 | 0.680 | 1.301 |
+| `hist=2` | 6,759 | 6,782 | 0.677 | 1.295 |
+| `scrub2=1` | 6,458 | 6,512 | 0.653 | 1.353 |
+| all (fast, pipe 2, hist 2, scrub2, tokthreads 2) | 13,825 | 13,959 | 0.657 | 1.280 |
+| all + `fp16res=1` | 15,195 | 15,308 | 0.663 | 1.277 |
+
+Raw net (no search), same 300 rows: top-1 0.607 / CE 1.408 with masked history, 0.620 / 1.357 with the real history
+(`--raw-hist 1`). Search lifts both; real history helps the raw net and the search by a similar amount (CE -0.03 to
+-0.07), top-1 gains are within noise except `hist` (+3 to +4 points). Throughput rows change evals per decision, not
+tree depth (about 3.97 everywhere), so more evals mostly mean better-converged visits (CE drops 1.37 -> 1.28).
+
+Forward microbench (`.cache/ns25/bench2.py`, interleaved, min of 12 rounds, ms per 256-leaf batch; GPU contended so
+the medians are 30-50% above the minima): eager autocast 41.8; fp16 weights 37.5; + drop history tokens 32.4; + CUDA
+graphs 24.2; compaction 29.6-29.9 (worse than graphs alone under contention); + last-layer pruning 28.0; + fp16
+residual 26.8. End to end `fast`+`fp16res` is about 4.5x the baseline offline throughput.
+
+**Live history gap / exporter leak.** The live `BattleHistory` is built from protocol events only. When the
+opponent's chosen move did not execute (asleep, flinch, full paralysis, KO'd before moving, etc.) the live row has
+no action (kind 0), while the training exporter wrote the RECORDED chosen action, which is information the
+live bot cannot see. Live is the correct behaviour (no hidden information) and must not guess. This is a leak in
+the exporter's history rows for future exports: they should only contain actions that were observable in the log.
+In the live-vs-exporter smoke (239 decisions, 3,824 rows) 96.9% of rows were identical; the differences were 95
+"action unknown on live side" (this leak), 9 different action, 8 own hp/faint numbers and 8 opponent actor species
+(0.2% of rows each; not investigated further, the smoke harness was not kept).
+
 ## How to SPRT
 
 Do not run these on a busy machine: each net-search decision uses a Rust thread for ~0.3 s and the GPU for ~0.7 s,
@@ -188,3 +233,14 @@ python -m showdown_bot.league --bots "cand=net-search:model=models\tok-d256.pt:d
   hidden for the side-one view.
 * Free descents (terminal or already-evaluated leaves) stop after 8 in a row per world per `collect`; very small
   trees (forced moves, last-Pokemon endgames) end early with fewer evaluations than the budget.
+
+### SPRT commands for the sped-up spec (589.68.7)
+
+NEW = `net-search:model=models\tok-d256.pt:device=cuda:worlds=32:time_ms=1000:batch=256:c_puct=2:depth=4:pipe=2:fast=1:fp16res=1:hist=2:scrub2=1:tokthreads=2`
+(wheel sdb.25 required; validated with `parse_spec`).
+
+```
+python -m showdown_bot.league --bots "cand=NEW,base=net-search:model=models\tok-d256.pt:device=cuda:worlds=32:time_ms=1000:batch=256:c_puct=2:depth=4" --sprt 0,21 --search-workers 18 --game-timeout 3600 --concurrency 1 --out data/league/sprt-ns25-vs-ns --seed 1
+python -m showdown_bot.league --bots "cand=NEW,best=search-net:scale=1.5:c_puct=2:prior=models\prior-gen56-h32.ppol:mode=argmax:time_ms=1000:worlds=4:evaluator=models\gen7-res-root-mlp16.pev" --sprt 0,21 --search-workers 18 --game-timeout 3600 --concurrency 1 --out data/league/sprt-ns25-vs-best --seed 1
+```
+(substitute the NEW spec text for `NEW`.)

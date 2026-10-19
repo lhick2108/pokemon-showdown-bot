@@ -84,11 +84,14 @@ SPEC_KEYS = {
     "human": {"model": str, "pick": str, "elo": str, "temp": float},
     # a no-search bot that plays the token transformer's policy head (players.tokenpolicy):
     # argmax unless temp (or pick=sample) is given
-    "token-policy": {"model": str, "device": str, "temp": float, "pick": str},
+    "token-policy": {"model": str, "device": str, "temp": float, "pick": str, "hist": int},
     # Jaxcalibur-style net-guided search with the token transformer (players.netsearch, docs/net-search.md)
     "net-search": {"model": str, "device": str, "worlds": int, "time_ms": int, "max_evals": int,
                    "batch": int, "c_puct": float, "depth": int, "fpu": float, "vavg": int,
-                   "scrub": int, "pipe": int, "views": int, "mode": str},
+                   "scrub": int, "pipe": int, "views": int, "mode": str,
+                   # 589.68.7: fast forward (CUDA graphs, token compaction), live history rows (1 root / 2 tree),
+                   # side-two scrub to what the opponent knows of our team, tokenisation threads
+                   "fast": int, "fp16res": int, "hist": int, "scrub2": int, "tokthreads": int},
     "search": {"evaluator": str, "scale": float, "time_ms": int, "worlds": int,
                "selection": str, "gamma": float, "mode": str,
                "tendency": str, "tkappa": float, "tdelta": float,
@@ -212,8 +215,12 @@ def parse_spec(text: str) -> BotSpec:
                 raise ValueError(f"{key} must be >= 1 in bot spec {raw!r}")
             if key == "views" and parsed not in (1, 2):
                 raise ValueError(f"views must be 1 or 2 in bot spec {raw!r}")
-            if key in ("vavg", "scrub") and parsed not in (0, 1):
+            if key in ("vavg", "scrub", "fast", "fp16res", "scrub2") and parsed not in (0, 1):
                 raise ValueError(f"{key} must be 0 or 1 in bot spec {raw!r}")
+            if key == "hist" and parsed not in ((0, 1, 2) if type_name == "net-search" else (0, 1)):
+                raise ValueError(f"hist must be {'0, 1 or 2' if type_name == 'net-search' else '0 or 1'} in bot spec {raw!r}")
+            if key == "tokthreads" and not 1 <= parsed <= 4:
+                raise ValueError(f"tokthreads must be 1..4 in bot spec {raw!r}")
             if key == "mode" and type_name == "net-search":
                 if parsed.lower() not in ("argmax", "mixed"):
                     raise ValueError(f"mode must be argmax or mixed for net-search in bot spec {raw!r}")
@@ -878,14 +885,14 @@ def _make_player(spec: BotSpec, cfg: LeagueConfig, recorder, concurrency: int, s
         kwargs["seed"] = cfg.seed * 1000 + salt
     if spec.type == "token-policy":
         kwargs["model"] = spec.param("model")
-        for key in ("device", "temp", "pick"):
+        for key in ("device", "temp", "pick", "hist"):
             if spec.param(key) is not None:
                 kwargs[key] = spec.param(key)
         kwargs["seed"] = cfg.seed * 1000 + salt
     if spec.type == "net-search":
         kwargs["model"] = spec.param("model")
         for key in ("device", "worlds", "time_ms", "max_evals", "batch", "c_puct", "depth", "fpu",
-                    "vavg", "scrub", "pipe", "views", "mode"):
+                    "vavg", "scrub", "pipe", "views", "mode", "fast", "fp16res", "hist", "scrub2", "tokthreads"):
             if spec.param(key) is not None:
                 kwargs[key] = spec.param(key)
         kwargs["seed"] = cfg.seed * 1000 + salt
@@ -1446,7 +1453,7 @@ def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     p.add_argument("--bots", help="comma-separated label=type[:key=value...] or plain type. Types: "
                    + ", ".join(sorted(bench.PLAYER_REGISTRY)) + ", foulplay. search keys: "
-                   "evaluator, scale, time_ms, worlds, selection (ucb1|exp3|rm), gamma, mode (mixed|argmax|nash|bayes), npc (matrix pseudocount), bargmax (0|1, bayes picks its best move), tendency (on|off), tkappa, tdelta, endgame (off|safest|nash), eg_alive, eg_side, eg_ms, eg_worlds, eg_cap, opp_model, opp_elo, exploit_delta, exploit_weight, exploit_kappa, exploit_gain (docs/human-policy.md), prior, prior_opp (self|none|human|path), c_puct, prior_eps, fpu, prior_human (docs/policy-prior.md). human keys: model, pick (sample|argmax), temp, elo. token-policy keys: model, device (auto|cpu|cuda), temp, pick; net-search keys: model, device, worlds, time_ms, max_evals, batch, c_puct, depth, fpu, vavg (0|1), scrub (0|1), pipe, views (1|2), mode (argmax|mixed) (docs/net-search.md); search bots also take tok_prior=<token net .pt>, tok_device (docs/token-net.md). humansearch: search keys + model, w (human weight 0..1), pick, blend (geo|mix), temp, elo. e.g. net=search-net:evaluator=m.pev:scale=4:endgame=safest:eg_alive=5:eg_ms=1500")
+                   "evaluator, scale, time_ms, worlds, selection (ucb1|exp3|rm), gamma, mode (mixed|argmax|nash|bayes), npc (matrix pseudocount), bargmax (0|1, bayes picks its best move), tendency (on|off), tkappa, tdelta, endgame (off|safest|nash), eg_alive, eg_side, eg_ms, eg_worlds, eg_cap, opp_model, opp_elo, exploit_delta, exploit_weight, exploit_kappa, exploit_gain (docs/human-policy.md), prior, prior_opp (self|none|human|path), c_puct, prior_eps, fpu, prior_human (docs/policy-prior.md). human keys: model, pick (sample|argmax), temp, elo. token-policy keys: model, device (auto|cpu|cuda), temp, pick, hist (0|1: live history rows); net-search keys: model, device, worlds, time_ms, max_evals, batch, c_puct, depth, fpu, vavg (0|1), scrub (0|1), pipe, views (1|2), mode (argmax|mixed), fast (0|1), fp16res (0|1), hist (0|1|2), scrub2 (0|1), tokthreads (1-4) (docs/net-search.md); search bots also take tok_prior=<token net .pt>, tok_device (docs/token-net.md). humansearch: search keys + model, w (human weight 0..1), pick, blend (geo|mix), temp, elo. e.g. net=search-net:evaluator=m.pev:scale=4:endgame=safest:eg_alive=5:eg_ms=1500")
     p.add_argument("--games-per-pair", type=bench._positive_int, default=20)
     p.add_argument("--out", type=Path, help="output dir, e.g. data/league/<run-id>")
     p.add_argument("--rate-only", type=Path, metavar="DIR", help="recompute results from DIR/games.jsonl")

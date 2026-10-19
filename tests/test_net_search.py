@@ -229,6 +229,127 @@ def test_real_net_on_a_real_state(states):
     assert 0 < extra["root_value"] < 1
 
 
+# ------------------------------------------------------------------ 589.68.7: fast forward, history, scrub2, threads
+
+has25 = hasattr(getattr(pe, "NetSearch", None), "take_hist")
+needs25 = pytest.mark.skipif(not has25, reason="engine wheel without sdb.25 (history / reveal2 / threads)")
+
+OLD_SPEC = r"net-search:model=models	ok-d256.pt:device=cuda:worlds=32:time_ms=1000:batch=256:c_puct=2:depth=4"
+NEW_SPEC = OLD_SPEC + ":pipe=2:fast=1:hist=2:scrub2=1:tokthreads=2"
+
+
+def test_new_keys_parse_and_old_spec_is_unchanged():
+    old, new = league.parse_spec("old=" + OLD_SPEC), league.parse_spec("new=" + NEW_SPEC)
+    assert [k for k, _ in old.params if k in ("fast", "hist", "scrub2", "tokthreads", "fp16res")] == []
+    assert (new.param("fast"), new.param("hist"), new.param("scrub2"), new.param("tokthreads")) == (1, 2, 1, 2)
+    league.parse_spec("tp=token-policy:model=m.pt:hist=1")
+
+
+@pytest.mark.parametrize("bad", [
+    "net-search:model=m.pt:hist=3", "net-search:model=m.pt:fast=2", "net-search:model=m.pt:scrub2=2",
+    "net-search:model=m.pt:tokthreads=0", "net-search:model=m.pt:tokthreads=5", "net-search:model=m.pt:fp16res=3",
+    "token-policy:model=m.pt:hist=2", "token-policy:model=m.pt:fast=1", "search-net:evaluator=x.pev:hist=1",
+])
+def test_new_keys_reject(bad):
+    with pytest.raises(ValueError):
+        league.parse_spec(bad)
+
+
+@needs25
+def test_engine_rejects_bad_new_arguments(states):
+    with pytest.raises(ValueError):
+        pe.NetSearch([states[0]], hist=3)
+    with pytest.raises(ValueError):
+        pe.NetSearch([states[0]], threads=9)
+    with pytest.raises(ValueError):
+        pe.NetSearch([states[0]], hist=1, hist_cat=b"\x00" * 5, hist_cont=b"\x00" * 7)
+
+
+@needs25
+def test_history_rows_reach_the_evaluator(tiny_net, states):
+    """hist=1 gives every leaf the root rows (side two mirrored); hist=2 pushes the simulated turns."""
+    pol = token_policy.TokenPolicy.load(tiny_net, "cpu")
+    hc = np.zeros((16, 4), np.int16)
+    hf = np.zeros((16, 5), np.float32)
+    hc[0] = (1, 1, 77, 5)
+    hc[1] = (2, 3, 66, 6)
+    hf[0] = (0.0625, -0.1, 0.0, 0.0, 0.0)
+    hf[1] = (0.0625, 0.0, -0.1, 0.0, 0.0)
+    for mode in (1, 2):
+        seen = []
+        searcher = nsr.NetSearcher(pol, worlds=2, time_ms=5000, max_evals=80, batch=16, depth=3, hist=mode)
+        orig = searcher.evaluator.evaluate
+
+        def spy(cat, cont, n, hist=None, _o=orig, _s=seen):
+            _s.append(None if hist is None else (np.frombuffer(hist[0], "<i2").reshape(n, 2, 16, 4).copy(),
+                                                 np.frombuffer(hist[1], "<f4").reshape(n, 2, 16, 5).copy()))
+            return _o(cat, cont, n, hist)
+
+        searcher.evaluator.evaluate = spy
+        policy, extra = searcher.search(states[:2], hist=(hc, hf))
+        assert policy and extra["drive"].evals == 80
+        assert all(h is not None for h in seen)
+        first_cat = seen[0][0]  # the roots
+        assert (first_cat[:, 0, 0] == (1, 1, 77, 5)).all() and (first_cat[:, 0, 1] == (2, 3, 66, 6)).all()
+        # side two sees the turn mirrored: its own action (the opponent's row) first, with the side ids flipped
+        assert (first_cat[:, 1, 0] == (1, 3, 66, 6)).all() and (first_cat[:, 1, 1] == (2, 1, 77, 5)).all()
+        deeper = np.concatenate([h[0] for h in seen[1:]])
+        if mode == 1:
+            assert (deeper[:, 0, 0] == (1, 1, 77, 5)).all()
+        else:
+            assert (deeper[:, 0, 2] == (1, 1, 77, 5)).any(), "the root rows move down behind the simulated turn"
+            assert (deeper[:, 0, 0, 0] == 1).all() and (deeper[:, 0, 1, 0] == 2).all()
+
+
+@needs25
+def test_scrub2_and_threads_change_only_what_they_should(states):
+    s = states[0]
+    base = pe.NetSearch([s])
+    n, cat, cont = base.collect(1)
+    scr = pe.NetSearch([s], reveal2=[])
+    n2, cat2, cont2 = scr.collect(1)
+    from showdown_bot import tokens as tk
+
+    lay = tk.layout()
+    meta = lay["meta"]["offset"]
+    c1 = np.frombuffer(cat, "<i2").reshape(2, -1)
+    c2 = np.frombuffer(cat2, "<i2").reshape(2, -1)
+    assert (c1[0] == c2[0]).all()  # side one's view is untouched
+    assert c1[1][meta + 2] == 0 and c2[1][meta + 2] == 1  # side two's view of our team is scrubbed
+    t1 = pe.NetSearch([s] * 8, seed=4)
+    t3 = pe.NetSearch([s] * 8, seed=4, threads=3)
+    assert t1.collect(8)[1:] == t3.collect(8)[1:]
+
+
+@needs25
+def test_search_with_everything_on_tiny_net(tiny_net, states):
+    pol = token_policy.TokenPolicy.load(tiny_net, "cpu")
+    searcher = nsr.NetSearcher(pol, worlds=4, time_ms=5000, max_evals=120, batch=16, depth=3, fast=True, hist=2,
+                               scrub2=True, tokthreads=2, pipe=2)
+    hist = (np.zeros((16, 4), np.int16), np.zeros((16, 5), np.float32))
+    policy, extra = searcher.search(states[:4], hist=hist, reveal2=[("x", [], False, False, False)])
+    legal = {c for s in states[:4] for c, _x in pe.policy_actions(pe.State.from_string(s), 1)}
+    assert policy and set(policy) <= legal and extra["drive"].evals == 120
+    assert abs(sum(policy.values()) - 1) < 1e-6
+
+
+def test_fast_evaluator_equals_eager_on_a_tiny_net(tiny_net, states):
+    pol = token_policy.TokenPolicy.load(tiny_net, "cpu")
+    slow = nsr.NetEvaluator(pol.net, "cpu")
+    fast = nsr.NetEvaluator(pol.net, "cpu", fast=True)
+    cats, conts = [], []
+    for s in states[:6]:
+        for side in (1, 2):
+            c, f, _ = pe.state_tokens_str(s, side, None, False)
+            cats.append(np.frombuffer(c, "<i2"))
+            conts.append(np.frombuffer(f, "<f4"))
+    cat, cont = np.stack(cats).tobytes(), np.stack(conts).tobytes()
+    a = [np.frombuffer(x, "<f4") for x in slow.evaluate(cat, cont, 6)]
+    b = [np.frombuffer(x, "<f4") for x in fast.evaluate(cat, cont, 6)]
+    for x, y in zip(a, b):
+        assert np.abs(x - y).max() < 3e-2  # bf16 autocast on the CPU against float32
+
+
 # ------------------------------------------------------------------ smoke game
 
 

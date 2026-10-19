@@ -6,6 +6,11 @@ Per decision it compares, by top-1 agreement with the recorded visit argmax:
   raw   the token net's policy (live path: recorded worlds, opponent scrubbed with the recorded ``opp_facts``)
   ns    ``NetSearcher`` on the recorded worlds (repeated up to ``--worlds``; every copy is its own tree)
 
+589.68.7 switches (all off = the sdb.24 numbers): ``--fast`` (CUDA graphs / compaction forward), ``--fp16res``,
+``--hist 1|2`` (the exporter's real 16 history rows of the decision as the root rows; 2 = plus the simulated turns),
+``--scrub2`` (side two's view of our team scrubbed to what the recorded peer knew of it), ``--tokthreads N``,
+``--raw-hist`` (the raw-net row also gets the real history).
+
 and reports throughput (evals/s, batches per decision) with the latency breakdown. Decisions are cached in
 ``--cache`` so config sweeps do not reload the recordings::
 
@@ -42,6 +47,8 @@ def load_rows(args: argparse.Namespace) -> list[dict]:
             "gen": r["gen"], "role": r["role"], "tag": r["tag"], "idx": r["idx"],
             "worlds": [w["state"] for w in d["worlds"]], "opp_facts": d["opp_facts"],
             "T": np.asarray(s["pol_target"], np.float32), "L": np.asarray(s["act_legal"][0] > 0),
+            "hist_cat": np.asarray(s["hist_cat"], np.int16), "hist_cont": np.asarray(s["hist_cont"], np.float32),
+            "us_facts": r.get("peer_facts"),
         })
     cache.parent.mkdir(parents=True, exist_ok=True)
     cache.write_bytes(pickle.dumps(rows))
@@ -58,7 +65,7 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--net", default=r"C:\Users\Lewis\pokemon-showdown-bot\models\tok-d256.pt")
     ap.add_argument("--device", default="cuda")
-    ap.add_argument("--cache", default=".cache/netsearch_offline_rows.pkl")
+    ap.add_argument("--cache", default=".cache/netsearch_offline_rows2.pkl")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--worlds", type=int, default=32)
     ap.add_argument("--time-ms", type=int, default=1000)
@@ -72,6 +79,12 @@ def main() -> None:
     ap.add_argument("--pipe", type=int, default=1)
     ap.add_argument("--views", type=int, default=2)
     ap.add_argument("--warmup", type=int, default=3)
+    ap.add_argument("--fast", type=int, default=0)
+    ap.add_argument("--fp16res", type=int, default=0)
+    ap.add_argument("--hist", type=int, default=0)
+    ap.add_argument("--scrub2", type=int, default=0)
+    ap.add_argument("--tokthreads", type=int, default=1)
+    ap.add_argument("--raw-hist", type=int, default=0)
     ap.add_argument("--out-json")
     args = ap.parse_args()
 
@@ -91,6 +104,7 @@ def main() -> None:
     searcher = nsr.NetSearcher(
         tp, worlds=args.worlds, time_ms=args.time_ms, max_evals=args.max_evals, batch=args.batch,
         c_puct=args.c_puct, depth=args.depth, fpu=args.fpu, vavg=bool(args.vavg), scrub=bool(args.scrub), pipe=args.pipe, views=args.views,
+        fast=bool(args.fast), fp16res=bool(args.fp16res), hist=args.hist, scrub2=bool(args.scrub2), tokthreads=args.tokthreads,
     )
     T = np.stack([r["T"] for r in rows])
     L = np.stack([r["L"] for r in rows])
@@ -99,17 +113,23 @@ def main() -> None:
     evals, batches, wall, coll, fwd, feed, tree, tokm = [], [], [], [], [], [], [], []
     maxd, depthn = [], []
     for w in range(args.warmup):  # CUDA / cudnn warm-up, not counted
-        searcher.search(rows[w % n]["worlds"] * 2, tokens.reveal_rows(rows[w % n]["opp_facts"]), time_ms=300)
+        wr = rows[w % n]
+        searcher.search(wr["worlds"] * 2, tokens.reveal_rows(wr["opp_facts"]), time_ms=300,
+                        hist=(wr["hist_cat"], wr["hist_cont"]) if args.hist else None,
+                        reveal2=tokens.reveal_rows(wr["us_facts"]) if (args.scrub2 and wr["us_facts"] is not None) else None)
     for i, r in enumerate(rows):
         reveal = tokens.reveal_rows(r["opp_facts"])
-        names, pol, legal = tp.predict_states(r["worlds"], reveal)
+        names, pol, legal = tp.predict_states(
+            r["worlds"], reveal, (r["hist_cat"], r["hist_cont"]) if args.raw_hist else None)
         vec = np.zeros(N_ACT)
         for p, lg in zip(pol, legal):
             vec += np.where(lg, p, 0.0) / len(pol)
         RAW[i] = vec / max(vec.sum(), 1e-12)
         slot = {c: j for j, c in enumerate(names[0]) if c}
         worlds = (r["worlds"] * (args.worlds // len(r["worlds"]) + 1))[: args.worlds]
-        policy, info = searcher.search(worlds, reveal)
+        policy, info = searcher.search(
+            worlds, reveal, hist=(r["hist_cat"], r["hist_cont"]) if args.hist else None,
+            reveal2=tokens.reveal_rows(r["us_facts"]) if (args.scrub2 and r["us_facts"] is not None) else None)
         for c, p in policy.items():
             if c in slot:
                 NS[i, slot[c]] = p
