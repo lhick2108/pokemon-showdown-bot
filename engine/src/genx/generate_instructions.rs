@@ -28,6 +28,7 @@ use crate::pokemon::PokemonName;
 use crate::instruction::{ChangeAbilityInstruction, ToggleTerastallizedInstruction};
 use crate::instruction::{DecrementFutureSightInstruction, FormeChangeInstruction};
 use crate::instruction::{DecrementPPInstruction, SetLastUsedMoveInstruction};
+use crate::instruction::{DisableMoveInstruction, EnableMoveInstruction};
 
 use super::damage_calc::calculate_futuresight_damage;
 use super::damage_calc::{calculate_damage, type_effectiveness_modifier, DamageRolls};
@@ -742,6 +743,36 @@ fn get_instructions_from_volatile_statuses(
         side.volatile_statuses
             .insert(volatile_status.volatile_status);
         incoming_instructions.instruction_list.push(ins);
+
+        // Disable (Cursed Body): the move the target just used, for 4 residuals including this
+        // turn's (Showdown duration 5, minus one when applied during the target's own move)
+        if volatile_status.volatile_status == PokemonVolatileStatus::DISABLE {
+            let slot = attacker_choice.move_index;
+            let side = state.get_side(&target_side);
+            let current = side.volatile_status_durations.disable;
+            let start = 4 * 4 + slot as i8;
+            side.volatile_status_durations.disable = start;
+            incoming_instructions
+                .instruction_list
+                .push(Instruction::ChangeVolatileStatusDuration(
+                    ChangeVolatileStatusDurationInstruction {
+                        side_ref: target_side,
+                        volatile_status: PokemonVolatileStatus::DISABLE,
+                        amount: start - current,
+                    },
+                ));
+            let active = side.get_active();
+            if !active.moves[&slot].disabled {
+                active.moves[&slot].disabled = true;
+                incoming_instructions
+                    .instruction_list
+                    .push(Instruction::DisableMove(DisableMoveInstruction {
+                        side_ref: target_side,
+                        move_index: slot,
+                    }));
+            }
+            return;
+        }
 
         // timed volatiles: remaining turns (Showdown `duration`; ticks down in the residual step)
         let start = match volatile_status.volatile_status {
@@ -2465,6 +2496,23 @@ pub fn generate_instructions_from_move(
     }
 
     if cannot_use_move(state, &choice, &attacking_side) {
+        // A move aimed at a target that fainted earlier in the turn fails for lack of a target
+        // after Showdown has already deducted its PP (`[notarget]`), unless the user could not
+        // act at all (asleep / frozen / flinched: BeforeMove, no PP).
+        let (attacker_side, defender_side) = state.get_both_sides_immutable(&attacking_side);
+        let attacker = attacker_side.get_active_immutable();
+        if defender_side.get_active_immutable().hp == 0
+            && choice.category != MoveCategory::Status
+            && !continuation_turn
+            && !choice.sleep_talk_move
+            && attacker.status != PokemonStatus::SLEEP
+            && attacker.status != PokemonStatus::FREEZE
+            && !attacker_side
+                .volatile_statuses
+                .contains(&PokemonVolatileStatus::FLINCH)
+        {
+            deduct_pp(state, &attacking_side, &choice, &mut incoming_instructions);
+        }
         state.reverse_instructions(&incoming_instructions.instruction_list);
         final_instructions.push(incoming_instructions);
         return;
@@ -3508,6 +3556,55 @@ fn add_end_of_turn_instructions(
         let side = state.get_side(side_ref);
         if side.get_active().hp == 0 {
             continue;
+        }
+
+        // Disable (residual order 17): ends after its turns, re-enabling the move
+        if side
+            .volatile_statuses
+            .contains(&PokemonVolatileStatus::DISABLE)
+            && side.volatile_status_durations.disable >= 4
+        {
+            let encoded = side.volatile_status_durations.disable;
+            let remaining = encoded - 4;
+            let new_value = if remaining < 4 { 0 } else { remaining };
+            incoming_instructions
+                .instruction_list
+                .push(Instruction::ChangeVolatileStatusDuration(
+                    ChangeVolatileStatusDurationInstruction {
+                        side_ref: *side_ref,
+                        volatile_status: PokemonVolatileStatus::DISABLE,
+                        amount: new_value - encoded,
+                    },
+                ));
+            side.volatile_status_durations.disable = new_value;
+            if new_value == 0 {
+                side.volatile_statuses
+                    .remove(&PokemonVolatileStatus::DISABLE);
+                incoming_instructions
+                    .instruction_list
+                    .push(Instruction::RemoveVolatileStatus(
+                        RemoveVolatileStatusInstruction {
+                            side_ref: *side_ref,
+                            volatile_status: PokemonVolatileStatus::DISABLE,
+                        },
+                    ));
+                let slot = match encoded % 4 {
+                    0 => PokemonMoveIndex::M0,
+                    1 => PokemonMoveIndex::M1,
+                    2 => PokemonMoveIndex::M2,
+                    _ => PokemonMoveIndex::M3,
+                };
+                let active = side.get_active();
+                if active.moves[&slot].disabled {
+                    active.moves[&slot].disabled = false;
+                    incoming_instructions
+                        .instruction_list
+                        .push(Instruction::EnableMove(EnableMoveInstruction {
+                            side_ref: *side_ref,
+                            move_index: slot,
+                        }));
+                }
+            }
         }
 
         if side

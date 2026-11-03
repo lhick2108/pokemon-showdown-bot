@@ -200,8 +200,17 @@ def sim_volatiles_to_engine(mon: dict, unrep: set, guess: set) -> tuple[set, dic
             dur["healblock"] = max(1, int(st.get("duration") or 5))
         elif vid == "throatchop" and ENGINE_HAS_DURATIONS:
             dur["throatchop"] = max(1, int(st.get("duration") or 2))
+        elif vid == "disable" and ENGINE_HAS_LAST_ITEM:
+            # sdb.28: turns_remaining * 4 + slot of the disabled move
+            slots = [to_id(m["id"]) for m in mon["moves"]]
+            mv = to_id(st.get("move") or "")
+            if mv in slots:
+                dur["disable"] = max(1, min(7, int(st.get("duration") or 4))) * 4 + slots.index(mv)
     if mon.get("abilityOnce") and engine_supports_volatile("typechange"):
         vols.add("typechange")
+    if mon.get("slowStart"):  # the engine's slowstart volatile = Showdown's ability counter
+        vols.add("slowstart")
+        dur["slowstart"] = int(mon["slowStart"])
     return vols, dur, sub_hp
 
 
@@ -468,6 +477,8 @@ def sim_expected(post: dict, pre_built: Built) -> dict:
                 vid = "transformed"
             if vid not in IGNORED_VOLATILES and not vid.startswith(("ability:", "item:")) and not act["fainted"]:
                 vols.add(vid)
+        if act.get("slowStart") and not act["fainted"]:
+            vols.add("slowstart")
         sc = {"spikes": 0, "toxic_spikes": 0, "stealth_rock": 0, "sticky_web": 0, "reflect": 0, "light_screen": 0,
               "aurora_veil": 0, "tailwind": 0, "safeguard": 0, "mist": 0, "lucky_chant": 0}
         for cid, st in sd["sideConditions"].items():

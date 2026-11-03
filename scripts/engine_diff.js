@@ -56,6 +56,8 @@ function dumpMon(p) {
 		transformed: !!p.volatiles['transform'],
 		// Protean / Libero (gen 9): once per switch-in, tracked in the ability state, not a volatile
 		abilityOnce: !!((p.abilityState || {}).protean || (p.abilityState || {}).libero),
+		// Slow Start (gen 9) is an ability-state counter, not a volatile: turns left (0 = over)
+		slowStart: p.ability === 'slowstart' ? ((p.abilityState || {}).counter || 0) : 0,
 	};
 }
 

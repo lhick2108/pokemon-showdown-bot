@@ -855,6 +855,9 @@ pub struct VolatileStatusDurations {
     pub healblock: i8,
     /// Throat Chop turns remaining (2). 0 with the volatile set is read as a fresh 2.
     pub throatchop: i8,
+    /// Disable (sdb.28, Cursed Body): `turns_remaining * 4 + move_slot` (slot 0-3 of the
+    /// disabled move), 0 when not disabled. Serialized after `throatchop` only when non-zero.
+    pub disable: i8,
 }
 
 impl Default for VolatileStatusDurations {
@@ -868,6 +871,7 @@ impl Default for VolatileStatusDurations {
             yawn: 0,
             healblock: 0,
             throatchop: 0,
+            disable: 0,
         }
     }
 }
@@ -883,6 +887,7 @@ impl VolatileStatusDurations {
             ("yawn", self.yawn),
             ("healblock", self.healblock),
             ("throatchop", self.throatchop),
+            ("disable", self.disable),
         ];
 
         let mut output = String::new();
@@ -904,7 +909,12 @@ impl VolatileStatusDurations {
             "{};{};{};{};{};{}",
             self.confusion, self.encore, self.lockedmove, self.slowstart, self.taunt, self.yawn
         );
-        if self.healblock != 0 || self.throatchop != 0 {
+        if self.disable != 0 {
+            format!(
+                "{};{};{};{}",
+                base, self.healblock, self.throatchop, self.disable
+            )
+        } else if self.healblock != 0 || self.throatchop != 0 {
             format!("{};{};{}", base, self.healblock, self.throatchop)
         } else {
             base
@@ -916,6 +926,7 @@ impl VolatileStatusDurations {
         VolatileStatusDurations {
             healblock: extra(6),
             throatchop: extra(7),
+            disable: extra(8),
             confusion: split[0].parse::<i8>().unwrap(),
             encore: split[1].parse::<i8>().unwrap(),
             lockedmove: split[2].parse::<i8>().unwrap(),
@@ -1734,6 +1745,9 @@ impl State {
             }
             PokemonVolatileStatus::THROATCHOP => {
                 side.volatile_status_durations.throatchop += amount;
+            }
+            PokemonVolatileStatus::DISABLE => {
+                side.volatile_status_durations.disable += amount;
             }
             _ => panic!(
                 "Invalid volatile status for increment_volatile_status_duration: {:?}",

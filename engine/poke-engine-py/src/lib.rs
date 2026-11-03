@@ -388,6 +388,8 @@ pub struct PyVolatileStatusDurations {
     pub yawn: i8,
     pub healblock: i8,
     pub throatchop: i8,
+    /// sdb.28: Disable as `turns_remaining * 4 + move_slot`, 0 = none
+    pub disable: i8,
 }
 
 impl From<VolatileStatusDurations> for PyVolatileStatusDurations {
@@ -401,6 +403,7 @@ impl From<VolatileStatusDurations> for PyVolatileStatusDurations {
             yawn: other.yawn,
             healblock: other.healblock,
             throatchop: other.throatchop,
+            disable: other.disable,
         }
     }
 }
@@ -416,6 +419,7 @@ impl Into<VolatileStatusDurations> for PyVolatileStatusDurations {
             yawn: self.yawn,
             healblock: self.healblock,
             throatchop: self.throatchop,
+            disable: self.disable,
         }
     }
 }
@@ -432,6 +436,7 @@ impl PyVolatileStatusDurations {
         yawn=0,
         healblock=0,
         throatchop=0,
+        disable=0,
     ))]
     fn new(
         confusion: i8,
@@ -442,6 +447,7 @@ impl PyVolatileStatusDurations {
         yawn: i8,
         healblock: i8,
         throatchop: i8,
+        disable: i8,
     ) -> PyVolatileStatusDurations {
         PyVolatileStatusDurations {
             confusion,
@@ -452,6 +458,7 @@ impl PyVolatileStatusDurations {
             yawn,
             healblock,
             throatchop,
+            disable,
         }
     }
 }

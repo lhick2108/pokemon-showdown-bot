@@ -22,6 +22,8 @@ class VolatileStatusDurations:
     :type healblock: int
     :param throatchop: Throat Chop turns remaining (sdb.22; 0 with the volatile set = fresh 2)
     :type throatchop: int
+    :param disable: Disable (sdb.28): ``turns_remaining * 4 + move_slot``, 0 when not disabled
+    :type disable: int
     """
 
     confusion: int
@@ -32,6 +34,7 @@ class VolatileStatusDurations:
     yawn: int
     healblock: int
     throatchop: int
+    disable: int
 
     def __init__(
         self,
@@ -43,6 +46,7 @@ class VolatileStatusDurations:
         yawn: int = 0,
         healblock: int = 0,
         throatchop: int = 0,
+        disable: int = 0,
     ) -> None: ...
 
 class SideConditions:

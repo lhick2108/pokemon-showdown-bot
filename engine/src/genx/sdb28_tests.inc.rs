@@ -380,6 +380,78 @@ fn test_sdb28_unburden_activates_when_the_item_is_lost() {
         .contains(&PokemonVolatileStatus::UNBURDEN));
 }
 
+// ---------------------------------------------------------------- Cursed Body / Disable
+
+#[test]
+fn test_sdb28_cursed_body_disables_the_move_for_four_residuals() {
+    let mut state = State::default();
+    state.side_two.get_active().ability = Abilities::CURSEDBODY;
+    state.side_two.get_active().hp = 500;
+    state.side_two.get_active().maxhp = 500;
+    let outcomes = sdb28_moves(&mut state, Choices::TACKLE, Choices::SPLASH);
+    let disabled: Vec<_> = outcomes
+        .iter()
+        .filter(|(_, s)| {
+            s.side_one
+                .volatile_statuses
+                .contains(&PokemonVolatileStatus::DISABLE)
+        })
+        .collect();
+    let p: f32 = disabled.iter().map(|(p, _)| p).sum();
+    assert!((p - 30.0).abs() < 0.5, "{p}");
+    let mut s = disabled[0].1.clone();
+    assert!(s.side_one.get_active_immutable().moves.m0.disabled);
+    // after this turn's residual 3 turns remain (encoded 3 * 4 + slot 0)
+    assert_eq!(s.side_one.volatile_status_durations.disable, 12);
+    for turn in 0..3 {
+        assert!(s.side_one.get_active_immutable().moves.m0.disabled, "turn {turn}");
+        let next = sdb28_turn(
+            &mut s,
+            MoveChoice::Move(PokemonMoveIndex::M1),
+            MoveChoice::Move(PokemonMoveIndex::M0),
+        );
+        s = next[0].1.clone();
+    }
+    assert!(!s.side_one.get_active_immutable().moves.m0.disabled);
+    assert!(!s
+        .side_one
+        .volatile_statuses
+        .contains(&PokemonVolatileStatus::DISABLE));
+    assert_eq!(s.side_one.volatile_status_durations.disable, 0);
+}
+
+#[test]
+fn test_sdb28_disable_duration_serializes() {
+    let mut state = State::default();
+    state.side_one.volatile_status_durations.disable = 13;
+    let ser = state.serialize();
+    let back = State::deserialize(&ser);
+    assert_eq!(back.side_one.volatile_status_durations.disable, 13);
+    assert_eq!(back.serialize(), ser);
+}
+
+// ---------------------------------------------------------------- PP vs a fainted target
+
+#[test]
+fn test_sdb28_pp_is_spent_on_a_target_that_fainted_earlier_in_the_turn() {
+    // side one uses Healing Wish first (faints), side two's Tackle has no target but costs PP
+    let mut state = State::default();
+    state.side_one.get_active().speed = 200;
+    state.side_one.pokemon.pkmn[1].hp = 100;
+    set_move(&mut state.side_one, PokemonMoveIndex::M0, Choices::HEALINGWISH, 16);
+    set_move(&mut state.side_two, PokemonMoveIndex::M0, Choices::TACKLE, 35);
+    state.side_two.get_active().moves.m0.max_pp = 56;
+    let outcomes = sdb28_turn(
+        &mut state,
+        MoveChoice::Move(PokemonMoveIndex::M0),
+        MoveChoice::Move(PokemonMoveIndex::M0),
+    );
+    for (_, s) in outcomes {
+        assert_eq!(s.side_one.get_active_immutable().hp, 0);
+        assert_eq!(s.side_two.get_active_immutable().moves.m0.pp, 34);
+    }
+}
+
 #[test]
 fn test_sdb28_last_item_serialization_is_backward_compatible() {
     let mut state = State::default();
