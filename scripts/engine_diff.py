@@ -102,6 +102,18 @@ def _wheel_supports_sdb22() -> tuple[bool, bool]:
 ENGINE_HAS_DURATIONS, ENGINE_HAS_MAX_PP = _wheel_supports_sdb22()
 
 
+def _wheel_supports_last_item() -> bool:
+    """`Pokemon(last_item=)` (Harvest's regrowable berry) is available (>= sdb.28)."""
+    try:
+        pe.Pokemon(last_item="sitrusberry")
+        return True
+    except TypeError:
+        return False
+
+
+ENGINE_HAS_LAST_ITEM = _wheel_supports_last_item()
+
+
 def engine_supports_volatile(name: str) -> bool:
     ok = _VOL_OK.get(name)
     if ok is None:
@@ -236,6 +248,9 @@ def build_pokemon(m: dict, req_moves: list | None, unrep: set, guess: set):
         weight_kg=float(m["weightkg"]), terastallized=bool(m["terastallized"]),
         tera_type=to_id(m["teraType"]) or "typeless", moves=moves, times_attacked=int(m["timesAttacked"]),
     )
+    last = to_id(m.get("lastItem") or "")
+    if ENGINE_HAS_LAST_ITEM and to_id(m["ability"]) == "harvest" and last.endswith("berry"):
+        kw["last_item"] = last  # the engine tracks the eaten berry for Harvest only (sdb.28)
     try:
         p = pe.Pokemon(**kw)
     except TypeError:  # older wheels have no times_attacked

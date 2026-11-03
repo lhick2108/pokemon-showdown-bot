@@ -31,13 +31,19 @@ function simpleState(o) {
 	return out;
 }
 
+// Stable identity of a team member: the set species (randbats has one per species). Not
+// `baseSpecies`, which permanent forme changes (Disguise, Tera Shift, Tera) rewrite mid-battle.
+function uidOf(p) {
+	return ((p.set && p.set.species) || p.baseSpecies.name).toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
 function dumpMon(p) {
 	if (p.status !== 'slp') p.restFlag = false;
 	const volatiles = {};
 	for (const id of Object.keys(p.volatiles)) volatiles[id] = simpleState(p.volatiles[id]);
 	const ss = p.statusState || {};
 	return {
-		uid: p.baseSpecies.id, sid: p.species.id, name: p.name, level: p.level,
+		uid: uidOf(p), sid: p.species.id, name: p.name, level: p.level,
 		hp: p.hp, maxhp: p.maxhp, fainted: p.fainted, active: p.isActive,
 		types: p.getTypes(false, true), baseTypes: p.baseSpecies.types.slice(),
 		ability: p.ability, baseAbility: p.baseAbility, item: p.item, lastItem: p.lastItem,
@@ -91,13 +97,13 @@ function pickAction(side, info, rng) {
 	const canSwitch = info.switches.length > 0 && !info.trapped;
 	if (canSwitch && rng.random() < 0.12) {
 		const i = info.switches[rng.random(info.switches.length)];
-		return {cmd: `switch ${i + 1}`, a: {type: 'switch', uid: side.pokemon[i].baseSpecies.id}};
+		return {cmd: `switch ${i + 1}`, a: {type: 'switch', uid: uidOf(side.pokemon[i])}};
 	}
 	const enabled = info.moves.map((m, i) => (m.disabled ? -1 : i)).filter((i) => i >= 0);
 	if (!enabled.length) {
 		if (canSwitch) {
 			const i = info.switches[rng.random(info.switches.length)];
-			return {cmd: `switch ${i + 1}`, a: {type: 'switch', uid: side.pokemon[i].baseSpecies.id}};
+			return {cmd: `switch ${i + 1}`, a: {type: 'switch', uid: uidOf(side.pokemon[i])}};
 		}
 		return {cmd: 'move 1', a: {type: 'move', id: info.moves[0].id, tera: false}};
 	}
@@ -110,7 +116,7 @@ function scriptedAction(side, info, cmd) {
 	const m = /^(move|switch) (\d+)( terastallize)?$/.exec(cmd);
 	if (!m) throw new Error('bad scripted command ' + cmd);
 	const i = +m[2] - 1;
-	if (m[1] === 'switch') return {cmd, a: {type: 'switch', uid: side.pokemon[i].baseSpecies.id}};
+	if (m[1] === 'switch') return {cmd, a: {type: 'switch', uid: uidOf(side.pokemon[i])}};
 	return {cmd, a: {type: 'move', id: info.moves[i].id, tera: !!m[3]}};
 }
 
@@ -148,7 +154,7 @@ function takeTurn(b, rng, scripted, extra) {
 			if (fi[k].kind !== 'switch') return;
 			const i = fi[k].switches[rng.random(fi[k].switches.length)];
 			if (i === undefined) return;
-			round[k] = {type: 'switch', uid: s.pokemon[i].baseSpecies.id};
+			round[k] = {type: 'switch', uid: uidOf(s.pokemon[i])};
 			cmds[k] = `switch ${i + 1}`;
 		});
 		if (!cmds.some(Boolean)) break;

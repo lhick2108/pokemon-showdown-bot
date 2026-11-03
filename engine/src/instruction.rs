@@ -95,6 +95,8 @@ pub enum Instruction {
     ToggleMegaEvolved(ToggleMegaEvolvedInstruction),
     TeamPreviewFaintIndex(SideReference, PokemonIndex),
     ToggleTeamPreview,
+    SetLastItem(SetLastItemInstruction),
+    ChangeMaxHp(ChangeStatInstruction),
 }
 
 impl fmt::Debug for Instruction {
@@ -364,6 +366,16 @@ impl fmt::Debug for Instruction {
             Instruction::ToggleTeamPreview => {
                 write!(f, "ToggleTeamPreview")
             }
+            Instruction::ChangeMaxHp(c) => {
+                write!(f, "ChangeMaxHp {:?}: {}", c.side_ref, c.amount)
+            }
+            Instruction::SetLastItem(i) => {
+                write!(
+                    f,
+                    "SetLastItem {:?}: {:?} -> {:?}",
+                    i.side_ref, i.previous_item, i.new_item
+                )
+            }
         }
     }
 }
@@ -469,6 +481,14 @@ pub struct ChangeItemInstruction {
     pub side_ref: SideReference,
     pub current_item: Items,
     pub new_item: Items,
+}
+
+/// The active Pokemon's `last_item` (the berry Harvest can regrow). Reversible: `previous_item`.
+#[derive(Debug, PartialEq, Clone)]
+pub struct SetLastItemInstruction {
+    pub side_ref: SideReference,
+    pub new_item: Items,
+    pub previous_item: Items,
 }
 
 #[derive(Debug, PartialEq, Clone)]

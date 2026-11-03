@@ -3,7 +3,7 @@
     ability_field_change_activation, ability_status_cure_residual,
     ability_weather_residual,
     ability_modify_attack_against, ability_modify_attack_being_used, ability_on_switch_in,
-    ability_on_switch_out, Abilities,
+    ability_on_switch_out, permanent_forme_change, Abilities,
 };
 use super::choice_effects::{
     charge_choice_to_volatile, choice_after_damage_hit, choice_before_move, choice_hazard_clear,
@@ -19,7 +19,8 @@ use crate::instruction::{
     ChangeSideConditionInstruction, ChangeTerrain, ChangeType,
     ChangeVolatileStatusDurationInstruction, ChangeWeather, DecrementRestTurnsInstruction,
     DecrementWishInstruction, HealInstruction, RemoveVolatileStatusInstruction,
-    SetSecondMoveSwitchOutMoveInstruction, SetSleepTurnsInstruction, ToggleBatonPassingInstruction,
+    SetLastItemInstruction, SetSecondMoveSwitchOutMoveInstruction, SetSleepTurnsInstruction,
+    ToggleBatonPassingInstruction,
     ToggleDamageDealtHitSubstituteInstruction, ToggleMegaEvolvedInstruction,
     ToggleShedTailingInstruction, ToggleTrickRoomInstruction,
 };
@@ -32,7 +33,7 @@ use super::damage_calc::calculate_futuresight_damage;
 use super::damage_calc::{calculate_damage, type_effectiveness_modifier, DamageRolls};
 use super::items::{
     item_before_move, item_end_of_turn, item_residual_heal, item_modify_attack_against, item_modify_attack_being_used,
-    item_on_switch_in, Items,
+    item_on_switch_in, record_eaten_berry, unnerves, Items,
 };
 use super::state::{MoveChoice, PokemonVolatileStatus, Terrain, Weather};
 use crate::choices::{Choice, MoveCategory};
@@ -1005,18 +1006,49 @@ fn get_instructions_from_status_effects(
         return;
     }
 
+    let foe_unnerves = unnerves(
+        state
+            .get_side_immutable(&target_side_ref.get_other_side())
+            .get_active_immutable(),
+    );
     let target_side = state.get_side(&target_side_ref);
     let target_side_active = target_side.active_index;
     let target_pkmn = target_side.get_active();
 
-    let instruction = if target_pkmn.item == Items::LUMBERRY {
+    // Lum / Chesto block the status and are eaten (Harvest remembers the berry)
+    if !foe_unnerves
+        && (target_pkmn.item == Items::LUMBERRY
+            || (target_pkmn.item == Items::CHESTOBERRY && status.status == PokemonStatus::SLEEP))
+    {
+        let berry = target_pkmn.item;
+        let mut extra = vec![];
+        target_pkmn.item = Items::NONE;
+        record_eaten_berry(target_pkmn, &target_side_ref, berry, &mut extra);
+        target_pkmn.item = berry;
+        if !extra.is_empty() {
+            // keep the original order: ChangeItem first, then SetLastItem
+            let ins = Instruction::ChangeItem(ChangeItemInstruction {
+                side_ref: target_side_ref,
+                current_item: berry,
+                new_item: Items::NONE,
+            });
+            target_pkmn.item = Items::NONE;
+            incoming_instructions.instruction_list.push(ins);
+            incoming_instructions.instruction_list.extend(extra);
+            return;
+        }
+    }
+    let instruction = if target_pkmn.item == Items::LUMBERRY && !foe_unnerves {
         target_pkmn.item = Items::NONE;
         Instruction::ChangeItem(ChangeItemInstruction {
             side_ref: target_side_ref,
             current_item: Items::LUMBERRY,
             new_item: Items::NONE,
         })
-    } else if target_pkmn.item == Items::CHESTOBERRY && status.status == PokemonStatus::SLEEP {
+    } else if target_pkmn.item == Items::CHESTOBERRY
+        && status.status == PokemonStatus::SLEEP
+        && !foe_unnerves
+    {
         target_pkmn.item = Items::NONE;
         Instruction::ChangeItem(ChangeItemInstruction {
             side_ref: target_side_ref,
@@ -2671,9 +2703,10 @@ fn get_effective_speed(state: &State, side_reference: &SideReference) -> i16 {
             boosted_speed *= 2.0
         }
         Abilities::UNBURDEN
-            if side
-                .volatile_statuses
-                .contains(&PokemonVolatileStatus::UNBURDEN) =>
+            if active_pkmn.item == Items::NONE
+                && side
+                    .volatile_statuses
+                    .contains(&PokemonVolatileStatus::UNBURDEN) =>
         {
             boosted_speed *= 2.0
         }
@@ -2967,13 +3000,16 @@ fn on_terrain_end(
     }
 }
 
+/// End-of-turn residuals. Mutates `state` along `incoming_instructions` (the caller reverses).
+/// Returns extra branches when a residual is random (Harvest): each is a complete instruction
+/// list for an alternative outcome, with its own percentage, NOT applied to `state`.
 fn add_end_of_turn_instructions(
     state: &mut State,
     mut incoming_instructions: &mut StateInstructions,
     first_move_side: &SideReference,
-) {
+) -> Vec<StateInstructions> {
     if state.side_one.force_switch || state.side_two.force_switch {
-        return;
+        return vec![];
     }
 
     let sides = [first_move_side, &first_move_side.get_other_side()];
@@ -3806,6 +3842,84 @@ fn add_end_of_turn_instructions(
         ability_end_of_turn(state, side_ref, &mut incoming_instructions);
     }
 
+    unburden_activation(state, incoming_instructions);
+    harvest_end_of_turn(state, sides, incoming_instructions)
+}
+
+/// Harvest (Showdown residual order 28.2): an itemless holder whose last eaten item was a berry
+/// regrows it, always in sun, otherwise with 50%. A regrown berry whose condition already holds
+/// (Sitrus at <= 1/2 HP, Lum while statused, ...) is eaten again right away (the `Update` event
+/// after the residuals). The main branch (`incoming_instructions`, applied to `state`) is the one
+/// where every roll succeeds; the other combinations are returned.
+fn harvest_end_of_turn(
+    state: &mut State,
+    sides: [&SideReference; 2],
+    incoming_instructions: &mut StateInstructions,
+) -> Vec<StateInstructions> {
+    let mut rolls: Vec<(f32, Vec<Instruction>)> = vec![];
+    let sun = matches!(state.weather.weather_type, Weather::SUN | Weather::HARSHSUN);
+    for side_ref in sides {
+        let active = state.get_side_immutable(side_ref).get_active_immutable();
+        if active.hp == 0
+            || active.ability != Abilities::HARVEST
+            || active.item != Items::NONE
+            || active.last_item == Items::NONE
+        {
+            continue;
+        }
+        let berry = active.last_item;
+        let mut block = StateInstructions::default();
+        block
+            .instruction_list
+            .push(Instruction::ChangeItem(ChangeItemInstruction {
+                side_ref: *side_ref,
+                current_item: Items::NONE,
+                new_item: berry,
+            }));
+        block
+            .instruction_list
+            .push(Instruction::SetLastItem(SetLastItemInstruction {
+                side_ref: *side_ref,
+                new_item: Items::NONE,
+                previous_item: berry,
+            }));
+        {
+            let active = state.get_side(side_ref).get_active();
+            active.item = berry;
+            active.last_item = Items::NONE;
+        }
+        item_end_of_turn(state, side_ref, &mut block);
+        rolls.push((if sun { 1.0 } else { 0.5 }, block.instruction_list));
+    }
+    if rolls.is_empty() {
+        return vec![];
+    }
+    let base = incoming_instructions.clone();
+    let mut extra = vec![];
+    let full = (1usize << rolls.len()) - 1;
+    for mask in 0..full {
+        let mut branch = base.clone();
+        let mut p = 1.0;
+        for (i, (chance, block)) in rolls.iter().enumerate() {
+            if mask & (1 << i) != 0 {
+                p *= chance;
+                branch.instruction_list.extend(block.iter().cloned());
+            } else {
+                p *= 1.0 - chance;
+            }
+        }
+        if p > 0.0 {
+            branch.update_percentage(p);
+            extra.push(branch);
+        }
+    }
+    let mut p = 1.0;
+    for (chance, block) in rolls {
+        p *= chance;
+        incoming_instructions.instruction_list.extend(block);
+    }
+    incoming_instructions.update_percentage(p);
+    extra
 }
 
 /// Spend PP for the move the attacker is using (Pressure on the target costs one more).
@@ -4089,6 +4203,54 @@ fn run_move(
     }
 }
 
+/// Unburden (Showdown `onAfterUseItem` / `onTakeItem`): the holder gets the `unburden` volatile
+/// (Speed x2 while it has no item) once it loses its item. Detected from this branch's
+/// instructions so every item-losing site (berries, gems, herbs, Knock Off, ...) is covered.
+fn unburden_activation(state: &mut State, instructions: &mut StateInstructions) {
+    for side_ref in [SideReference::SideOne, SideReference::SideTwo] {
+        let side = state.get_side_immutable(&side_ref);
+        let active = side.get_active_immutable();
+        if active.ability != Abilities::UNBURDEN
+            || active.item != Items::NONE
+            || active.hp <= 0
+            || side
+                .volatile_statuses
+                .contains(&PokemonVolatileStatus::UNBURDEN)
+        {
+            continue;
+        }
+        let mut lost = false;
+        for ins in instructions.instruction_list.iter().rev() {
+            match ins {
+                Instruction::Switch(sw) if sw.side_ref == side_ref => break,
+                Instruction::ChangeItem(c)
+                    if c.side_ref == side_ref
+                        && c.current_item != Items::NONE
+                        && c.new_item == Items::NONE =>
+                {
+                    lost = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if lost {
+            instructions
+                .instruction_list
+                .push(Instruction::ApplyVolatileStatus(
+                    ApplyVolatileStatusInstruction {
+                        side_ref,
+                        volatile_status: PokemonVolatileStatus::UNBURDEN,
+                    },
+                ));
+            state
+                .get_side(&side_ref)
+                .volatile_statuses
+                .insert(PokemonVolatileStatus::UNBURDEN);
+        }
+    }
+}
+
 fn after_move_finish(state: &mut State, final_instructions: &mut Vec<StateInstructions>) {
     for state_instructions in final_instructions.iter_mut() {
         state.apply_instructions(&state_instructions.instruction_list);
@@ -4117,6 +4279,7 @@ fn after_move_finish(state: &mut State, final_instructions: &mut Vec<StateInstru
                 }
             }
         }
+        unburden_activation(state, state_instructions);
         state.reverse_instructions(&state_instructions.instruction_list);
     }
 }
@@ -4348,6 +4511,42 @@ fn ogerpon_terastallize_effects(
     side_ref: SideReference,
     instructions: &mut StateInstructions,
 ) {
+    // Terapagos-Terastal becomes Terapagos-Stellar (Teraform Zero) when it Terastallizes, and
+    // Teraform Zero clears the weather and terrain
+    if state.get_side(&side_ref).get_active().id == PokemonName::TERAPAGOSTERASTAL {
+        permanent_forme_change(
+            state.get_side(&side_ref),
+            &side_ref,
+            PokemonName::TERAPAGOSSTELLAR,
+            Some(Abilities::TERAFORMZERO),
+            instructions,
+        );
+        if state.weather.weather_type != Weather::NONE {
+            instructions
+                .instruction_list
+                .push(Instruction::ChangeWeather(ChangeWeather {
+                    new_weather: Weather::NONE,
+                    new_weather_turns_remaining: 0,
+                    previous_weather: state.weather.weather_type,
+                    previous_weather_turns_remaining: state.weather.turns_remaining,
+                }));
+            state.weather.weather_type = Weather::NONE;
+            state.weather.turns_remaining = 0;
+        }
+        if state.terrain.terrain_type != Terrain::NONE {
+            instructions
+                .instruction_list
+                .push(Instruction::ChangeTerrain(ChangeTerrain {
+                    new_terrain: Terrain::NONE,
+                    new_terrain_turns_remaining: 0,
+                    previous_terrain: state.terrain.terrain_type,
+                    previous_terrain_turns_remaining: state.terrain.turns_remaining,
+                }));
+            state.terrain.terrain_type = Terrain::NONE;
+            state.terrain.turns_remaining = 0;
+        }
+        return;
+    }
     let (tera_forme, ability, stat) = match state.get_side(&side_ref).get_active().id {
         PokemonName::OGERPON => (
             PokemonName::OGERPONTEALTERA,
@@ -4612,6 +4811,7 @@ pub fn generate_instructions_from_move_pair(
                 branch_on_damage,
             );
 
+            let mut eot_extra = vec![];
             for state_instruction in state_instructions_vec.iter_mut() {
                 state.apply_instructions(&state_instruction.instruction_list);
                 if !(s1_replacing_fainted_pkmn
@@ -4619,10 +4819,15 @@ pub fn generate_instructions_from_move_pair(
                     || state.side_one.force_switch
                     || state.side_two.force_switch)
                 {
-                    add_end_of_turn_instructions(state, state_instruction, &SideReference::SideOne);
+                    eot_extra.extend(add_end_of_turn_instructions(
+                        state,
+                        state_instruction,
+                        &SideReference::SideOne,
+                    ));
                 }
                 state.reverse_instructions(&state_instruction.instruction_list);
             }
+            state_instructions_vec.extend(eot_extra);
         }
         SideMovesFirst::SideTwo => {
             handle_both_moves(
@@ -4634,6 +4839,7 @@ pub fn generate_instructions_from_move_pair(
                 &mut state_instructions_vec,
                 branch_on_damage,
             );
+            let mut eot_extra = vec![];
             for state_instruction in state_instructions_vec.iter_mut() {
                 state.apply_instructions(&state_instruction.instruction_list);
                 if !(s1_replacing_fainted_pkmn
@@ -4641,10 +4847,15 @@ pub fn generate_instructions_from_move_pair(
                     || state.side_one.force_switch
                     || state.side_two.force_switch)
                 {
-                    add_end_of_turn_instructions(state, state_instruction, &SideReference::SideTwo);
+                    eot_extra.extend(add_end_of_turn_instructions(
+                        state,
+                        state_instruction,
+                        &SideReference::SideTwo,
+                    ));
                 }
                 state.reverse_instructions(&state_instruction.instruction_list);
             }
+            state_instructions_vec.extend(eot_extra);
         }
         SideMovesFirst::SpeedTie => {
             let mut side_one_moves_first_instruction = incoming_instructions.clone();
@@ -4661,6 +4872,7 @@ pub fn generate_instructions_from_move_pair(
                 &mut state_instructions_vec,
                 branch_on_damage,
             );
+            let mut eot_extra = vec![];
             for state_instruction in state_instructions_vec.iter_mut() {
                 state.apply_instructions(&state_instruction.instruction_list);
                 if !(s1_replacing_fainted_pkmn
@@ -4668,10 +4880,15 @@ pub fn generate_instructions_from_move_pair(
                     || state.side_one.force_switch
                     || state.side_two.force_switch)
                 {
-                    add_end_of_turn_instructions(state, state_instruction, &SideReference::SideOne);
+                    eot_extra.extend(add_end_of_turn_instructions(
+                        state,
+                        state_instruction,
+                        &SideReference::SideOne,
+                    ));
                 }
                 state.reverse_instructions(&state_instruction.instruction_list);
             }
+            state_instructions_vec.extend(eot_extra);
 
             // side_two moves first
             let mut side_two_moves_first_si = Vec::with_capacity(4);
@@ -4684,6 +4901,7 @@ pub fn generate_instructions_from_move_pair(
                 &mut side_two_moves_first_si,
                 branch_on_damage,
             );
+            let mut eot_extra = vec![];
             for state_instruction in side_two_moves_first_si.iter_mut() {
                 state.apply_instructions(&state_instruction.instruction_list);
                 if !(s1_replacing_fainted_pkmn
@@ -4691,10 +4909,15 @@ pub fn generate_instructions_from_move_pair(
                     || state.side_one.force_switch
                     || state.side_two.force_switch)
                 {
-                    add_end_of_turn_instructions(state, state_instruction, &SideReference::SideTwo);
+                    eot_extra.extend(add_end_of_turn_instructions(
+                        state,
+                        state_instruction,
+                        &SideReference::SideTwo,
+                    ));
                 }
                 state.reverse_instructions(&state_instruction.instruction_list);
             }
+            side_two_moves_first_si.extend(eot_extra);
 
             // combine both vectors into the final vector
             state_instructions_vec.extend(side_two_moves_first_si);
@@ -4770,11 +4993,17 @@ fn get_instructions_from_pursuit_hitting_switching_target(
         i += 1;
     }
 
+    let mut eot_extra = vec![];
     for state_instruction in state_instructions_vec.iter_mut() {
         state.apply_instructions(&state_instruction.instruction_list);
-        add_end_of_turn_instructions(state, state_instruction, &SideReference::SideOne);
+        eot_extra.extend(add_end_of_turn_instructions(
+            state,
+            state_instruction,
+            &SideReference::SideOne,
+        ));
         state.reverse_instructions(&state_instruction.instruction_list);
     }
+    state_instructions_vec.extend(eot_extra);
 }
 
 pub fn calculate_damage_rolls(
@@ -12234,4 +12463,5 @@ mod tests {
     include!("fail_move_tests.inc.rs");
     include!("sdb22_tests.inc.rs");
     include!("sdb22_tests2.inc.rs");
+    include!("sdb28_tests.inc.rs");
 }

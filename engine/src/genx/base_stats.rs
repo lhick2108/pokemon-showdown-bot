@@ -18,6 +18,9 @@ impl PokemonName {
     pub fn base_stats(&self) -> (i16, i16, i16, i16, i16, i16) {
         match self {
             PokemonName::MINIOR => (60, 100, 60, 100, 60, 120),
+            PokemonName::TERAPAGOS => (90, 65, 85, 65, 85, 60),
+            PokemonName::TERAPAGOSTERASTAL => (95, 95, 110, 105, 110, 85),
+            PokemonName::TERAPAGOSSTELLAR => (160, 105, 110, 130, 110, 85),
             PokemonName::MINIORMETEOR => (60, 60, 100, 60, 100, 60),
             PokemonName::WISHIWASHI => (45, 20, 20, 25, 25, 40),
             PokemonName::WISHIWASHISCHOOL => (45, 140, 130, 140, 135, 30),
