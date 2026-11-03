@@ -26,8 +26,8 @@ python scripts/ladder.py --games 3 --dry-run            # local server 127.0.0.1
 ```
 
 Promoted config on a pinned engine (the main .venv keeps an old engine): `scripts/ladder_best.py` unzips
-`engine/wheels/poke_engine-0.0.48+<engine>-*.whl` (default `sdb.28`; `sdb.27` is the engine stack789v5 was SPRT-tested on) to `.cache/engine/` and runs `ladder.py` with
-`--bot best:worlds=16 --move-cap 10 --search-workers 16` unless given; other arguments pass through.
+`engine/wheels/poke_engine-0.0.48+<engine>-*.whl` (default `sdb.19`, the w16 ladder engine; ft-v5 and dist-v5 on sdb.28-29 did not beat gen7 on it at 16 worlds) to `.cache/engine/` and runs `ladder.py` with
+`--bot best-gen7:worlds=16 --move-cap 10 --search-workers 16` unless given; other arguments pass through.
 
 ```
 python scripts/ladder_best.py --check                      # engine version, model files, parsed config; no connection

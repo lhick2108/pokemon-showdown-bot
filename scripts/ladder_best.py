@@ -1,7 +1,7 @@
 """Run scripts/ladder.py with the promoted config on a pinned engine wheel.
 
     python scripts/ladder_best.py --check                 # verify engine, models and spec; no connection
-    python scripts/ladder_best.py --games 300             # public ladder, best:worlds=16
+    python scripts/ladder_best.py --games 300             # public ladder, best-gen7:worlds=16
     python scripts/ladder_best.py --engine sdb.27 --games 3 --dry-run
     python scripts/ladder_best.py --games 600 --arm self=best:worlds=16 \
         --arm human=best:worlds=16:prior_opp=human:prior_human=models/human-policy.npz
@@ -25,9 +25,10 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 from showdown_bot.engines import engine_dir  # noqa: E402
 
-# sdb.27 is the engine stack789v5 was SPRT-tested on (2026-10-20); sdb.28 adds fidelity fixes only
-ENGINE = "sdb.28"
-DEFAULTS = {"--bot": "best:worlds=16", "--move-cap": "10", "--search-workers": "16"}
+# gen7 on sdb.19 is the w16 ladder setup (peak 2483); ft-v5 / dist-v5 on sdb.28-29 did not beat it at
+# 16 worlds (2026-11-04: dist-v5-h32@sdb.29 vs gen7@sdb.19 +2 Elo over 328 games, 589.70)
+ENGINE = "sdb.19"
+DEFAULTS = {"--bot": "best-gen7:worlds=16", "--move-cap": "10", "--search-workers": "16"}
 
 CHECK = """
 import importlib.metadata as m, sys
