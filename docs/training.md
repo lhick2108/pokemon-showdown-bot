@@ -589,3 +589,11 @@ python -m showdown_bot.train --data data\human\pc1-fp-aux\train --states truth `
 ```
 
 A v5 row is 2275 float16 columns (4.55 KB), 7% smaller than v4.
+
+### Faster v5 leaves: line cache fix (sdb.29) and distilled h16-h64 nets (589.70)
+
+On sdb.28 the per-Pokemon line cache thrashed (2 ways; 18% of leaves missed a line), which cost
+ft-v5-h128 more than its hidden size did. sdb.29 uses 4 ways (bit-identical evaluations).
+`--distill models\ft-v5-h128.pev` trains smaller v5 nets on the teacher's outputs:
+`dist-v5-h32` matches ft-v5-h128 offline and searches ~0.93-0.95x gen7's iterations on
+sdb.29 (ft-v5-h128: ~0.88x). Numbers and commands: `docs/eval-speed.md`.

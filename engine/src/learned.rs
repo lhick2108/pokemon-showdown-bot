@@ -247,8 +247,12 @@ pub struct Scratch {
 }
 
 const CACHE_SETS: usize = 2 * TEAM_SLOTS * TEAM_SLOTS;
-/// 2 ways: a tera / item-loss toggle on the active Pokemon flips its key mid-search.
-const CACHE_WAYS: usize = 2;
+/// Ways per set (round-robin eviction). A tera / item-loss / forme toggle on a Pokemon flips
+/// its key mid-search, and the variants combine: with 2 ways (sdb.28 and earlier) about 18% of
+/// the leaf evaluations of a 1 s search missed at least one line (40 ladder states, ft-v5-h128;
+/// a miss re-adds ~150 weight rows incl. the identity embeddings), with 4 ways 0.7%, with 8
+/// ways 0.4% (docs/eval-speed.md).
+const CACHE_WAYS: usize = 4;
 
 impl Scratch {
     /// Forget cached per-Pokemon contributions (required if team stats changed).
@@ -314,6 +318,10 @@ struct Acc<'a, const H: usize> {
     w1t: &'a [f32],
     idx: Vec<u32>,
     val: Vec<f32>,
+    /// offsets (in floats) into `Scratch::cache_vals` of the cached per-Pokemon lines, added
+    /// to `dense` (in this order, before the queued rows) by `flush`
+    lines: [u32; 2 * TEAM_SLOTS],
+    n_lines: usize,
 }
 
 impl<'a, const H: usize> Acc<'a, H> {
@@ -323,7 +331,14 @@ impl<'a, const H: usize> Acc<'a, H> {
         val.clear();
         let mut dense = [0.0f32; H];
         dense.copy_from_slice(&b1[..H]);
-        Acc { dense, w1t, idx, val }
+        Acc { dense, w1t, idx, val, lines: [0; 2 * TEAM_SLOTS], n_lines: 0 }
+    }
+
+    /// Queues a cached per-Pokemon line (`H` floats at `cache_vals[off..]`).
+    #[inline(always)]
+    fn line(&mut self, off: usize) {
+        self.lines[self.n_lines] = off as u32;
+        self.n_lines += 1;
     }
 
     #[inline(always)]
@@ -338,17 +353,29 @@ impl<'a, const H: usize> Acc<'a, H> {
         self.val.push(x);
     }
 
-    /// Applies the queue to `dense` (same per-lane summation order as adding row by row).
+    /// Applies the queued lines (from `cv` = `Scratch::cache_vals`), then the queued rows, to
+    /// `dense`. Per lane the summation order is the same as adding the lines and then the rows
+    /// one by one to `dense` (bias, lines in queue order, rows in queue order), so the result
+    /// is bit-identical to that; the chunked loop only keeps the accumulator in registers.
     #[inline(always)]
-    fn flush(&mut self) {
-        // 32 floats = 4 AVX2 registers (the whole vector for H <= 32)
-        const CH: usize = 32;
+    fn flush(&mut self, cv: &[f32]) {
+        // 64 floats = 8 AVX2 registers: 8 independent add chains per queued row (the whole
+        // vector for H <= 64; H = 128 takes two passes)
+        const CH: usize = 64;
         let ch = if H < CH { H } else { CH };
+        let lines = &self.lines[..self.n_lines];
         let mut c = 0;
         while c < H {
             // `ch` divides H for every supported size (8, 16, 32, 64, 128)
             let mut a = [0.0f32; CH];
             a[..ch].copy_from_slice(&self.dense[c..c + ch]);
+            for off in lines {
+                let o = *off as usize + c;
+                let row = &cv[o..o + ch];
+                for j in 0..ch {
+                    a[j] += row[j];
+                }
+            }
             for (i, v) in self.idx.iter().zip(self.val.iter()) {
                 let o = *i as usize * H + c;
                 let row = &self.w1t[o..o + ch];
@@ -359,6 +386,7 @@ impl<'a, const H: usize> Acc<'a, H> {
             self.dense[c..c + ch].copy_from_slice(&a[..ch]);
             c += ch;
         }
+        self.n_lines = 0;
         self.idx.clear();
         self.val.clear();
     }
@@ -366,7 +394,7 @@ impl<'a, const H: usize> Acc<'a, H> {
     /// Flushes and returns the finished hidden vector, handing the queues back to `sc`.
     #[inline(always)]
     fn finish(mut self, sc: &mut Scratch) -> [f32; H] {
-        self.flush();
+        self.flush(&sc.cache_vals);
         sc.pidx = self.idx;
         sc.pval = self.val;
         self.dense
@@ -514,13 +542,18 @@ fn mlp_side<const H: usize, const V2: bool>(
             };
             let set = (side_no * TEAM_SLOTS + k) * TEAM_SLOTS + slot;
             let line0 = set * CACHE_WAYS;
-            let line = if sc.cache_keys[line0] == key {
-                line0
-            } else if sc.cache_keys[line0 + 1] == key {
-                line0 + 1
+            let mut hit = usize::MAX;
+            for w in 0..CACHE_WAYS {
+                if sc.cache_keys[line0 + w] == key {
+                    hit = line0 + w;
+                    break;
+                }
+            }
+            let line = if hit != usize::MAX {
+                hit
             } else {
                 let way = sc.cache_next[set] as usize;
-                sc.cache_next[set] = (way ^ 1) as u8;
+                sc.cache_next[set] = ((way + 1) % CACHE_WAYS) as u8;
                 let line = line0 + way;
                 let mut v = [0.0f32; H];
                 static_contrib::<H>(&mut v, w1t, base, p);
@@ -548,11 +581,7 @@ fn mlp_side<const H: usize, const V2: bool>(
                 sc.cache_recip[line] = 1.0 / p.maxhp.max(1) as f32;
                 line
             };
-            let o = (line * 2 + (p.hp > 0) as usize) * H;
-            let vals: &[f32; H] = sc.cache_vals[o..o + H].try_into().unwrap();
-            for j in 0..H {
-                acc.dense[j] += vals[j];
-            }
+            acc.line((line * 2 + (p.hp > 0) as usize) * H);
             alive_count += (p.hp > 0) as i8;
             // hp fraction (0 when fainted)
             let hpf = (p.hp.max(0) as f32 * sc.cache_recip[line]).min(1.0);
@@ -1977,6 +2006,64 @@ mod embed_tests {
     #[test]
     fn v5_fast_path_matches_reference() {
         fast_path_matches_reference(FEATURE_VERSION_5);
+    }
+
+    /// The per-Pokemon line cache must not change a single bit: a long-lived `Scratch` that
+    /// cycles through more key variants per Pokemon than it has ways (hits, misses, evictions)
+    /// gives exactly the logit of a fresh `Scratch`.
+    #[test]
+    fn line_cache_is_bit_exact_under_eviction() {
+        let states = states();
+        let mut rng = Lcg(23);
+        for &(ver, h) in &[(FEATURE_VERSION_5, 16usize), (FEATURE_VERSION_5, 128), (FEATURE_VERSION_1, 16)] {
+            let ev = if ver == FEATURE_VERSION_1 {
+                let n_in = feature_len(ver).unwrap();
+                let w1: Vec<f32> = (0..h * n_in).map(|_| rng.unit() * 0.2).collect();
+                let b1: Vec<f32> = (0..h).map(|_| rng.unit() * 0.3).collect();
+                let w2: Vec<f32> = (0..h).map(|_| rng.unit()).collect();
+                Evaluator::mlp_v(ver, h, w1, b1, w2, 0.1).unwrap()
+            } else {
+                random_embed_ev(ver, h, [8, 8, 8, 8], 900 + h as u64)
+            }
+            .with_stock_coef(0.0125)
+            .unwrap();
+            for s0 in states.iter().take(20) {
+                // 9 variants: tera / item / ability / move toggles of a few Pokemon + switches
+                let variants: Vec<State> = (0..9)
+                    .map(|v| {
+                        let mut s = s0.clone();
+                        for si in 0..2 {
+                            let side = if si == 0 { &mut s.side_one } else { &mut s.side_two };
+                            for (k, p) in side.pokemon.pkmn.iter_mut().enumerate() {
+                                if (v + k + si) % 3 == 0 {
+                                    p.terastallized = !p.terastallized;
+                                }
+                                if (v + 2 * k) % 4 == 1 {
+                                    p.item = Items::NONE;
+                                }
+                                if v % 5 == 2 + si {
+                                    p.ability = Abilities::NONE;
+                                }
+                                if (v * 7 + k) % 6 == 0 {
+                                    std::mem::swap(&mut p.moves.m0, &mut p.moves.m1);
+                                }
+                                p.hp = (p.hp as i32 * ((v + k) % 4) as i32 / 3) as i16;
+                            }
+                            side.active_index = unsafe { std::mem::transmute::<u8, crate::state::PokemonIndex>(((v + si) % 6) as u8) };
+                        }
+                        s
+                    })
+                    .collect();
+                let mut scratch = Scratch::new();
+                for round in 0..3 {
+                    for (i, s) in variants.iter().enumerate() {
+                        let a = ev.logit(s, &mut scratch);
+                        let b = ev.logit(s, &mut Scratch::new());
+                        assert_eq!(a.to_bits(), b.to_bits(), "v{ver} h{h} round {round} variant {i}: {a} vs {b}");
+                    }
+                }
+            }
+        }
     }
 
     fn fast_path_matches_reference(ver: u32) {

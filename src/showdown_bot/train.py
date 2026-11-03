@@ -1152,6 +1152,92 @@ def load_init(model: nn.Module, path: str | Path, *, model_kind: str, n_feat: in
             model.a.fill_(pev["stock_coef"] / STOCK_SCALE)
 
 
+def load_teacher(path: str | Path, *, n_feat: int, feature_version: int, residual: bool) -> nn.Module:
+    """A ``.pev`` as a torch model (any hidden size) for ``--distill``."""
+    pev = read_pev(path)
+    if pev["kind"] != "mlp":
+        raise ValueError(f"--distill {path}: teacher must be an MLP")
+    dims = pev.get("embed_dims")
+    teacher = build_model("mlp", n_feat, pev["hidden"], (1.0, 0.0) if residual else None,
+                          embed_dims=tuple(dims) if dims is not None else None)
+    load_init(teacher, path, model_kind="mlp", n_feat=n_feat, hidden=pev["hidden"],
+              feature_version=feature_version, residual=residual)
+    return teacher
+
+
+def _data_e(d: Data) -> torch.Tensor | None:
+    return None if d.e_sep is None else torch.from_numpy(d.e_sep)
+
+
+def apply_distill(model: nn.Module, teacher_path: Path, train: Data, val: Data,
+                  extra_val: list[tuple[str, Data]], *, n_feat: int, feature_version: int,
+                  residual: bool, weight: float, init: str, device: torch.device) -> dict:
+    """``--distill``: replace the train / val targets by ``weight * sigmoid(teacher) + (1 -
+    weight) * label`` and optionally start the student from the teacher (``init``).
+
+    Returns the original val labels and the teacher's val logits (for ``distill_report``)."""
+    if not 0.0 <= weight <= 1.0:
+        raise ValueError("--distill-weight must be in [0, 1]")
+    teacher = load_teacher(teacher_path, n_feat=n_feat, feature_version=feature_version,
+                           residual=residual).to(device)
+    out: dict = {"val_label": val.y_fit.copy()}
+    for d, name in ((train, "train"), (val, "val")):
+        t = logits_of(teacher, place_x(d.x, device), _data_e(d)).cpu().numpy().astype(np.float32)
+        if name == "val":
+            out["val_teacher"] = t
+        p = 1.0 / (1.0 + np.exp(-t.astype(np.float64)))
+        d.target = (weight * p + (1.0 - weight) * d.y_fit.astype(np.float64)).astype(np.float32)
+    out["extra_teacher"] = []
+    for _, d in extra_val:
+        out["extra_teacher"].append(
+            logits_of(teacher, place_x(d.x, device), _data_e(d)).cpu().numpy())
+    t_net = teacher.net if isinstance(teacher, ResidualNet) else teacher
+    s_net = model.net if isinstance(model, ResidualNet) else model
+    if init != "none":
+        if not isinstance(s_net, EmbedMLP) or not isinstance(t_net, EmbedMLP) \
+                or tuple(s_net.dims) != tuple(t_net.dims):
+            raise ValueError("--distill-init trunc|emb needs v4/v5 nets with the same --embed-dim")
+        with torch.no_grad():
+            for es, et in zip(s_net.emb, t_net.emb):
+                es.weight.copy_(et.weight)
+            if init == "trunc":
+                h_s, h_t = s_net.l1.out_features, t_net.l1.out_features
+                if h_s > h_t:
+                    raise ValueError(f"--distill-init trunc needs --hidden <= the teacher's ({h_t})")
+                idx = torch.argsort(t_net.out.weight[0].abs(), descending=True)[:h_s]
+                s_net.l1.weight.copy_(t_net.l1.weight[idx])
+                s_net.l1.bias.copy_(t_net.l1.bias[idx])
+                s_net.out.weight.copy_(t_net.out.weight[:, idx])
+                s_net.out.bias.copy_(t_net.out.bias)
+                if isinstance(model, ResidualNet) and isinstance(teacher, ResidualNet):
+                    model.a.fill_(float(teacher.a.item()))
+    tv = out["val_teacher"]
+    yv = torch.from_numpy(val.y)
+    print(f"distill: teacher {teacher_path} (hidden {t_net.l1.out_features}), weight {weight}, "
+          f"init {init}; teacher val BCE vs outcome weighted "
+          f"{weighted_bce(torch.from_numpy(tv), yv, torch.from_numpy(val.w)):.4f} "
+          f"unweighted {weighted_bce(torch.from_numpy(tv), yv):.4f}; teacher val BCE vs the "
+          f"original label weighted {weighted_bce(torch.from_numpy(tv), torch.from_numpy(out['val_label']), torch.from_numpy(val.w)):.4f}")
+    for (name, d), t in zip(extra_val, out["extra_teacher"]):
+        print(f"distill: teacher val-data[{name}] BCE vs outcome weighted "
+              f"{weighted_bce(torch.from_numpy(t), torch.from_numpy(d.y), torch.from_numpy(d.w)):.4f}")
+    del teacher
+    return out
+
+
+def distill_report(model: nn.Module, val: Data, info: dict, device: torch.device) -> None:
+    """Student vs the original labels and vs the teacher on the val split."""
+    model.to(device)
+    lv = logits_of(model, place_x(val.x, device), _data_e(val)).cpu()
+    w = torch.from_numpy(val.w)
+    tv = torch.from_numpy(info["val_teacher"])
+    print(f"distill: student val BCE vs the original label weighted "
+          f"{weighted_bce(lv, torch.from_numpy(info['val_label']), w):.4f} (teacher "
+          f"{weighted_bce(tv, torch.from_numpy(info['val_label']), w):.4f}); "
+          f"|student - teacher| logit mean {float((lv - tv).abs().mean()):.4f} "
+          f"rms {float(((lv - tv) ** 2).mean().sqrt()):.4f}")
+
+
 def verify_export(model: nn.Module, path: Path, states: list[str], tol: float = 1e-3) -> float:
     """Load ``path`` with ``Evaluator.load`` and compare ``evaluate`` to the torch logits.
 
@@ -1423,6 +1509,17 @@ def _parser() -> argparse.ArgumentParser:
                         "and output bias) from an existing .pev with the same model/hidden/"
                         "features/--residual; errors on mismatch. Typical: pretrain on human data, "
                         "then fine-tune on self-play with a lower --lr")
+    p.add_argument("--distill", type=Path, default=None, metavar="TEACHER.pev",
+                   help="knowledge distillation: train against sigmoid(teacher logit) on the same "
+                        "rows (teacher = a residual .pev of the same --features, any hidden size; "
+                        "evaluated on the GPU from the loaded feature rows). See --distill-weight, "
+                        "--distill-init and docs/eval-speed.md")
+    p.add_argument("--distill-weight", type=float, default=1.0, metavar="A",
+                   help="target = A * sigmoid(teacher) + (1 - A) * the --value-target label (default 1)")
+    p.add_argument("--distill-init", choices=("trunc", "emb", "none"), default="trunc",
+                   help="student start with --distill: trunc = the teacher's embedding tables and its "
+                        "--hidden hidden units of largest |w2| (needs --hidden <= teacher's), emb = "
+                        "only the embedding tables, none = random (default trunc)")
     p.add_argument("--val-fraction", type=float, default=0.1)
     p.add_argument("--epochs", type=int, default=60)
     p.add_argument("--patience", type=int, default=6)
@@ -1567,6 +1664,19 @@ def main(argv=None) -> int:
             return 2
         print(f"warm start from {args.init}"
               + (f" (a = {float(model.a.item()):.4f})" if args.residual else ""))
+    orig_targets = None
+    if args.distill is not None:
+        if args.init is not None:
+            print("--distill and --init are exclusive (use --distill-init)", file=sys.stderr)
+            return 2
+        try:
+            orig_targets = apply_distill(model, args.distill, train, val, extra_val, n_feat=n_feat,
+                                         feature_version=feature_version, residual=args.residual,
+                                         weight=args.distill_weight, init=args.distill_init,
+                                         device=device)
+        except (ValueError, OSError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
     if args.aux == "on":
         if args.model != "mlp" or args.augment_bench or args.augment_sides or args.aux_weight <= 0 \
                 or feature_version != 1 or args.nodes != "off":
@@ -1590,6 +1700,8 @@ def main(argv=None) -> int:
         print(f"learned a = {float(result.model.a.item()):.4f}  "
               f"(stock_coef = {result.model.stock_coef:.6f})")
     report(result.model, train, val, device)
+    if orig_targets is not None:
+        distill_report(result.model, val, orig_targets, device)
     if val.aux_y is not None:
         aux_report(result.model if args.aux == "on" else None, val, device)
     for name, vd in extra_val:

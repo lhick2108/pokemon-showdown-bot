@@ -64,6 +64,16 @@ fn main() {
             md = md.max((ev.logit(s, &mut sc) - ev.logit_reference(s, &mut sc2)).abs());
         }
         println!("max |fast - reference| over states: {md:e}");
+        // bit-exact fingerprint of the fast path (cache miss then hit per state) to compare
+        // engine builds: equal fingerprints = identical evaluations on these states
+        let mut fp: u64 = 0xcbf29ce484222325;
+        for s in &states {
+            let mut sc = Scratch::new();
+            for _ in 0..2 {
+                fp = (fp ^ ev.logit(s, &mut sc).to_bits() as u64).wrapping_mul(0x100000001b3);
+            }
+        }
+        println!("logit fingerprint {fp:016x}");
     }
     // micro: per-call cost
     let n = 200;
