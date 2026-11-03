@@ -88,6 +88,9 @@ EXPLOIT_KEYS = {"opp_model": str, "opp_elo": str, "exploit_delta": float, "explo
 # prior_opp=human (default: opp_model). tok_prior=<token net .pt> replaces our side's ROOT prior with the
 # token transformer policy (docs/token-net.md); it works with or without prior=<.ppol> (the .ppol then
 # keeps serving the interior nodes and the opponent side); tok_device = auto | cpu | cuda.
+# engine=<tag> runs this bot's searches on a pinned engine wheel (showdown_bot.engines; needs
+# --search-workers, the bot gets its own pool of that size on that engine)
+ENGINE_KEYS = {"engine": str}
 PRIOR_KEYS = {"prior": str, "prior_opp": str, "c_puct": float, "prior_eps": float, "fpu": float,
               "prior_human": str, "tok_prior": str, "tok_device": str}
 PRIOR_FIELDS = {"prior": "prior", "prior_opp": "prior_opp", "c_puct": "c_puct",
@@ -118,7 +121,7 @@ SPEC_KEYS = {
                 "tera_margin": float, "ev2": str, "scale2": float,
                 "material": float, "ko_tiebreak": float,
                 "npc": float, "bargmax": int,
-                **ENDGAME_KEYS, **EXPLOIT_KEYS, **PRIOR_KEYS},
+                **ENDGAME_KEYS, **EXPLOIT_KEYS, **PRIOR_KEYS, **ENGINE_KEYS},
     # search + final move blended with the human model: p ~ search^(1-w) * human^w (players.humansearch)
     "humansearch": {"evaluator": str, "scale": float, "time_ms": int, "worlds": int,
                     "selection": str, "gamma": float, "mode": str,
@@ -129,7 +132,7 @@ SPEC_KEYS = {
                     "tera_margin": float, "ev2": str, "scale2": float,
                 "material": float, "ko_tiebreak": float,
                     "npc": float, "bargmax": int,
-                    **ENDGAME_KEYS, **EXPLOIT_KEYS, **PRIOR_KEYS, **HUMAN_BLEND_KEYS},
+                    **ENDGAME_KEYS, **EXPLOIT_KEYS, **PRIOR_KEYS, **ENGINE_KEYS, **HUMAN_BLEND_KEYS},
     "search-net": {"evaluator": str, "scale": float, "time_ms": int, "worlds": int,
                    "selection": str, "gamma": float, "mode": str,
                "tendency": str, "tkappa": float, "tdelta": float,
@@ -139,7 +142,7 @@ SPEC_KEYS = {
                 "tera_margin": float, "ev2": str, "scale2": float,
                 "material": float, "ko_tiebreak": float,
                 "npc": float, "bargmax": int,
-                **ENDGAME_KEYS, **EXPLOIT_KEYS, **PRIOR_KEYS},
+                **ENDGAME_KEYS, **EXPLOIT_KEYS, **PRIOR_KEYS, **ENGINE_KEYS},
 }
 
 
@@ -983,7 +986,9 @@ def _make_player(spec: BotSpec, cfg: LeagueConfig, recorder, concurrency: int, s
             if spec.param("tdelta") is not None:
                 kwargs["tendency_delta"] = spec.param("tdelta")
         if cfg.search_workers:
-            kwargs["executor"] = get_pool(cfg.search_workers)
+            kwargs["executor"] = get_pool(cfg.search_workers, engine=spec.param("engine"))
+        elif spec.param("engine") is not None:
+            raise ValueError(f"{spec.label}: engine= needs --search-workers (a shared pool)")
     return cls(**kwargs)
 
 

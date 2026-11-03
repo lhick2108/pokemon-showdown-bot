@@ -19,10 +19,12 @@ import argparse
 import os
 import subprocess
 import sys
-import zipfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "src"))
+from showdown_bot.engines import engine_dir  # noqa: E402
+
 # sdb.27 is the engine stack789v5 was SPRT-tested on (2026-10-20); sdb.28 adds fidelity fixes only
 ENGINE = "sdb.28"
 DEFAULTS = {"--bot": "best:worlds=16", "--move-cap": "10", "--search-workers": "16"}
@@ -43,17 +45,6 @@ for text in sys.argv[1:]:
     print("      ", {k: getattr(cfg, k) for k in ("worlds", "mode", "evaluator", "prior", "prior_opp",
                                                   "prior_human", "c_puct")})
 """
-
-
-def engine_dir(tag: str) -> Path:
-    wheels = sorted((REPO / "engine" / "wheels").glob(f"poke_engine-0.0.48+{tag}-*.whl"))
-    if len(wheels) != 1:
-        raise SystemExit(f"expected one wheel for {tag} in engine/wheels, found {len(wheels)}")
-    out = REPO / ".cache" / "engine" / tag
-    if not (out / "poke_engine").is_dir():
-        with zipfile.ZipFile(wheels[0]) as z:
-            z.extractall(out)
-    return out
 
 
 def main(argv: list[str] | None = None) -> int:

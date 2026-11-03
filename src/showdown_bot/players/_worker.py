@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 
 def ping() -> int:
     """Warm a worker process (imports poke_engine); returns its pid."""
@@ -10,6 +12,30 @@ def ping() -> int:
     import poke_engine  # noqa: F401
 
     return os.getpid()
+
+
+def engine_version() -> str:
+    """The poke_engine version this worker runs (checks for ``engine=`` pools)."""
+    import importlib.metadata
+    import poke_engine
+
+    dist = Path(poke_engine.__file__).resolve().parents[1]
+    for info in dist.glob("poke_engine-*.dist-info"):
+        return importlib.metadata.Distribution.at(info).version
+    return importlib.metadata.version("poke_engine")
+
+
+def use_engine(path: str) -> None:
+    """Pool initializer: put an unpacked engine wheel first on sys.path (league spec ``engine=``)."""
+    import sys
+
+    if "poke_engine" in sys.modules:
+        raise RuntimeError("use_engine must run before poke_engine is imported")
+    sys.path.insert(0, path)
+    import poke_engine
+
+    if not str(Path(poke_engine.__file__).resolve()).startswith(str(Path(path).resolve())):
+        raise RuntimeError(f"engine from {poke_engine.__file__}, expected {path}")
 
 
 # Evaluators loaded in this worker process, keyed by (path, leaf scale); ``EVALUATOR_LOADS``

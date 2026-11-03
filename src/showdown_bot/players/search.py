@@ -478,17 +478,31 @@ def _print_total_stats() -> None:
 atexit.register(_print_total_stats)
 
 
-_POOLS: dict[int, ProcessPoolExecutor] = {}
+# Keyed by worker count, or (worker count, engine tag) for a pool on a pinned engine wheel.
+_POOLS: dict[int | tuple[int, str], ProcessPoolExecutor] = {}
 _CAP_SLACK_S = 10.0  # added to the planned wave time for the hard cap on one decision
 _TIMED_OUT = object()  # outcome marker of a pool job still running at the hard cap
 
 
-def get_pool(workers: int) -> ProcessPoolExecutor:
-    """Shared process pool (one per worker count) for all SearchPlayers."""
-    pool = _POOLS.get(workers)
+def get_pool(workers: int | tuple[int, str], engine: str | None = None) -> ProcessPoolExecutor:
+    """Shared process pool (one per worker count and engine) for all SearchPlayers.
+
+    ``engine`` (a tag such as ``sdb.28``, see ``showdown_bot.engines``) runs the pool's searches
+    on that engine wheel instead of the main process's; ``workers`` may also be a pool key.
+    """
+    if isinstance(workers, tuple):
+        workers, engine = workers
+    key = workers if engine is None else (workers, engine)
+    pool = _POOLS.get(key)
     if pool is None:
-        pool = ProcessPoolExecutor(max_workers=workers)
-        _POOLS[workers] = pool
+        if engine is None:
+            pool = ProcessPoolExecutor(max_workers=workers)
+        else:
+            from showdown_bot.engines import engine_dir
+
+            pool = ProcessPoolExecutor(max_workers=workers, initializer=_worker.use_engine,
+                                       initargs=(str(engine_dir(engine)),))
+        _POOLS[key] = pool
         for _ in range(workers):
             pool.submit(_worker.ping)
     return pool
@@ -526,7 +540,7 @@ def pool_diagnostics() -> str:
     return "\n".join(lines)
 
 
-def _shared_pool_key(executor: Any) -> int | None:
+def _shared_pool_key(executor: Any) -> int | tuple[int, str] | None:
     """The ``_POOLS`` key of ``executor`` if it is a shared pool (else None)."""
     for workers, pool in _POOLS.items():
         if pool is executor:
@@ -543,7 +557,7 @@ def _kill_workers(pool: ProcessPoolExecutor) -> None:
             pass
 
 
-def reset_pool(workers: int, only: Executor | None = None, *, kill: bool = False) -> None:
+def reset_pool(workers: int | tuple[int, str], only: Executor | None = None, *, kill: bool = False) -> None:
     """Drop the shared pool so the next ``get_pool`` builds a fresh one.
 
     ``only`` guards against a thundering herd: when several battles notice the
@@ -1673,7 +1687,7 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             return get_pool(self._shared_workers)
         return self._executor
 
-    def _recycle_key(self, executor: Executor) -> int | None:
+    def _recycle_key(self, executor: Executor) -> int | tuple[int, str] | None:
         """Pool-registry key if ``executor`` may be rebuilt (owned or shared), else None."""
         if self._executor is None:
             return self.config.parallelism
