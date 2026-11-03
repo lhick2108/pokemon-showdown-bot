@@ -1,7 +1,7 @@
 #![allow(unused_variables)]
 use super::damage_calc::type_effectiveness_modifier;
 use super::generate_instructions::{add_remove_status_instructions, apply_boost_instruction};
-use super::items::{get_choice_move_disable_instructions, Items};
+use super::items::{get_choice_move_disable_instructions, on_item_taken, Items};
 use super::state::{PokemonVolatileStatus, Terrain, Weather};
 use crate::choices::{
     Boost, Choice, Choices, Effect, Heal, MoveCategory, MoveTarget, Secondary, StatBoosts,
@@ -825,7 +825,14 @@ pub fn ability_after_damage_hit(
                         new_item: Items::NONE,
                     },
                 ));
+                let old_item = defending_pkmn.item;
                 defending_pkmn.item = Items::NONE;
+                on_item_taken(
+                    defending_side,
+                    &side_ref.get_other_side(),
+                    old_item,
+                    &mut instructions.instruction_list,
+                );
             }
         }
         Abilities::MOXIE | Abilities::CHILLINGNEIGH | Abilities::ASONEGLASTRIER => {
@@ -1603,11 +1610,135 @@ pub fn imposter_transform(
     }
 }
 
+/// Showdown `formeChange(species, source, isPermanent = true)` (Tera Shift, Terapagos-Terastal ->
+/// Stellar on Tera): species, stats and max HP keep the Pokemon's own offsets (each stat moves by
+/// the base-stat difference, so IV / EV quirks of the input stats survive), the damage already
+/// taken is kept (`updateMaxHp`), and the ability (and base ability) becomes `new_ability`.
+/// Every change is a reversible instruction.
+pub fn permanent_forme_change(
+    side: &mut Side,
+    side_ref: &SideReference,
+    new_id: PokemonName,
+    new_ability: Option<Abilities>,
+    instructions: &mut StateInstructions,
+) {
+    let active = side.get_active();
+    if active.id == new_id {
+        return;
+    }
+    let old = active.calculate_stats_from_base_stats();
+    instructions
+        .instruction_list
+        .push(Instruction::FormeChange(FormeChangeInstruction {
+            side_ref: *side_ref,
+            name_change: new_id as i16 - active.id as i16,
+        }));
+    active.id = new_id;
+    let new = active.calculate_stats_from_base_stats();
+    let deltas = [
+        new.1 - old.1,
+        new.2 - old.2,
+        new.3 - old.3,
+        new.4 - old.4,
+        new.5 - old.5,
+    ];
+    for (i, amount) in deltas.iter().copied().enumerate() {
+        if amount == 0 {
+            continue;
+        }
+        let ins = ChangeStatInstruction {
+            side_ref: *side_ref,
+            amount,
+        };
+        instructions.instruction_list.push(match i {
+            0 => {
+                active.attack += amount;
+                Instruction::ChangeAttack(ins)
+            }
+            1 => {
+                active.defense += amount;
+                Instruction::ChangeDefense(ins)
+            }
+            2 => {
+                active.special_attack += amount;
+                Instruction::ChangeSpecialAttack(ins)
+            }
+            3 => {
+                active.special_defense += amount;
+                Instruction::ChangeSpecialDefense(ins)
+            }
+            _ => {
+                active.speed += amount;
+                Instruction::ChangeSpeed(ins)
+            }
+        });
+    }
+    let hp_delta = new.0 - old.0;
+    if hp_delta != 0 {
+        let new_max = active.maxhp + hp_delta;
+        let new_hp = if active.hp <= 0 {
+            0
+        } else {
+            cmp::max(1, new_max - (active.maxhp - active.hp))
+        };
+        instructions
+            .instruction_list
+            .push(Instruction::ChangeMaxHp(ChangeStatInstruction {
+                side_ref: *side_ref,
+                amount: hp_delta,
+            }));
+        active.maxhp = new_max;
+        if new_hp != active.hp {
+            instructions
+                .instruction_list
+                .push(Instruction::Heal(HealInstruction {
+                    side_ref: *side_ref,
+                    heal_amount: new_hp - active.hp,
+                }));
+            active.hp = new_hp;
+        }
+    }
+    if let Some(ability) = new_ability {
+        if active.ability != ability {
+            instructions
+                .instruction_list
+                .push(Instruction::ChangeAbility(ChangeAbilityInstruction {
+                    side_ref: *side_ref,
+                    ability_change: ability as i16 - active.ability as i16,
+                }));
+            active.ability = ability;
+        }
+        if active.base_ability != ability {
+            instructions
+                .instruction_list
+                .push(Instruction::ChangeBaseAbility(ChangeAbilityInstruction {
+                    side_ref: *side_ref,
+                    ability_change: ability as i16 - active.base_ability as i16,
+                }));
+            active.base_ability = ability;
+        }
+    }
+}
+
 pub fn ability_on_switch_in(
     state: &mut State,
     side_ref: &SideReference,
     instructions: &mut StateInstructions,
 ) {
+    // Tera Shift (cannot be suppressed): Terapagos becomes Terapagos-Terastal / Tera Shell
+    {
+        let side = state.get_side(side_ref);
+        let active = side.get_active_immutable();
+        if active.ability == Abilities::TERASHIFT && active.id == PokemonName::TERAPAGOS {
+            permanent_forme_change(
+                side,
+                side_ref,
+                PokemonName::TERAPAGOSTERASTAL,
+                Some(Abilities::TERASHELL),
+                instructions,
+            );
+        }
+    }
     let (attacking_side, defending_side) = state.get_both_sides(side_ref);
     let active_pkmn = attacking_side.get_active();
     let defending_pkmn = defending_side.get_active_immutable();
@@ -2740,6 +2871,16 @@ pub fn ability_modify_attack_against(
                     chance: 11.0,
                     target: MoveTarget::User,
                     effect: Effect::Status(PokemonStatus::SLEEP),
+                });
+            }
+        }
+        // Cursed Body: 30% to Disable the move that hit it (any damaging move, sdb.28)
+        Abilities::CURSEDBODY => {
+            if attacker_choice.category != MoveCategory::Status {
+                attacker_choice.add_or_create_secondaries(Secondary {
+                    chance: 30.0,
+                    target: MoveTarget::User,
+                    effect: Effect::VolatileStatus(PokemonVolatileStatus::DISABLE),
                 });
             }
         }

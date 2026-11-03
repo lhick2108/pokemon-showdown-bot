@@ -1,7 +1,7 @@
 use super::abilities::Abilities;
 use super::damage_calc::type_effectiveness_modifier;
 use super::generate_instructions::{add_remove_status_instructions, apply_boost_instruction};
-use super::items::{get_choice_move_disable_instructions, Items};
+use super::items::{get_choice_move_disable_instructions, on_item_taken, Items};
 use super::state::{PokemonVolatileStatus, Terrain, Weather};
 use crate::choices::{
     Boost, Choice, Choices, Effect, Heal, MoveCategory, MoveTarget, Secondary, StatBoosts,
@@ -825,10 +825,17 @@ pub fn choice_after_damage_hit(
                     new_item: Items::NONE,
                 });
                 instructions.instruction_list.push(instruction);
+                let old_item = defender_active.item;
                 defender_active.item = Items::NONE;
+                on_item_taken(
+                    defending_side,
+                    &attacking_side_ref.get_other_side(),
+                    old_item,
+                    &mut instructions.instruction_list,
+                );
             }
         }
-        Choices::THIEF => {
+        Choices::THIEF | Choices::COVET => {
             let attacker_active = attacking_side.get_active();
             let defender_active = defending_side.get_active();
             if defender_active.item_can_be_removed()
@@ -853,6 +860,12 @@ pub fn choice_after_damage_hit(
                 });
                 instructions.instruction_list.push(instruction);
                 attacker_active.item = defender_item;
+                on_item_taken(
+                    defending_side,
+                    &attacking_side_ref.get_other_side(),
+                    defender_item,
+                    &mut instructions.instruction_list,
+                );
             }
         }
         Choices::CLEARSMOG => {
@@ -1725,6 +1738,42 @@ pub fn choice_special_effect(
             instructions
                 .instruction_list
                 .push(change_defender_item_instruction);
+            on_item_taken(
+                attacking_side,
+                attacking_side_ref,
+                attacker_item,
+                &mut instructions.instruction_list,
+            );
+            on_item_taken(
+                defending_side,
+                &attacking_side_ref.get_other_side(),
+                defender_item,
+                &mut instructions.instruction_list,
+            );
+        }
+        Choices::CORROSIVEGAS => {
+            let defender_has_sub = defending_side
+                .volatile_statuses
+                .contains(&PokemonVolatileStatus::SUBSTITUTE);
+            let defender = defending_side.get_active();
+            let defender_item = defender.item;
+            if defender_item == Items::NONE || !defender.item_can_be_removed() || defender_has_sub {
+                return;
+            }
+            instructions
+                .instruction_list
+                .push(Instruction::ChangeItem(ChangeItemInstruction {
+                    side_ref: attacking_side_ref.get_other_side(),
+                    current_item: defender_item,
+                    new_item: Items::NONE,
+                }));
+            defender.item = Items::NONE;
+            on_item_taken(
+                defending_side,
+                &attacking_side_ref.get_other_side(),
+                defender_item,
+                &mut instructions.instruction_list,
+            );
         }
         Choices::SUNNYDAY => {
             if state.weather.weather_type != Weather::SUN {

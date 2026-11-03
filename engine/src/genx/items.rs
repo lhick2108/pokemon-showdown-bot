@@ -8,7 +8,8 @@ use crate::define_enum_with_from_str;
 use crate::engine::generate_instructions::add_remove_status_instructions;
 use crate::instruction::{
     ChangeItemInstruction, ChangeStatusInstruction, DamageInstruction, DecrementPPInstruction,
-    DisableMoveInstruction, HealInstruction, Instruction, StateInstructions,
+    DisableMoveInstruction, EnableMoveInstruction, HealInstruction, Instruction,
+    SetLastItemInstruction, StateInstructions,
 };
 use crate::pokemon::PokemonName;
 use crate::state::{
@@ -305,6 +306,89 @@ pub fn get_choice_move_disable_instructions(
     moves_to_disable
 }
 
+/// Unnerve / As One: while the holder is out, its foes cannot eat berries (`onFoeTryEatItem`).
+pub fn unnerves(foe: &Pokemon) -> bool {
+    foe.hp > 0
+        && matches!(
+            foe.ability,
+            Abilities::UNNERVE | Abilities::ASONEGLASTRIER | Abilities::ASONESPECTRIER
+        )
+}
+
+pub fn is_berry(item: Items) -> bool {
+    item != Items::NONE && format!("{:?}", item).ends_with("BERRY")
+}
+
+/// The item as far as eating it goes: NONE for a berry its holder cannot eat (foe has Unnerve).
+fn edible(item: Items, foe: &Pokemon) -> Items {
+    if unnerves(foe) && is_berry(item) {
+        Items::NONE
+    } else {
+        item
+    }
+}
+
+pub fn is_choice_item(item: Items) -> bool {
+    matches!(
+        item,
+        Items::CHOICEBAND | Items::CHOICESPECS | Items::CHOICESCARF
+    )
+}
+
+/// Called after the active Pokemon of `side` lost (or swapped) its item `old_item` to another
+/// Pokemon's move or ability (Knock Off, Thief, Covet, Trick, Corrosive Gas, Magician, ...).
+///
+/// Showdown's `choicelock` volatile ends as soon as the holder no longer holds a Choice item
+/// (`onBeforeMove` / `onDisableMove`), so the moves the lock disabled are re-enabled. Swapping
+/// one Choice item for another keeps the lock.
+pub fn on_item_taken(
+    side: &mut Side,
+    side_ref: &SideReference,
+    old_item: Items,
+    instructions: &mut Vec<Instruction>,
+) {
+    let active = side.get_active();
+    // Gorilla Tactics locks through the same disabled flags and is not released
+    if is_choice_item(old_item)
+        && !is_choice_item(active.item)
+        && active.ability != Abilities::GORILLATACTICS
+    {
+        let mut iter = active.moves.into_iter();
+        let mut to_enable = vec![];
+        while let Some(m) = iter.next() {
+            if m.disabled {
+                to_enable.push(iter.pokemon_move_index);
+            }
+        }
+        for move_index in to_enable {
+            active.moves[&move_index].disabled = false;
+            instructions.push(Instruction::EnableMove(EnableMoveInstruction {
+                side_ref: *side_ref,
+                move_index,
+            }));
+        }
+    }
+}
+
+/// Harvest: remember the berry the active Pokemon just ate (Showdown's `pokemon.lastItem`, set
+/// by `eatItem`, not by Knock Off / Thief / Trick). Only tracked for Harvest holders so other
+/// Pokemon emit no extra instructions.
+pub fn record_eaten_berry(
+    pkmn: &mut Pokemon,
+    side_ref: &SideReference,
+    berry: Items,
+    instructions: &mut Vec<Instruction>,
+) {
+    if pkmn.ability == Abilities::HARVEST && pkmn.last_item != berry {
+        instructions.push(Instruction::SetLastItem(SetLastItemInstruction {
+            side_ref: *side_ref,
+            new_item: berry,
+            previous_item: pkmn.last_item,
+        }));
+        pkmn.last_item = berry;
+    }
+}
+
 fn damage_reduction_berry(
     defending_pkmn: &mut Pokemon,
     attacking_side_ref: &SideReference,
@@ -324,6 +408,12 @@ fn damage_reduction_berry(
                 new_item: Items::NONE,
             }));
         defending_pkmn.item = Items::NONE;
+        record_eaten_berry(
+            defending_pkmn,
+            &attacking_side_ref.get_other_side(),
+            berry,
+            &mut instructions.instruction_list,
+        );
         choice.base_power /= 2.0;
     }
 }
@@ -390,6 +480,12 @@ fn lum_berry(
             new_item: Items::NONE,
         }));
     active_pkmn.item = Items::NONE;
+    record_eaten_berry(
+        active_pkmn,
+        side_ref,
+        Items::LUMBERRY,
+        &mut instructions.instruction_list,
+    );
 }
 
 fn sitrus_berry(
@@ -414,6 +510,12 @@ fn sitrus_berry(
             new_item: Items::NONE,
         }));
     active_pkmn.item = Items::NONE;
+    record_eaten_berry(
+        active_pkmn,
+        side_ref,
+        Items::SITRUSBERRY,
+        &mut instructions.instruction_list,
+    );
 }
 
 // Leppa Berry: restores 10 PP to the first move slot at 0 PP, then is consumed.
@@ -458,6 +560,12 @@ fn leppa_berry(
                 new_item: Items::NONE,
             }));
         active_pkmn.item = Items::NONE;
+        record_eaten_berry(
+            active_pkmn,
+            side_ref,
+            Items::LEPPABERRY,
+            &mut instructions.instruction_list,
+        );
     }
 }
 
@@ -480,6 +588,7 @@ fn status_cure_berry(
             new_item: Items::NONE,
         }));
     active_pkmn.item = Items::NONE;
+    record_eaten_berry(active_pkmn, side_ref, berry, &mut instructions.instruction_list);
     add_remove_status_instructions(instructions, active_index, *side_ref, attacking_side);
 }
 
@@ -505,7 +614,9 @@ fn boost_berry(
             current_item: attacker.item,
             new_item: Items::NONE,
         }));
+    let berry = attacker.item;
     attacker.item = Items::NONE;
+    record_eaten_berry(attacker, side_ref, berry, &mut instructions.instruction_list);
 }
 
 pub fn item_before_move(
@@ -517,7 +628,7 @@ pub fn item_before_move(
     let (attacking_side, defending_side) = state.get_both_sides(side_ref);
     let active_pkmn = attacking_side.get_active();
     let defending_pkmn = defending_side.get_active();
-    match defending_pkmn.item {
+    match edible(defending_pkmn.item, active_pkmn) {
         Items::CHOPLEBERRY => damage_reduction_berry(
             defending_pkmn,
             side_ref,
@@ -553,6 +664,12 @@ pub fn item_before_move(
                     },
                 ));
                 defending_pkmn.item = Items::NONE;
+                record_eaten_berry(
+                    defending_pkmn,
+                    &side_ref.get_other_side(),
+                    Items::CHILANBERRY,
+                    &mut instructions.instruction_list,
+                );
                 choice.base_power /= 2.0;
             }
         }
@@ -670,7 +787,7 @@ pub fn item_before_move(
         ),
         _ => {}
     }
-    match active_pkmn.item {
+    match edible(active_pkmn.item, defending_pkmn) {
         Items::NORMALGEM => power_up_gem(
             side_ref,
             active_pkmn,
@@ -1003,9 +1120,13 @@ pub fn item_end_of_turn(
     side_ref: &SideReference,
     instructions: &mut StateInstructions,
 ) {
-    let attacking_side = state.get_side(side_ref);
+    let (attacking_side, defending_side) = state.get_both_sides(side_ref);
+    let item = edible(
+        attacking_side.get_active_immutable().item,
+        defending_side.get_active_immutable(),
+    );
     let active_pkmn = attacking_side.get_active();
-    match active_pkmn.item {
+    match item {
         Items::LUMBERRY if active_pkmn.status != PokemonStatus::NONE => {
             lum_berry(side_ref, attacking_side, instructions)
         }

@@ -855,6 +855,9 @@ pub struct VolatileStatusDurations {
     pub healblock: i8,
     /// Throat Chop turns remaining (2). 0 with the volatile set is read as a fresh 2.
     pub throatchop: i8,
+    /// Disable (sdb.28, Cursed Body): `turns_remaining * 4 + move_slot` (slot 0-3 of the
+    /// disabled move), 0 when not disabled. Serialized after `throatchop` only when non-zero.
+    pub disable: i8,
 }
 
 impl Default for VolatileStatusDurations {
@@ -868,6 +871,7 @@ impl Default for VolatileStatusDurations {
             yawn: 0,
             healblock: 0,
             throatchop: 0,
+            disable: 0,
         }
     }
 }
@@ -883,6 +887,7 @@ impl VolatileStatusDurations {
             ("yawn", self.yawn),
             ("healblock", self.healblock),
             ("throatchop", self.throatchop),
+            ("disable", self.disable),
         ];
 
         let mut output = String::new();
@@ -904,7 +909,12 @@ impl VolatileStatusDurations {
             "{};{};{};{};{};{}",
             self.confusion, self.encore, self.lockedmove, self.slowstart, self.taunt, self.yawn
         );
-        if self.healblock != 0 || self.throatchop != 0 {
+        if self.disable != 0 {
+            format!(
+                "{};{};{};{}",
+                base, self.healblock, self.throatchop, self.disable
+            )
+        } else if self.healblock != 0 || self.throatchop != 0 {
             format!("{};{};{}", base, self.healblock, self.throatchop)
         } else {
             base
@@ -916,6 +926,7 @@ impl VolatileStatusDurations {
         VolatileStatusDurations {
             healblock: extra(6),
             throatchop: extra(7),
+            disable: extra(8),
             confusion: split[0].parse::<i8>().unwrap(),
             encore: split[1].parse::<i8>().unwrap(),
             lockedmove: split[2].parse::<i8>().unwrap(),
@@ -952,6 +963,9 @@ pub struct Pokemon {
     pub terastallized: bool,
     pub tera_type: PokemonType,
     pub moves: PokemonMoves,
+    /// Showdown's `pokemon.lastItem`, only tracked for Harvest: the berry it ate last (NONE =
+    /// nothing to regrow). Serialized as an optional trailing field (sdb.28).
+    pub last_item: Items,
 }
 
 impl Default for Pokemon {
@@ -980,6 +994,7 @@ impl Default for Pokemon {
             mega_evolved: false,
             terastallized: false,
             tera_type: PokemonType::NORMAL,
+            last_item: Items::NONE,
             moves: PokemonMoves {
                 m0: Default::default(),
                 m1: Default::default(),
@@ -1045,7 +1060,7 @@ impl Pokemon {
             "{};{};{};{};{};{}",
             self.evs.0, self.evs.1, self.evs.2, self.evs.3, self.evs.4, self.evs.5
         );
-        format!(
+        let base = format!(
             "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             self.id,
             self.level,
@@ -1076,7 +1091,14 @@ impl Pokemon {
             self.mega_evolved,
             self.terastallized,
             self.tera_type.to_string(),
-        )
+        );
+        // optional trailing fields (sdb.28): only written when set, so older readers and
+        // states without them are unaffected
+        if self.last_item != Items::NONE {
+            format!("{},{}", base, self.last_item.to_string())
+        } else {
+            base
+        }
     }
 
     pub fn deserialize(serialized: &str) -> Pokemon {
@@ -1130,6 +1152,10 @@ impl Pokemon {
             mega_evolved: split[26].parse::<bool>().unwrap(),
             terastallized: split[27].parse::<bool>().unwrap(),
             tera_type: PokemonType::from_str(split[28]).unwrap(),
+            last_item: match split.get(29) {
+                Some(v) if !v.is_empty() => Items::from_str(v).unwrap(),
+                _ => Items::NONE,
+            },
         }
     }
 }
@@ -1720,6 +1746,9 @@ impl State {
             PokemonVolatileStatus::THROATCHOP => {
                 side.volatile_status_durations.throatchop += amount;
             }
+            PokemonVolatileStatus::DISABLE => {
+                side.volatile_status_durations.disable += amount;
+            }
             _ => panic!(
                 "Invalid volatile status for increment_volatile_status_duration: {:?}",
                 volatile_status
@@ -1966,6 +1995,9 @@ impl State {
             Instruction::ChangeSpeed(instruction) => {
                 self.get_side(&instruction.side_ref).get_active().speed += instruction.amount;
             }
+            Instruction::ChangeMaxHp(instruction) => {
+                self.get_side(&instruction.side_ref).get_active().maxhp += instruction.amount;
+            }
             Instruction::EnableMove(instruction) => {
                 self.enable_move(&instruction.side_ref, &instruction.move_index)
             }
@@ -2081,6 +2113,9 @@ impl State {
             Instruction::TeamPreviewFaintIndex(side_ref, pkmn_index) => {
                 self.get_side(&side_ref).pokemon[*pkmn_index].hp = 0;
             }
+            Instruction::SetLastItem(instruction) => {
+                self.get_side(&instruction.side_ref).get_active().last_item = instruction.new_item;
+            }
             Instruction::ToggleTeamPreview => {
                 self.team_preview = !self.team_preview;
             }
@@ -2187,6 +2222,9 @@ impl State {
             }
             Instruction::ChangeSpeed(instruction) => {
                 self.get_side(&instruction.side_ref).get_active().speed -= instruction.amount;
+            }
+            Instruction::ChangeMaxHp(instruction) => {
+                self.get_side(&instruction.side_ref).get_active().maxhp -= instruction.amount;
             }
             Instruction::ChangeWish(instruction) => {
                 self.unset_wish(&instruction.side_ref, instruction.wish_amount_change)
@@ -2295,6 +2333,10 @@ impl State {
             Instruction::TeamPreviewFaintIndex(side_ref, pkmn_index) => {
                 let pkmn = &mut self.get_side(side_ref).pokemon[*pkmn_index];
                 pkmn.hp = pkmn.maxhp;
+            }
+            Instruction::SetLastItem(instruction) => {
+                self.get_side(&instruction.side_ref).get_active().last_item =
+                    instruction.previous_item;
             }
             Instruction::ToggleTeamPreview => {
                 self.team_preview = !self.team_preview;

@@ -129,14 +129,9 @@ def test_choice_lock_released_when_item_is_removed(data, sampler, removal):
     assert not any(m.disabled for m in built.state.side_two.pokemon[0].moves)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "engine: Choice lock is DisableMove instructions emitted on move use "
-        "(engine/src/genx/items.rs get_choice_move_disable_instructions); Knock Off / Trick / Thief / "
-        "Covet / Corrosive Gas (engine/src/genx/choice_effects.rs ChangeItem sites) never re-enable "
-        "the old holder's moves, so later plies of the search still treat the mon as locked."
-    ),
+@pytest.mark.skipif(
+    es._engine_sdb_level() < 28,
+    reason="engine < sdb.28 does not re-enable Choice-locked moves when Knock Off / Trick / Thief removes the item (72d)",
 )
 def test_engine_releases_choice_lock_when_knock_off_removes_the_item(data, sampler):
     import poke_engine as pe

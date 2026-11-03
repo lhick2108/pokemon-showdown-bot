@@ -102,6 +102,18 @@ def _wheel_supports_sdb22() -> tuple[bool, bool]:
 ENGINE_HAS_DURATIONS, ENGINE_HAS_MAX_PP = _wheel_supports_sdb22()
 
 
+def _wheel_supports_last_item() -> bool:
+    """`Pokemon(last_item=)` (Harvest's regrowable berry) is available (>= sdb.28)."""
+    try:
+        pe.Pokemon(last_item="sitrusberry")
+        return True
+    except TypeError:
+        return False
+
+
+ENGINE_HAS_LAST_ITEM = _wheel_supports_last_item()
+
+
 def engine_supports_volatile(name: str) -> bool:
     ok = _VOL_OK.get(name)
     if ok is None:
@@ -188,8 +200,17 @@ def sim_volatiles_to_engine(mon: dict, unrep: set, guess: set) -> tuple[set, dic
             dur["healblock"] = max(1, int(st.get("duration") or 5))
         elif vid == "throatchop" and ENGINE_HAS_DURATIONS:
             dur["throatchop"] = max(1, int(st.get("duration") or 2))
+        elif vid == "disable" and ENGINE_HAS_LAST_ITEM:
+            # sdb.28: turns_remaining * 4 + slot of the disabled move
+            slots = [to_id(m["id"]) for m in mon["moves"]]
+            mv = to_id(st.get("move") or "")
+            if mv in slots:
+                dur["disable"] = max(1, min(7, int(st.get("duration") or 4))) * 4 + slots.index(mv)
     if mon.get("abilityOnce") and engine_supports_volatile("typechange"):
         vols.add("typechange")
+    if mon.get("slowStart"):  # the engine's slowstart volatile = Showdown's ability counter
+        vols.add("slowstart")
+        dur["slowstart"] = int(mon["slowStart"])
     return vols, dur, sub_hp
 
 
@@ -236,6 +257,9 @@ def build_pokemon(m: dict, req_moves: list | None, unrep: set, guess: set):
         weight_kg=float(m["weightkg"]), terastallized=bool(m["terastallized"]),
         tera_type=to_id(m["teraType"]) or "typeless", moves=moves, times_attacked=int(m["timesAttacked"]),
     )
+    last = to_id(m.get("lastItem") or "")
+    if ENGINE_HAS_LAST_ITEM and to_id(m["ability"]) == "harvest" and last.endswith("berry"):
+        kw["last_item"] = last  # the engine tracks the eaten berry for Harvest only (sdb.28)
     try:
         p = pe.Pokemon(**kw)
     except TypeError:  # older wheels have no times_attacked
@@ -453,6 +477,8 @@ def sim_expected(post: dict, pre_built: Built) -> dict:
                 vid = "transformed"
             if vid not in IGNORED_VOLATILES and not vid.startswith(("ability:", "item:")) and not act["fainted"]:
                 vols.add(vid)
+        if act.get("slowStart") and not act["fainted"]:
+            vols.add("slowstart")
         sc = {"spikes": 0, "toxic_spikes": 0, "stealth_rock": 0, "sticky_web": 0, "reflect": 0, "light_screen": 0,
               "aurora_veil": 0, "tailwind": 0, "safeguard": 0, "mist": 0, "lucky_chant": 0}
         for cid, st in sd["sideConditions"].items():

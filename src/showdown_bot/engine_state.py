@@ -1138,6 +1138,17 @@ def _opponent_pokemon(slot: OpponentSlot, battle: Any) -> tuple[pe.Pokemon, list
         status = _status_of(mon)
         sleep_turns, rest_turns = _sleep_fields(battle, mon, status)
     locked_to = _locked_move(mon, item, move_ids)
+    # Harvest regrows the berry it ate (engine ``Pokemon.last_item``, sdb.28). The world's item is
+    # the set's berry; an empty revealed item means it was eaten (or, rarely, knocked off).
+    extra: dict[str, Any] = {}
+    sampled_item = to_id(sampled.item)
+    if (
+        _ENGINE_LAST_ITEM
+        and ability == "harvest"
+        and not item
+        and sampled_item.endswith("berry")
+    ):
+        extra["last_item"] = sampled_item
     moves: list[pe.Move] = []
     for move_id in move_ids:
         pp = _max_pp(move_id)
@@ -1169,6 +1180,7 @@ def _opponent_pokemon(slot: OpponentSlot, battle: Any) -> tuple[pe.Pokemon, list
         terastallized=bool(mon is not None and mon.is_terastallized),
         tera_type=tera_type,
         moves=moves,
+        **extra,
     )
     return pokemon, moves, mon
 
@@ -1204,6 +1216,8 @@ _ENGINE_SLEEP_FIXES = _engine_sdb_level() >= 4
 #: Safety Goggles block powder, Sticky Web counts as a foe drop (589.39). Pending Wish is
 #: passed through ``Side.wish`` (any build).
 _ENGINE_FAIL_FIXES = _engine_sdb_level() >= 5
+#: ``0.0.48+sdb.28``: ``Pokemon.last_item`` (Harvest) and forme fields.
+_ENGINE_LAST_ITEM = _engine_sdb_level() >= 28
 
 
 def _rebuild_pokemon(pokemon: pe.Pokemon, **changes: Any) -> pe.Pokemon:
@@ -1220,6 +1234,9 @@ def _rebuild_pokemon(pokemon: pe.Pokemon, **changes: Any) -> pe.Pokemon:
         mega_evolved=pokemon.mega_evolved, terastallized=pokemon.terastallized,
         tera_type=pokemon.tera_type, moves=list(pokemon.moves),
     )
+    last_item = getattr(pokemon, "last_item", None)
+    if last_item and last_item != "none":
+        kwargs["last_item"] = last_item
     kwargs.update(changes)
     return pe.Pokemon(**kwargs)
 

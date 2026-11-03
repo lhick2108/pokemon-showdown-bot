@@ -292,7 +292,7 @@ impl PySide {
         active_index="0".to_string(),
         baton_passing=false,
         shed_tailing=false,
-        volatile_status_durations=PyVolatileStatusDurations::new(0, 0, 0, 0, 0, 0, 0, 0),
+        volatile_status_durations=PyVolatileStatusDurations::new(0, 0, 0, 0, 0, 0, 0, 0, 0),
         wish=(0, 0),
         future_sight=(0, "0".to_string()),
         force_switch=false,
@@ -388,6 +388,8 @@ pub struct PyVolatileStatusDurations {
     pub yawn: i8,
     pub healblock: i8,
     pub throatchop: i8,
+    /// sdb.28: Disable as `turns_remaining * 4 + move_slot`, 0 = none
+    pub disable: i8,
 }
 
 impl From<VolatileStatusDurations> for PyVolatileStatusDurations {
@@ -401,6 +403,7 @@ impl From<VolatileStatusDurations> for PyVolatileStatusDurations {
             yawn: other.yawn,
             healblock: other.healblock,
             throatchop: other.throatchop,
+            disable: other.disable,
         }
     }
 }
@@ -416,6 +419,7 @@ impl Into<VolatileStatusDurations> for PyVolatileStatusDurations {
             yawn: self.yawn,
             healblock: self.healblock,
             throatchop: self.throatchop,
+            disable: self.disable,
         }
     }
 }
@@ -432,6 +436,7 @@ impl PyVolatileStatusDurations {
         yawn=0,
         healblock=0,
         throatchop=0,
+        disable=0,
     ))]
     fn new(
         confusion: i8,
@@ -442,6 +447,7 @@ impl PyVolatileStatusDurations {
         yawn: i8,
         healblock: i8,
         throatchop: i8,
+        disable: i8,
     ) -> PyVolatileStatusDurations {
         PyVolatileStatusDurations {
             confusion,
@@ -452,6 +458,7 @@ impl PyVolatileStatusDurations {
             yawn,
             healblock,
             throatchop,
+            disable,
         }
     }
 }
@@ -633,6 +640,8 @@ pub struct PyPokemon {
     pub terastallized: bool,
     pub tera_type: String,
     pub moves: Vec<PyMove>,
+    /// sdb.28: the berry Harvest can regrow (Showdown `lastItem`), "none" otherwise
+    pub last_item: String,
 }
 
 impl From<Pokemon> for PyPokemon {
@@ -671,6 +680,7 @@ impl From<Pokemon> for PyPokemon {
             mega_evolved: other.mega_evolved,
             terastallized: other.terastallized,
             tera_type: other.tera_type.to_string(),
+            last_item: other.last_item.to_string(),
             moves: other
                 .moves
                 .into_iter()
@@ -718,6 +728,7 @@ impl Into<Pokemon> for PyPokemon {
             mega_evolved: self.mega_evolved,
             terastallized: self.terastallized,
             tera_type: PokemonType::from_str(&self.tera_type).unwrap(),
+            last_item: Items::from_str(&self.last_item).unwrap(),
             moves: PokemonMoves {
                 m0: moves_vec[0].clone().into(),
                 m1: moves_vec[1].clone().into(),
@@ -756,6 +767,7 @@ impl PyPokemon {
         mega_evolved=false,
         terastallized=false,
         tera_type="typeless".to_string(),
+        last_item="none".to_string(),
     ))]
     fn new(
         id: String,
@@ -782,6 +794,7 @@ impl PyPokemon {
         mega_evolved: bool,
         terastallized: bool,
         tera_type: String,
+        last_item: String,
     ) -> Self {
         if base_ability == "" {
             base_ability = ability.clone();
@@ -811,6 +824,7 @@ impl PyPokemon {
             terastallized,
             tera_type,
             moves,
+            last_item,
         }
     }
     #[staticmethod]
