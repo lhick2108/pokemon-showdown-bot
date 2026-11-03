@@ -351,3 +351,75 @@ in Showdown), Imposter's `transformed` (5), Speed Boost (9, engine ticks on a tu
   (`Abilities::HUNGERSWITCH` exists; the stats / move Aura Wheel type are not recalculated), Ursaluna-Bloodmoon.
 * Slow Start (9 turns), Cursed Body (8), Unburden (7), Synchronize, a real Struggle choice when all PP are spent
   (currently the side gets `none`), Outrage / Thrash random length.
+
+---
+
+# After sdb.28 (72d, 589.68.4, 589.61): same 200 seeds, engine `0.0.48+sdb.28`
+
+`python scripts/engine_diff.py run --games 200 --seed 5000` (6,992 turns, 6,983 comparable, 22 s). The harness changed
+again, so sdb.27 was re-run with the *same* harness:
+
+* **Stable identity** (`uid` = the set species instead of `baseSpecies`): a permanent forme change (Disguise ->
+  Mimikyu-Busted, Tera Shift -> Terapagos-Terastal, Tera -> Terapagos-Stellar) rewrites `baseSpecies`, so the old harness
+  reported the same mon as a different active Pokemon (the 10 + 7 `active` rows of the sdb.22 top-10) and silently
+  skipped its HP / item / status comparison.
+* **Slow Start** is an ability counter in gen 9 (`abilityState.counter`), not a volatile; the harness now maps it to the
+  engine's `slowstart` volatile both ways (the 9 `slowstart` rows were a harness artifact; the engine timer was right).
+* With a sdb.28 wheel the harness also passes `Pokemon.last_item` (Harvest holders) and the Disable duration/slot.
+
+| | sdb.27, sdb.22-era harness | sdb.27, new harness | **sdb.28, new harness** |
+|---|---|---|---|
+| diverging turns, PP excluded | 383 / 6,983 = 5.5% | 362 = 5.2% | **284 = 4.1%** |
+| clean turns only | 376 / 6,928 = 5.4% | 355 = 5.1% | 279 / 6,928 = 4.0% |
+| PP-only turns | 20 | 20 | **8** |
+
+## What changed in the engine
+
+* **Choice lock release (72d)**: Knock Off, Thief, Covet, Trick / Switcheroo, Corrosive Gas and Magician re-enable the
+  moves a Choice lock disabled once the holder no longer holds a Choice item (`items::on_item_taken`; Choice-for-Choice
+  swaps and Gorilla Tactics keep the lock). Covet now steals like Thief; Corrosive Gas removes the target's item. A mon
+  that receives a Choice item is locked after its next move (unchanged `item_before_move`).
+* **Harvest**: `Pokemon.last_item` (optional trailing serialized field, py `Pokemon(last_item=)`), set by the new
+  reversible `SetLastItem` instruction when a Harvest holder *eats* a berry (not Knock Off / Thief / Trick). Last
+  residual: regrow with probability 1 in sun, else 0.5; a regrown berry whose condition holds is eaten at once (Sitrus
+  at <= 1/2). `add_end_of_turn_instructions` returns the "did not regrow" branches (up to 3 with two Harvest sides).
+  The live bot sets `last_item` for an opponent Harvest holder whose berry was eaten (`engine_state._opponent_pokemon`).
+* **Unnerve / As One** stop the foe's berries (end of turn, before-move pinch / resist berries, Lum / Chesto on status).
+  This, not Harvest, was most of the remaining Sitrus/Harvest rows (Pyroar vs Trevenant).
+* **Formes**: `abilities::permanent_forme_change` (Showdown `formeChange(..., isPermanent)`): each stat moves by the
+  base-stat difference, max HP via the new reversible `ChangeMaxHp` keeping the damage taken (`updateMaxHp`), ability and
+  base ability replaced. Used for **Tera Shift** on switch-in (Terapagos -> Terastal / Tera Shell, cannot be
+  suppressed) and **Terastal -> Stellar on Tera** (Teraform Zero, which also clears weather and terrain). Base stats
+  for the three Terapagos formes added. Mimikyu-Busted, Eiscue-Noice (incl. snow restore), Morpeko Hunger Switch,
+  Minior Shields Down and Ogerpon Tera formes were already handled; their `active` rows were the harness uid artifact.
+* **Unburden**: the `unburden` volatile is applied when the holder loses its item (any site: detected from the branch's
+  `ChangeItem x -> none` after each move and at end of turn); Speed x2 only while itemless.
+* **Cursed Body**: 30% Disable (secondary on the attacker) of the move that hit it; `VolatileStatusDurations.disable`
+  = `turns * 4 + slot` (optional trailing field, py `disable`), the move is disabled and re-enabled after 4 residuals.
+* **PP on a fainted target**: a move aimed at a target that fainted earlier in the turn spends its PP (Showdown
+  `[notarget]`) unless the user was asleep / frozen / flinched.
+
+Validation: `cargo test --release` 1,114 passed (1 ignored), 19 new `test_sdb28_*` (each also checks that every
+branch reverses to the exact starting state); `scripts/engine_fuzz.py --states 1000`: 1000 ok, 0 panics; pytest
+1,015 passed + `tests/test_engine_sdb28.py` (6). MCTS throughput (`scripts/engine_bench_pp.py --seconds 2 --reps 3`,
+4 alternating rounds per wheel, single thread): sdb.28 is 0-6% slower than sdb.27 (mean over rounds: legacy PP
+opening 301k vs 301k it/s, midgame 297k vs 304k, late 3v2 346k vs 363k; tracked PP 272k vs 289k, 275k vs 287k,
+321k vs 337k); round-to-round noise on this box is about +-4%.
+
+## New top-10 (turns, % of 6,983)
+
+| # | field / mechanic | turns | note |
+|---|---|---|---|
+| 1 | `curse` volatile left on a non-Ghost Curse user | 23 (5 rows) | cosmetic: the engine keeps the volatile, no effect |
+| 2 | hp, Recover | 8 | harness artifact (heal + damage compared as a net change) |
+| 3 | hp, Roost | 7 | same harness artifact |
+| 4 | Speed Boost | 9 | engine boosts on the switch-in turn (Showdown needs `activeTurns`) |
+| 5 | confusion after Outrage / Thrash | 10 | lock length is random 2-3 in Showdown, engine always 3 |
+| 6 | hp, Knock Off | 5 | net-HP tolerance (drain in the same turn) and Ice Face / Disguise + Knock Off (item still removed in Showdown) |
+| 7 | hp, Life Orb | 5 | no recoil after a Disguise-absorbed hit (Showdown applies it) |
+| 8 | `transformed` (Imposter) | 5 | Imposter / Choice Scarf interactions |
+| 9 | hp, Leftovers | 5 | mixed |
+| 10 | hp, Acrobatics | 4 | item-loss timing within the turn |
+
+Remaining plans: Speed Boost on the switch-in turn, random Outrage length, Life Orb / Knock Off through Disguise and
+Ice Face, Synchronize and a real Struggle choice.
