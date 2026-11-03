@@ -26,11 +26,16 @@ def engine_version() -> str:
 
 
 def use_engine(path: str) -> None:
-    """Pool initializer: put an unpacked engine wheel first on sys.path (league spec ``engine=``)."""
+    """Pool initializer: put an unpacked engine wheel first on sys.path (league spec ``engine=``).
+
+    A spawned worker re-imports the parent's main module (``-m showdown_bot.league``), which may
+    already have imported the default engine; those modules are dropped so the import below loads
+    the pinned build (the worker's search functions import poke_engine lazily, so they get it).
+    """
     import sys
 
-    if "poke_engine" in sys.modules:
-        raise RuntimeError("use_engine must run before poke_engine is imported")
+    for name in [n for n in sys.modules if n == "poke_engine" or n.startswith("poke_engine.")]:
+        del sys.modules[name]
     sys.path.insert(0, path)
     import poke_engine
 

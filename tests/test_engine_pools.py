@@ -29,3 +29,16 @@ def test_pinned_pool_runs_that_engine():
         assert pool.submit(_worker.engine_version).result(timeout=120) == f"0.0.48+{TAG}"
     finally:
         reset_pool((1, TAG), kill=True)
+
+
+@pytest.mark.skipif(not HAVE_WHEEL, reason=f"no {TAG} wheel in engine/wheels")
+def test_use_engine_replaces_an_already_imported_engine():
+    # a spawned worker re-imports `-m showdown_bot.league`, which imports the default engine first
+    import subprocess
+    import sys
+
+    code = ("import poke_engine; from showdown_bot.players import _worker; "
+            f"_worker.use_engine(r'{engines.engine_dir(TAG)}'); print(_worker.engine_version())")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == f"0.0.48+{TAG}"
