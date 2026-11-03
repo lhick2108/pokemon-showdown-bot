@@ -755,6 +755,7 @@ class LeagueConfig:
     strict_compute: bool = False  # refuse to start when search_workers > cores - 2
     strict_workers: bool = False  # cap concurrency so peak world-job demand <= search workers
     sprt: sprt.SprtConfig | None = None  # sequential paired-game test (two bots, bot 1 = candidate)
+    sprt_prior: tuple = (0, 0, 0, 0, 0)  # pentanomial counts from earlier runs (--sprt-prior), pooled
     stall_dump_s: float = 180.0  # no game finished for this long: dump stacks + pool state (0: off)
     specs: dict = field(default_factory=dict)  # label -> BotSpec
     compute: dict = field(default_factory=dict)  # filled by run_league: preflight + throughput
@@ -785,6 +786,27 @@ class SprtState:
                 "bounds": list(self.cfg.bounds), "verdict": self.verdict or "max",
                 "verdict_text": sprt.VERDICTS[self.verdict or "max"],
                 "elo": elo, "elo_ci": [lo, hi]}
+
+
+def sprt_run_counts(run_dir: Path, cand: str, base: str) -> list[int]:
+    """Pentanomial counts of ``cand`` vs ``base`` over the finished team pairs in a run's games.jsonl."""
+    pairs: dict = {}
+    path = Path(run_dir) / "games.jsonl"
+    if not path.exists():
+        raise ValueError(f"no games.jsonl in {run_dir}")
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        g = json.loads(line)
+        if {g["p1"], g["p2"]} != {cand, base} or g.get("team_pair") is None:
+            continue
+        w = g.get("winner")
+        pairs.setdefault(g["team_pair"], []).append(1.0 if w == cand else 0.0 if w == base else 0.5)
+    counts = [0] * 5
+    for scores in pairs.values():
+        if len(scores) == 2:
+            counts[sprt.pair_index(sum(scores))] += 1
+    return counts
 
 
 class Tracker:
@@ -1085,7 +1107,9 @@ async def _play_sprt_matchup(a, b, cfg, tracker, recorder, games_path, pair_inde
     other. ``a`` (the candidate) scores each pair 0..2; the verdict is frozen at the first
     crossing and pairs still in flight are cancelled.
     """
-    state = SprtState(cfg.sprt)
+    state = SprtState(cfg.sprt, counts=list(cfg.sprt_prior))
+    if any(cfg.sprt_prior):
+        state.verdict = sprt.decide(state.counts, cfg.sprt)
     tracker.sprt[(a, b)] = state
     seed = cfg.team_seed * 1000 + pair_index
     plans = teams_module.plan_games(cfg.teams, 2 * cfg.sprt.max_pairs, seed)
@@ -1536,7 +1560,10 @@ def _parser() -> argparse.ArgumentParser:
                         "Implies --teams swap and --strict-workers; stops at the verdict or "
                         "--max-games. --concurrency is then the number of pair lanes")
     p.add_argument("--max-games", type=bench._positive_int, default=2000,
-                   help="with --sprt: game budget (even; 2 per pair)")
+                   help="with --sprt: game budget (even; 2 per pair), counting --sprt-prior pairs")
+    p.add_argument("--sprt-prior", action="append", default=[], metavar="RUN_DIR:CANDIDATE:BASELINE",
+                   help="with --sprt: pool the paired games of an earlier run of the same matchup "
+                        "(its labels for this run's candidate and baseline); repeatable")
     p.add_argument("--strict-workers", action=argparse.BooleanOptionalAction, default=None,
                    help="cap --concurrency so concurrency x 2 x worlds <= --search-workers "
                         "(default on with --sprt)")
@@ -1579,6 +1606,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.teams == "random":
             args.teams = "swap"
         args.games_per_pair = args.max_games
+    prior = [0] * 5
+    for item in args.sprt_prior:
+        run, cand, base = item.rsplit(":", 2)
+        prior = [x + y for x, y in zip(prior, sprt_run_counts(Path(run), cand, base))]
+    if any(prior) and sprt_cfg is not None:
+        print(f"SPRT prior: pairs {prior} from {len(args.sprt_prior)} run(s)", flush=True)
     cfg = LeagueConfig(
         out=args.out, battle_format=args.format, games_per_pair=args.games_per_pair,
         concurrency=args.concurrency, connect_timeout=args.connect_timeout,
@@ -1590,7 +1623,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         strict_compute=args.strict_compute, stall_dump_s=args.stall_dump_s,
         strict_workers=(sprt_cfg is not None) if args.strict_workers is None
         else args.strict_workers,
-        sprt=sprt_cfg,
+        sprt=sprt_cfg, sprt_prior=tuple(prior),
     )
     if args.teams != "random" and args.games_per_pair % 2:
         print(f"error: --teams {args.teams} needs an even --games-per-pair", file=sys.stderr)

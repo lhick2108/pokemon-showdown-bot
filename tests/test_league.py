@@ -347,3 +347,14 @@ def test_play_sprt_matchup_stops_at_verdict(tmp_path, monkeypatch):
     assert state.counts[4] >= 5 and sum(state.counts) == state.counts[4]
     assert len(games) < 400  # stopped early
     assert len(tracker.lanes[("cand", "base")]) == 3
+
+
+def test_sprt_run_counts_pools_finished_pairs(tmp_path):
+    rows = [("c", "b", "c", 0), ("b", "c", "c", 0),   # pair 0: candidate wins both -> index 4
+            ("c", "b", "b", 1), ("b", "c", "c", 1),   # pair 1: split -> index 2
+            ("c", "b", "b", 2)]                       # pair 2 unfinished: dropped
+    with open(tmp_path / "games.jsonl", "w", encoding="utf-8") as f:
+        for p1, p2, winner, pair in rows:
+            f.write(json.dumps({"p1": p1, "p2": p2, "winner": winner, "team_pair": pair}) + "\n")
+    assert league.sprt_run_counts(tmp_path, "c", "b") == [0, 0, 1, 0, 1]
+    assert league.sprt_run_counts(tmp_path, "b", "c") == [1, 0, 1, 0, 0]
