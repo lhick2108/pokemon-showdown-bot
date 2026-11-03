@@ -26,14 +26,14 @@ python scripts/ladder.py --games 3 --dry-run            # local server 127.0.0.1
 ```
 
 Promoted config on a pinned engine (the main .venv keeps an old engine): `scripts/ladder_best.py` unzips
-`engine/wheels/poke_engine-0.0.48+<engine>-*.whl` (default `sdb.27`) to `.cache/engine/` and runs `ladder.py` with
+`engine/wheels/poke_engine-0.0.48+<engine>-*.whl` (default `sdb.28`; `sdb.27` is the engine stack789v5 was SPRT-tested on) to `.cache/engine/` and runs `ladder.py` with
 `--bot best:worlds=16 --move-cap 10 --search-workers 16` unless given; other arguments pass through.
 
 ```
 python scripts/ladder_best.py --check                      # engine version, model files, parsed config; no connection
 python scripts/ladder_best.py --games 1 --dry-run          # local server rehearsal
 python scripts/ladder_best.py --games 300                  # public ladder
-python scripts/ladder_best.py --engine sdb.28 --games 300  # after the sdb.28 regression check
+python scripts/ladder_best.py --games 600 --ab-log data/ladder/ab-human1.jsonl --arm self=best:worlds=16 \n    --arm human=best:worlds=16:prior_opp=human:prior_human=models/human-policy.npz   # A/B, --bot is not added
 ```
 
 Options: `--bot` (league spec syntax, default `search`; the presets `best` and `best-gen7` expand to the

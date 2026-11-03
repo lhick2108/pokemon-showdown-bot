@@ -2,13 +2,15 @@
 
     python scripts/ladder_best.py --check                 # verify engine, models and spec; no connection
     python scripts/ladder_best.py --games 300             # public ladder, best:worlds=16
-    python scripts/ladder_best.py --engine sdb.28 --games 3 --dry-run
+    python scripts/ladder_best.py --engine sdb.27 --games 3 --dry-run
+    python scripts/ladder_best.py --games 600 --arm self=best:worlds=16 \
+        --arm human=best:worlds=16:prior_opp=human:prior_human=models/human-policy.npz
 
 The main .venv keeps an old engine (Windows locks the .pyd while jobs run), so the
 wheel engine/wheels/poke_engine-0.0.48+<engine>-*.whl is unzipped once to
 .cache/engine/<engine> and put first on PYTHONPATH with src/. Every other argument
-goes to scripts/ladder.py; --bot, --move-cap and --search-workers get the defaults
-below unless given.
+goes to scripts/ladder.py; --bot (unless --arm is given), --move-cap and
+--search-workers get the defaults below unless given.
 """
 
 from __future__ import annotations
@@ -21,8 +23,26 @@ import zipfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-ENGINE = "sdb.27"  # the engine stack789v5 was validated on (4-world SPRT, 2026-10-20)
+# sdb.27 is the engine stack789v5 was SPRT-tested on (2026-10-20); sdb.28 adds fidelity fixes only
+ENGINE = "sdb.28"
 DEFAULTS = {"--bot": "best:worlds=16", "--move-cap": "10", "--search-workers": "16"}
+
+CHECK = """
+import importlib.metadata as m, sys
+from pathlib import Path
+import poke_engine
+from showdown_bot import ladder_ab, league
+print("engine", m.version("poke_engine"), "from", poke_engine.__file__)
+for text in sys.argv[1:]:
+    spec = league.parse_spec(text)
+    for key in ("evaluator", "prior", "prior_human"):
+        value = spec.param(key)
+        assert value is None or Path(value).is_file(), f"{spec.label}: missing {key} file {value}"
+    cfg = ladder_ab.arm_search_config(spec, 1000)
+    print("spec  ", spec.text)
+    print("      ", {k: getattr(cfg, k) for k in ("worlds", "mode", "evaluator", "prior", "prior_opp",
+                                                  "prior_human", "c_puct")})
+"""
 
 
 def engine_dir(tag: str) -> Path:
@@ -39,31 +59,21 @@ def engine_dir(tag: str) -> Path:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--engine", default=ENGINE, help=f"engine wheel tag (default {ENGINE})")
-    p.add_argument("--check", action="store_true", help="load engine, models and spec, then exit")
+    p.add_argument("--check", action="store_true", help="load engine, models and specs, then exit")
     args, rest = p.parse_known_args(argv)
 
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join([str(engine_dir(args.engine)), str(REPO / "src")])
-    bot = next((rest[i + 1] for i, a in enumerate(rest[:-1]) if a == "--bot"), DEFAULTS["--bot"])
+    arms = [rest[i + 1] for i, a in enumerate(rest[:-1]) if a == "--arm"]
+    bots = arms or [next((rest[i + 1] for i, a in enumerate(rest[:-1]) if a == "--bot"), DEFAULTS["--bot"])]
     for flag, value in DEFAULTS.items():
+        if flag == "--bot" and arms:
+            continue
         if flag not in rest and not any(a.startswith(flag + "=") for a in rest):
             rest += [flag, value]
 
     if args.check:
-        probe = (
-            "import importlib.metadata as m, poke_engine, showdown_bot.league as L\n"
-            f"spec = L.parse_spec({bot!r})\n"
-            "from pathlib import Path\n"
-            "for k in ('evaluator', 'prior'):\n"
-            "    v = spec.param(k)\n"
-            "    assert v is None or Path(v).is_file(), f'missing {k}: {v}'\n"
-            "from showdown_bot import ladder_ab\n"
-            "cfg = ladder_ab.arm_search_config(spec, 1000)\n"
-            "print('engine', m.version('poke_engine'), 'from', poke_engine.__file__)\n"
-            "print('spec  ', spec.text)\n"
-            "print('config', cfg)\n"
-        )
-        return subprocess.call([sys.executable, "-c", probe], env=env, cwd=REPO)
+        return subprocess.call([sys.executable, "-c", CHECK, *bots], env=env, cwd=REPO)
     return subprocess.call([sys.executable, str(REPO / "scripts" / "ladder.py"), *rest], env=env, cwd=REPO)
 
 
