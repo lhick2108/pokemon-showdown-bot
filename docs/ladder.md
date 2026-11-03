@@ -22,10 +22,12 @@
 ```
 python scripts/ladder.py --games 1                      # first real game
 python scripts/ladder.py --games 20 --bot search-net:evaluator=models/x.pev:scale=1.5
+python scripts/ladder.py --games 300 --bot best:worlds=16  # promoted config (league.PRESETS)
 python scripts/ladder.py --games 3 --dry-run            # local server 127.0.0.1:8000, throwaway accounts
 ```
 
-Options: `--bot` (league spec syntax, default `search`), `--max-concurrent 1`,
+Options: `--bot` (league spec syntax, default `search`; the presets `best` and `best-gen7` expand to the
+current and previous promoted configs, keys after them override, e.g. `best:worlds=16`), `--max-concurrent 1`,
 `--move-cap 5` (hard seconds per decision; on overrun a base-power x effectiveness
 heuristic move is played), `--save-replays` (asks the server for `/savereplay`,
 default off), `--game-timeout 1800` (forfeit a battle that long as a last resort,

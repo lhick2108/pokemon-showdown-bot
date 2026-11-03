@@ -132,6 +132,19 @@ def test_parse_spec_selection_keys():
             league.parse_spec(bad)
 
 
+def test_parse_spec_presets():
+    best, b16, old = league.parse_bots("best,b16=best:worlds=16:noop=strict,old=best-gen7")
+    assert (best.label, best.type) == ("best", "search-net")
+    assert best.param("prior").endswith("prior-gen789-h32.ppol")
+    assert best.param("evaluator").endswith("ft-v5-h128.pev")
+    assert (best.param("worlds"), best.param("mode"), best.param("c_puct")) == (4, "argmax", 2.0)
+    assert (b16.label, b16.param("worlds"), b16.param("noop")) == ("b16", 16, "strict")
+    assert [k for k, _ in b16.params].count("worlds") == 1
+    assert old.param("evaluator").endswith("gen7-res-root-mlp16.pev")
+    with pytest.raises(ValueError):
+        league.parse_spec("x=best:bogus=1")
+
+
 @pytest.mark.parametrize("bad", [
     "x=search:bogus=1", "x=search:time_ms", "x=search:time_ms=abc", "x=search:time_ms=0",
     "x=search:scale=-1", "x=nope", "=search", "x=search:time_ms=1:time_ms=2",

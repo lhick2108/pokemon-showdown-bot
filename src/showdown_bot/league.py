@@ -43,6 +43,23 @@ logger = logging.getLogger("showdown_bot.league")
 SCHEMA_VERSION = 1
 TIE = "tie"
 ALIASES = {"heuristic": "heuristics", "fp": FOULPLAY_NAME}
+# Named configurations: `best` or `label=best[:key=value...]` expands to the preset, keys given
+# after it override the preset's. `best` = stack789v5, promoted 2026-11-03 (SPRT vs gen7+prior56:
+# +20.9 [+3.3, +38.6] at 4 worlds / 600 pairs, +12.2 [-17.7, +42.2] at 16 worlds / 200 pairs).
+_MODELS = Path(__file__).resolve().parents[2] / "models"
+PRESETS = {
+    "best": ("search-net", (
+        ("scale", "1.5"), ("c_puct", "2"), ("prior", str(_MODELS / "prior-gen789-h32.ppol")),
+        ("mode", "argmax"), ("time_ms", "1000"), ("worlds", "4"),
+        ("evaluator", str(_MODELS / "ft-v5-h128.pev")),
+    )),
+    # previous best (gen7 evaluator + gen56 prior), kept as the regression baseline
+    "best-gen7": ("search-net", (
+        ("scale", "1.5"), ("c_puct", "2"), ("prior", str(_MODELS / "prior-gen56-h32.ppol")),
+        ("mode", "argmax"), ("time_ms", "1000"), ("worlds", "4"),
+        ("evaluator", str(_MODELS / "gen7-res-root-mlp16.pev")),
+    )),
+}
 SEARCH_BOTS = ("search", "search-net", "humansearch")
 PRIOR_WEIGHT = 0.5  # virtual tie games added between every pair of bots
 
@@ -178,6 +195,11 @@ def parse_spec(text: str) -> BotSpec:
         raise ValueError(f"malformed bot spec {raw!r}")
     type_name = ALIASES.get(type_name.strip(), type_name.strip())
     label = ALIASES.get(label.strip(), label.strip())
+    if type_name in PRESETS:
+        type_name, preset = PRESETS[type_name]
+        given = dict(item.partition("=")[::2] for item in _split_spec_params(rest)) if rest else {}
+        merged = [(k, given.pop(k, v)) for k, v in preset] + list(given.items())
+        return parse_spec(f"{label}={type_name}:" + ":".join(f"{k}={v}" for k, v in merged))
     if not label or not re.fullmatch(r"[A-Za-z0-9_.+-]+", label):
         raise ValueError(f"bad bot label {label!r} in {raw!r}")
     if type_name != FOULPLAY_NAME:

@@ -145,7 +145,8 @@ path and device).
 
 ### Example SPRT commands
 
-Current best: `search-net:scale=1.5:c_puct=2:prior=models\prior-gen56-h32.ppol:mode=argmax:time_ms=1000:worlds=4:evaluator=models\gen7-res-root-mlp16.pev`
+Best at the time of these runs (now the `best-gen7` spec preset; the current best is the `best` preset, see
+`league.PRESETS`): `search-net:scale=1.5:c_puct=2:prior=models\prior-gen56-h32.ppol:mode=argmax:time_ms=1000:worlds=4:evaluator=models\gen7-res-root-mlp16.pev`
 
 ```
 # transformer prior replaces the .ppol at the root, everything else identical
