@@ -22,8 +22,18 @@
 ```
 python scripts/ladder.py --games 1                      # first real game
 python scripts/ladder.py --games 20 --bot search-net:evaluator=models/x.pev:scale=1.5
-python scripts/ladder.py --games 300 --bot best:worlds=16  # promoted config (league.PRESETS)
 python scripts/ladder.py --games 3 --dry-run            # local server 127.0.0.1:8000, throwaway accounts
+```
+
+Promoted config on a pinned engine (the main .venv keeps an old engine): `scripts/ladder_best.py` unzips
+`engine/wheels/poke_engine-0.0.48+<engine>-*.whl` (default `sdb.27`) to `.cache/engine/` and runs `ladder.py` with
+`--bot best:worlds=16 --move-cap 10 --search-workers 16` unless given; other arguments pass through.
+
+```
+python scripts/ladder_best.py --check                      # engine version, model files, parsed config; no connection
+python scripts/ladder_best.py --games 1 --dry-run          # local server rehearsal
+python scripts/ladder_best.py --games 300                  # public ladder
+python scripts/ladder_best.py --engine sdb.28 --games 300  # after the sdb.28 regression check
 ```
 
 Options: `--bot` (league spec syntax, default `search`; the presets `best` and `best-gen7` expand to the
