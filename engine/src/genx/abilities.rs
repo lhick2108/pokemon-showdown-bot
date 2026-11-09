@@ -1,7 +1,7 @@
 #![allow(unused_variables)]
 use super::damage_calc::type_effectiveness_modifier;
 use super::generate_instructions::{add_remove_status_instructions, apply_boost_instruction};
-use super::items::{get_choice_move_disable_instructions, Items};
+use super::items::{get_choice_move_disable_instructions, on_item_taken, Items};
 use super::state::{PokemonVolatileStatus, Terrain, Weather};
 use crate::choices::{
     Boost, Choice, Choices, Effect, Heal, MoveCategory, MoveTarget, Secondary, StatBoosts,
@@ -11,12 +11,14 @@ use crate::define_enum_with_from_str;
 use crate::instruction::{
     ApplyVolatileStatusInstruction, BoostInstruction, ChangeAbilityInstruction,
     ChangeItemInstruction, ChangeSideConditionInstruction, ChangeStatusInstruction, ChangeTerrain,
-    ChangeType, ChangeVolatileStatusDurationInstruction, ChangeWeather, DamageInstruction,
-    FormeChangeInstruction, HealInstruction, Instruction, StateInstructions,
+    ChangeMoveInstruction, ChangeStatInstruction, ChangeType,
+    ChangeVolatileStatusDurationInstruction, ChangeWeather, ChangeWeightInstruction,
+    DamageInstruction, DecrementPPInstruction, FormeChangeInstruction, HealInstruction, Instruction, StateInstructions,
 };
 use crate::pokemon::PokemonName;
 use crate::state::{
-    PokemonBoostableStat, PokemonSideCondition, PokemonStatus, PokemonType, Side, SideReference,
+    Pokemon, PokemonBoostableStat, PokemonMoveIndex, PokemonSideCondition, PokemonStatus, PokemonType, Side,
+    SideReference,
     State,
 };
 use std::cmp;
@@ -516,6 +518,76 @@ fn quarkdrive_volatile_from_side(side: &Side) -> PokemonVolatileStatus {
     }
 }
 
+/// Protosynthesis / Quark Drive for a Pokemon that is already out when sun / Electric Terrain
+/// starts (Showdown `onWeatherChange` / `onTerrainChange`). The switch-in case is handled by
+/// `ability_on_switch_in`; this covers Sunny Day / Drought / Electric Terrain set by either
+/// side after the Pokemon entered. Runs after each half-turn.
+pub fn ability_field_change_activation(
+    state: &mut State,
+    side_ref: &SideReference,
+    instructions: &mut StateInstructions,
+) {
+    let sun = state.weather_is_active(&Weather::SUN);
+    let electric = state.terrain_is_active(&Terrain::ELECTRICTERRAIN);
+    if !sun && !electric {
+        return;
+    }
+    let side = state.get_side(side_ref);
+    let active = side.get_active_immutable();
+    if active.hp <= 0 {
+        return;
+    }
+    match active.ability {
+        Abilities::PROTOSYNTHESIS if sun => {
+            let boosted = [
+                PokemonVolatileStatus::PROTOSYNTHESISATK,
+                PokemonVolatileStatus::PROTOSYNTHESISDEF,
+                PokemonVolatileStatus::PROTOSYNTHESISSPA,
+                PokemonVolatileStatus::PROTOSYNTHESISSPD,
+                PokemonVolatileStatus::PROTOSYNTHESISSPE,
+            ]
+            .iter()
+            .any(|v| side.volatile_statuses.contains(v));
+            if !boosted {
+                let volatile = protosynthesis_volatile_from_side(side);
+                side.volatile_statuses.insert(volatile);
+                instructions
+                    .instruction_list
+                    .push(Instruction::ApplyVolatileStatus(
+                        ApplyVolatileStatusInstruction {
+                            side_ref: *side_ref,
+                            volatile_status: volatile,
+                        },
+                    ));
+            }
+        }
+        Abilities::QUARKDRIVE if electric => {
+            let boosted = [
+                PokemonVolatileStatus::QUARKDRIVEATK,
+                PokemonVolatileStatus::QUARKDRIVEDEF,
+                PokemonVolatileStatus::QUARKDRIVESPA,
+                PokemonVolatileStatus::QUARKDRIVESPD,
+                PokemonVolatileStatus::QUARKDRIVESPE,
+            ]
+            .iter()
+            .any(|v| side.volatile_statuses.contains(v));
+            if !boosted {
+                let volatile = quarkdrive_volatile_from_side(side);
+                side.volatile_statuses.insert(volatile);
+                instructions
+                    .instruction_list
+                    .push(Instruction::ApplyVolatileStatus(
+                        ApplyVolatileStatusInstruction {
+                            side_ref: *side_ref,
+                            volatile_status: volatile,
+                        },
+                    ));
+            }
+        }
+        _ => {}
+    }
+}
+
 pub fn ability_before_move(
     state: &mut State,
     choice: &mut Choice,
@@ -556,7 +628,8 @@ pub fn ability_before_move(
             if (choice.category == MoveCategory::Physical
                 || choice.category == MoveCategory::Special)
                 && (defending_pkmn.id == PokemonName::MIMIKYU
-                    || defending_pkmn.id == PokemonName::MIMIKYUTOTEM) =>
+                    || defending_pkmn.id == PokemonName::MIMIKYUTOTEM)
+                && type_effectiveness_modifier(&choice.move_type, defending_pkmn) > 0.0 =>
         {
             choice.base_power = 0.0;
             instructions
@@ -572,7 +645,8 @@ pub fn ability_before_move(
             if (choice.category == MoveCategory::Physical
                 || choice.category == MoveCategory::Special)
                 && (defending_pkmn.id == PokemonName::MIMIKYU
-                    || defending_pkmn.id == PokemonName::MIMIKYUTOTEM) =>
+                    || defending_pkmn.id == PokemonName::MIMIKYUTOTEM)
+                && type_effectiveness_modifier(&choice.move_type, defending_pkmn) > 0.0 =>
         {
             choice.base_power = 0.0;
             instructions
@@ -619,7 +693,11 @@ pub fn ability_before_move(
                 .contains(&PokemonVolatileStatus::TYPECHANGE)
             {
                 let active_pkmn = attacking_side.get_active();
-                if !active_pkmn.has_type(&choice.move_type) && !active_pkmn.terastallized {
+                // Showdown compares the whole type list: a Water/Dark Greninja using a Water
+                // move still becomes pure Water (once per switch-in, via TYPECHANGE)
+                if active_pkmn.types != (choice.move_type, PokemonType::TYPELESS)
+                    && !active_pkmn.terastallized
+                {
                     instructions
                         .instruction_list
                         .push(Instruction::ChangeType(ChangeType {
@@ -747,7 +825,14 @@ pub fn ability_after_damage_hit(
                         new_item: Items::NONE,
                     },
                 ));
+                let old_item = defending_pkmn.item;
                 defending_pkmn.item = Items::NONE;
+                on_item_taken(
+                    defending_side,
+                    &side_ref.get_other_side(),
+                    old_item,
+                    &mut instructions.instruction_list,
+                );
             }
         }
         Abilities::MOXIE | Abilities::CHILLINGNEIGH | Abilities::ASONEGLASTRIER => {
@@ -857,6 +942,28 @@ pub fn ability_after_damage_hit(
                 });
                 defending_pkmn.types = (choice.move_type, PokemonType::TYPELESS);
                 instructions.instruction_list.push(change_type_instruction);
+            }
+        }
+        // Electromorphosis (any damaging hit) / Wind Power (wind moves): the holder gets Charge
+        Abilities::ELECTROMORPHOSIS | Abilities::WINDPOWER => {
+            if damage_dealt > 0
+                && defending_pkmn.hp != 0
+                && (defending_pkmn.ability == Abilities::ELECTROMORPHOSIS || choice.flags.wind)
+                && !defending_side
+                    .volatile_statuses
+                    .contains(&PokemonVolatileStatus::CHARGE)
+            {
+                instructions
+                    .instruction_list
+                    .push(Instruction::ApplyVolatileStatus(
+                        ApplyVolatileStatusInstruction {
+                            side_ref: side_ref.get_other_side(),
+                            volatile_status: PokemonVolatileStatus::CHARGE,
+                        },
+                    ));
+                defending_side
+                    .volatile_statuses
+                    .insert(PokemonVolatileStatus::CHARGE);
             }
         }
         Abilities::STAMINA => {
@@ -1138,6 +1245,96 @@ pub fn ability_on_switch_out(
     }
 }
 
+/// Weather residual abilities (Showdown `onWeather`, fired with the weather's own residual at
+/// order 1: before Future Sight / Wish / Leftovers / status damage). Heal Block stops the heals.
+pub fn ability_weather_residual(
+    state: &mut State,
+    side_ref: &SideReference,
+    instructions: &mut StateInstructions,
+) {
+    let (own_side, other_side) = state.get_both_sides_immutable(side_ref);
+    if other_side.get_active_immutable().ability == Abilities::NEUTRALIZINGGAS {
+        return;
+    }
+    let blocked = own_side
+        .volatile_statuses
+        .contains(&PokemonVolatileStatus::HEALBLOCK);
+    let ability = own_side.get_active_immutable().ability;
+    let rain = state.weather_is_active(&Weather::RAIN) || state.weather_is_active(&Weather::HEAVYRAIN);
+    let active_pkmn = state.get_side(side_ref).get_active();
+    if active_pkmn.hp <= 0 {
+        return;
+    }
+    let mut heal_frac: i16 = 0; // denominator; 0 = none
+    let mut damage_frac: i16 = 0;
+    match ability {
+        Abilities::SOLARPOWER => {
+            if state.weather_is_active(&Weather::HARSHSUN) || state.weather_is_active(&Weather::SUN) {
+                damage_frac = 8;
+            }
+        }
+        Abilities::DRYSKIN => {
+            if state.weather_is_active(&Weather::RAIN) || state.weather_is_active(&Weather::HEAVYRAIN) {
+                heal_frac = 8;
+            } else if state.weather_is_active(&Weather::HARSHSUN) || state.weather_is_active(&Weather::SUN) {
+                damage_frac = 8;
+            }
+        }
+        Abilities::RAINDISH if rain => heal_frac = 16,
+        Abilities::ICEBODY if state.weather_is_active(&Weather::HAIL) => heal_frac = 16,
+        _ => return,
+    }
+    let active_pkmn = state.get_side(side_ref).get_active();
+    if heal_frac > 0 && !blocked {
+        let amount = cmp::min(active_pkmn.maxhp / heal_frac, active_pkmn.maxhp - active_pkmn.hp);
+        if amount > 0 {
+            instructions.instruction_list.push(Instruction::Heal(HealInstruction {
+                side_ref: *side_ref,
+                heal_amount: amount,
+            }));
+            active_pkmn.hp += amount;
+        }
+    } else if damage_frac > 0 && active_pkmn.ability != Abilities::MAGICGUARD {
+        let amount = cmp::min(active_pkmn.maxhp / damage_frac, active_pkmn.hp);
+        if amount > 0 {
+            instructions.instruction_list.push(Instruction::Damage(DamageInstruction {
+                side_ref: *side_ref,
+                damage_amount: amount,
+            }));
+            active_pkmn.hp -= amount;
+        }
+    }
+}
+
+/// Hydration / Shed Skin (Showdown residual order 5, sub-order 3: after Wish and Grassy Terrain,
+/// before Leftovers and before poison / burn damage). Shed Skin's 1/3 chance is not branched on.
+pub fn ability_status_cure_residual(
+    state: &mut State,
+    side_ref: &SideReference,
+    instructions: &mut StateInstructions,
+) {
+    let (own_side, other_side) = state.get_both_sides_immutable(side_ref);
+    if other_side.get_active_immutable().ability == Abilities::NEUTRALIZINGGAS {
+        return;
+    }
+    let active = own_side.get_active_immutable();
+    if active.hp <= 0 || active.status == PokemonStatus::NONE {
+        return;
+    }
+    let cure = match active.ability {
+        Abilities::HYDRATION => {
+            state.weather_is_active(&Weather::RAIN) || state.weather_is_active(&Weather::HEAVYRAIN)
+        }
+        Abilities::SHEDSKIN => true,
+        _ => false,
+    };
+    if cure {
+        let side = state.get_side(side_ref);
+        let active_index = side.active_index;
+        add_remove_status_instructions(instructions, active_index, *side_ref, side);
+    }
+}
+
 pub fn ability_end_of_turn(
     state: &mut State,
     side_ref: &SideReference,
@@ -1230,54 +1427,6 @@ pub fn ability_end_of_turn(
                 defender.hp -= damage_dealt;
             }
         }
-        Abilities::SOLARPOWER => {
-            if state.weather_is_active(&Weather::HARSHSUN) || state.weather_is_active(&Weather::SUN)
-            {
-                let active_pkmn = state.get_side(side_ref).get_active();
-                let damage_dealt =
-                    cmp::min(active_pkmn.maxhp / 8, active_pkmn.maxhp - active_pkmn.hp);
-                if damage_dealt > 0 {
-                    instructions
-                        .instruction_list
-                        .push(Instruction::Damage(DamageInstruction {
-                            side_ref: *side_ref,
-                            damage_amount: damage_dealt,
-                        }));
-                    active_pkmn.hp -= damage_dealt;
-                }
-            }
-        }
-        Abilities::ICEBODY => {
-            if state.weather_is_active(&Weather::HAIL) {
-                let active_pkmn = state.get_side(side_ref).get_active();
-                let health_recovered =
-                    cmp::min(active_pkmn.maxhp / 16, active_pkmn.maxhp - active_pkmn.hp);
-                if health_recovered > 0 {
-                    instructions
-                        .instruction_list
-                        .push(Instruction::Heal(HealInstruction {
-                            side_ref: *side_ref,
-                            heal_amount: health_recovered,
-                        }));
-                    active_pkmn.hp += health_recovered;
-                }
-            }
-        }
-        Abilities::POISONHEAL => {
-            if active_pkmn.hp < active_pkmn.maxhp
-                && (active_pkmn.status == PokemonStatus::POISON
-                    || active_pkmn.status == PokemonStatus::TOXIC)
-            {
-                let heal_amount =
-                    cmp::min(active_pkmn.maxhp / 8, active_pkmn.maxhp - active_pkmn.hp);
-                let ins = Instruction::Heal(HealInstruction {
-                    side_ref: side_ref.clone(),
-                    heal_amount: heal_amount,
-                });
-                active_pkmn.hp += heal_amount;
-                instructions.instruction_list.push(ins);
-            }
-        }
         Abilities::SPEEDBOOST => {
             if attacking_side.speed_boost < 6 {
                 let ins = Instruction::Boost(BoostInstruction {
@@ -1289,73 +1438,285 @@ pub fn ability_end_of_turn(
                 instructions.instruction_list.push(ins);
             }
         }
-        Abilities::RAINDISH => {
-            if state.weather_is_active(&Weather::RAIN)
-                || state.weather_is_active(&Weather::HEAVYRAIN)
-            {
-                let active_pkmn = state.get_side(side_ref).get_active();
-                let health_recovered =
-                    cmp::min(active_pkmn.maxhp / 16, active_pkmn.maxhp - active_pkmn.hp);
-                if health_recovered > 0 {
-                    instructions
-                        .instruction_list
-                        .push(Instruction::Heal(HealInstruction {
-                            side_ref: *side_ref,
-                            heal_amount: health_recovered,
-                        }));
-                    active_pkmn.hp += health_recovered;
-                }
-            }
-        }
-        Abilities::DRYSKIN => {
-            if state.weather_is_active(&Weather::RAIN) {
-                let active_pkmn = state.get_side(side_ref).get_active();
-                if active_pkmn.hp < active_pkmn.maxhp {
-                    let heal_amount =
-                        cmp::min(active_pkmn.maxhp / 8, active_pkmn.maxhp - active_pkmn.hp);
-                    let ins = Instruction::Heal(HealInstruction {
-                        side_ref: side_ref.clone(),
-                        heal_amount: heal_amount,
-                    });
-                    active_pkmn.hp += heal_amount;
-                    instructions.instruction_list.push(ins);
-                }
-            }
-        }
-        Abilities::HYDRATION => {
-            if active_pkmn.status != PokemonStatus::NONE
-                && (state.weather_is_active(&Weather::RAIN)
-                    || state.weather_is_active(&Weather::HEAVYRAIN))
-            {
-                let attacking_side = state.get_side(side_ref);
-                let active_index = attacking_side.active_index;
-                let active_pkmn = attacking_side.get_active();
-
-                add_remove_status_instructions(
-                    instructions,
-                    active_index,
-                    *side_ref,
-                    attacking_side,
-                );
-            }
-        }
-        // Shed skin only has a 1/3 chance of activating at the end of the turn
-        // but I'm not going to branch on that here
-        Abilities::SHEDSKIN => {
-            if active_pkmn.status != PokemonStatus::NONE {
-                let attacking_side = state.get_side(side_ref);
-                let active_index = attacking_side.active_index;
-                let active_pkmn = attacking_side.get_active();
-
-                add_remove_status_instructions(
-                    instructions,
-                    active_index,
-                    *side_ref,
-                    attacking_side,
-                );
-            }
-        }
         _ => {}
+    }
+}
+
+/// Imposter: on switch-in, transform into the opposing active Pokemon
+/// (Pokemon Showdown `Pokemon.transformInto`, gen 9). Copies types, attack/defense/
+/// special attack/special defense/speed (not HP), all stat boosts, moves (5 PP each),
+/// ability and weight. Fails if either side is already transformed, the target has a
+/// substitute or a disguised Illusion, or either mon is fainted. Tera type and
+/// terastallization state are NOT copied (the target's pre-Tera types are copied).
+/// The user keeps its own species id (so stats are not recalculated), and the
+/// copied stats/moves are not restored on switch-out (the TRANSFORMED volatile is
+/// removed and the ability reverts; Imposter re-copies on the next entry).
+pub fn imposter_transform(
+    state: &mut State,
+    side_ref: &SideReference,
+    instructions: &mut StateInstructions,
+) {
+    let (own_side, foe_side) = state.get_both_sides(side_ref);
+    let foe = foe_side.get_active_immutable();
+    let own = own_side.get_active_immutable();
+    if own.hp <= 0
+        || foe.hp <= 0
+        || foe.ability == Abilities::ILLUSION
+        || foe_side
+            .volatile_statuses
+            .contains(&PokemonVolatileStatus::SUBSTITUTE)
+        || foe_side
+            .volatile_statuses
+            .contains(&PokemonVolatileStatus::TRANSFORMED)
+        || own_side
+            .volatile_statuses
+            .contains(&PokemonVolatileStatus::TRANSFORMED)
+    {
+        return;
+    }
+    // PS: `pokemon.getTypes(true, true)` -> excludes added types AND ignores
+    // terastallization, so the pre-Tera typing is copied
+    let foe_types = foe.types;
+    let foe_ability = foe.ability;
+    let foe_stats = (
+        foe.attack,
+        foe.defense,
+        foe.special_attack,
+        foe.special_defense,
+        foe.speed,
+    );
+    let foe_weight_hg = (foe.weight_kg * 10.0).round() as i16;
+    let foe_moves = [
+        foe.moves.m0.id,
+        foe.moves.m1.id,
+        foe.moves.m2.id,
+        foe.moves.m3.id,
+    ];
+    let foe_boosts = [
+        (PokemonBoostableStat::Attack, foe_side.attack_boost),
+        (PokemonBoostableStat::Defense, foe_side.defense_boost),
+        (
+            PokemonBoostableStat::SpecialAttack,
+            foe_side.special_attack_boost,
+        ),
+        (
+            PokemonBoostableStat::SpecialDefense,
+            foe_side.special_defense_boost,
+        ),
+        (PokemonBoostableStat::Speed, foe_side.speed_boost),
+        (PokemonBoostableStat::Accuracy, foe_side.accuracy_boost),
+        (PokemonBoostableStat::Evasion, foe_side.evasion_boost),
+    ];
+
+    let list = &mut instructions.instruction_list;
+    list.push(Instruction::ApplyVolatileStatus(
+        ApplyVolatileStatusInstruction {
+            side_ref: *side_ref,
+            volatile_status: PokemonVolatileStatus::TRANSFORMED,
+        },
+    ));
+    own_side
+        .volatile_statuses
+        .insert(PokemonVolatileStatus::TRANSFORMED);
+
+    // boosts
+    for (stat, target_boost) in foe_boosts.iter() {
+        let cur = match stat {
+            PokemonBoostableStat::Attack => &mut own_side.attack_boost,
+            PokemonBoostableStat::Defense => &mut own_side.defense_boost,
+            PokemonBoostableStat::SpecialAttack => &mut own_side.special_attack_boost,
+            PokemonBoostableStat::SpecialDefense => &mut own_side.special_defense_boost,
+            PokemonBoostableStat::Speed => &mut own_side.speed_boost,
+            PokemonBoostableStat::Accuracy => &mut own_side.accuracy_boost,
+            PokemonBoostableStat::Evasion => &mut own_side.evasion_boost,
+        };
+        if *cur != *target_boost {
+            list.push(Instruction::Boost(BoostInstruction {
+                side_ref: *side_ref,
+                stat: *stat,
+                amount: *target_boost - *cur,
+            }));
+            *cur = *target_boost;
+        }
+    }
+
+    let own = own_side.get_active();
+    if own.types != foe_types {
+        list.push(Instruction::ChangeType(ChangeType {
+            side_ref: *side_ref,
+            new_types: foe_types,
+            old_types: own.types,
+        }));
+        own.types = foe_types;
+    }
+    if own.ability != foe_ability {
+        list.push(Instruction::ChangeAbility(ChangeAbilityInstruction {
+            side_ref: *side_ref,
+            ability_change: foe_ability as i16 - own.ability as i16,
+        }));
+        own.ability = foe_ability;
+    }
+    macro_rules! copy_stat {
+        ($field:ident, $variant:ident, $val:expr) => {
+            if own.$field != $val {
+                list.push(Instruction::$variant(ChangeStatInstruction {
+                    side_ref: *side_ref,
+                    amount: $val - own.$field,
+                }));
+                own.$field = $val;
+            }
+        };
+    }
+    copy_stat!(attack, ChangeAttack, foe_stats.0);
+    copy_stat!(defense, ChangeDefense, foe_stats.1);
+    copy_stat!(special_attack, ChangeSpecialAttack, foe_stats.2);
+    copy_stat!(special_defense, ChangeSpecialDefense, foe_stats.3);
+    copy_stat!(speed, ChangeSpeed, foe_stats.4);
+    let own_weight_hg = (own.weight_kg * 10.0).round() as i16;
+    if own_weight_hg != foe_weight_hg {
+        list.push(Instruction::ChangeWeight(ChangeWeightInstruction {
+            side_ref: *side_ref,
+            amount_hg: foe_weight_hg - own_weight_hg,
+        }));
+        own.weight_kg = foe_weight_hg as f32 / 10.0;
+    }
+    for (mi, new_id) in [
+        PokemonMoveIndex::M0,
+        PokemonMoveIndex::M1,
+        PokemonMoveIndex::M2,
+        PokemonMoveIndex::M3,
+    ]
+    .iter()
+    .zip(foe_moves.iter())
+    {
+        let mv = &mut own.moves[mi];
+        if mv.id != *new_id {
+            list.push(Instruction::ChangeMove(ChangeMoveInstruction {
+                side_ref: *side_ref,
+                move_index: *mi,
+                id_change: *new_id as i16 - mv.id as i16,
+            }));
+            mv.id = *new_id;
+            mv.choice = crate::choices::MOVES.get(new_id).unwrap().to_owned();
+        }
+        if *new_id != Choices::NONE && mv.pp != 5 {
+            list.push(Instruction::DecrementPP(DecrementPPInstruction {
+                side_ref: *side_ref,
+                move_index: *mi,
+                amount: mv.pp - 5,
+            }));
+            mv.pp = 5;
+        }
+    }
+}
+
+/// Showdown `formeChange(species, source, isPermanent = true)` (Tera Shift, Terapagos-Terastal ->
+/// Stellar on Tera): species, stats and max HP keep the Pokemon's own offsets (each stat moves by
+/// the base-stat difference, so IV / EV quirks of the input stats survive), the damage already
+/// taken is kept (`updateMaxHp`), and the ability (and base ability) becomes `new_ability`.
+/// Every change is a reversible instruction.
+pub fn permanent_forme_change(
+    side: &mut Side,
+    side_ref: &SideReference,
+    new_id: PokemonName,
+    new_ability: Option<Abilities>,
+    instructions: &mut StateInstructions,
+) {
+    let active = side.get_active();
+    if active.id == new_id {
+        return;
+    }
+    let old = active.calculate_stats_from_base_stats();
+    instructions
+        .instruction_list
+        .push(Instruction::FormeChange(FormeChangeInstruction {
+            side_ref: *side_ref,
+            name_change: new_id as i16 - active.id as i16,
+        }));
+    active.id = new_id;
+    let new = active.calculate_stats_from_base_stats();
+    let deltas = [
+        new.1 - old.1,
+        new.2 - old.2,
+        new.3 - old.3,
+        new.4 - old.4,
+        new.5 - old.5,
+    ];
+    for (i, amount) in deltas.iter().copied().enumerate() {
+        if amount == 0 {
+            continue;
+        }
+        let ins = ChangeStatInstruction {
+            side_ref: *side_ref,
+            amount,
+        };
+        instructions.instruction_list.push(match i {
+            0 => {
+                active.attack += amount;
+                Instruction::ChangeAttack(ins)
+            }
+            1 => {
+                active.defense += amount;
+                Instruction::ChangeDefense(ins)
+            }
+            2 => {
+                active.special_attack += amount;
+                Instruction::ChangeSpecialAttack(ins)
+            }
+            3 => {
+                active.special_defense += amount;
+                Instruction::ChangeSpecialDefense(ins)
+            }
+            _ => {
+                active.speed += amount;
+                Instruction::ChangeSpeed(ins)
+            }
+        });
+    }
+    let hp_delta = new.0 - old.0;
+    if hp_delta != 0 {
+        let new_max = active.maxhp + hp_delta;
+        let new_hp = if active.hp <= 0 {
+            0
+        } else {
+            cmp::max(1, new_max - (active.maxhp - active.hp))
+        };
+        instructions
+            .instruction_list
+            .push(Instruction::ChangeMaxHp(ChangeStatInstruction {
+                side_ref: *side_ref,
+                amount: hp_delta,
+            }));
+        active.maxhp = new_max;
+        if new_hp != active.hp {
+            instructions
+                .instruction_list
+                .push(Instruction::Heal(HealInstruction {
+                    side_ref: *side_ref,
+                    heal_amount: new_hp - active.hp,
+                }));
+            active.hp = new_hp;
+        }
+    }
+    if let Some(ability) = new_ability {
+        if active.ability != ability {
+            instructions
+                .instruction_list
+                .push(Instruction::ChangeAbility(ChangeAbilityInstruction {
+                    side_ref: *side_ref,
+                    ability_change: ability as i16 - active.ability as i16,
+                }));
+            active.ability = ability;
+        }
+        if active.base_ability != ability {
+            instructions
+                .instruction_list
+                .push(Instruction::ChangeBaseAbility(ChangeAbilityInstruction {
+                    side_ref: *side_ref,
+                    ability_change: ability as i16 - active.base_ability as i16,
+                }));
+            active.base_ability = ability;
+        }
     }
 }
 
@@ -1364,6 +1725,20 @@ pub fn ability_on_switch_in(
     side_ref: &SideReference,
     instructions: &mut StateInstructions,
 ) {
+    // Tera Shift (cannot be suppressed): Terapagos becomes Terapagos-Terastal / Tera Shell
+    {
+        let side = state.get_side(side_ref);
+        let active = side.get_active_immutable();
+        if active.ability == Abilities::TERASHIFT && active.id == PokemonName::TERAPAGOS {
+            permanent_forme_change(
+                side,
+                side_ref,
+                PokemonName::TERAPAGOSTERASTAL,
+                Some(Abilities::TERASHELL),
+                instructions,
+            );
+        }
+    }
     let (attacking_side, defending_side) = state.get_both_sides(side_ref);
     let active_pkmn = attacking_side.get_active();
     let defending_pkmn = defending_side.get_active_immutable();
@@ -1554,6 +1929,7 @@ pub fn ability_on_switch_in(
                 state.weather.turns_remaining = WEATHER_ABILITY_TURNS;
             }
         }
+        Abilities::IMPOSTER => imposter_transform(state, side_ref, instructions),
         Abilities::INTIMIDATE => {
             let defender = defending_side.get_active_immutable();
             if !(defender.ability == Abilities::OWNTEMPO
@@ -2178,7 +2554,8 @@ pub fn ability_modify_attack_being_used(
             if attacker_choice.secondaries.is_some() || sheer_force_volatile_boosted {
                 attacker_choice.base_power *= 1.3;
                 attacker_choice.secondaries = None;
-                attacker_choice.volatile_status = None
+                attacker_choice.volatile_status = None;
+                attacker_choice.sheer_force_applied = true;
             }
         }
         Abilities::IRONFIST => {
@@ -2253,6 +2630,17 @@ pub fn ability_modify_attack_being_used(
         }
         _ => {}
     }
+}
+
+/// True if the attacker's move ignores the target's (breakable) ability: Mold Breaker, Teravolt,
+/// Turboblaze and the Mold-Breaker-like signature moves.
+pub fn attacker_ignores_target_ability(attacking_pkmn: &Pokemon, choice: &Choice) -> bool {
+    attacking_pkmn.ability == Abilities::MOLDBREAKER
+        || attacking_pkmn.ability == Abilities::TERAVOLT
+        || attacking_pkmn.ability == Abilities::TURBOBLAZE
+        || choice.move_id == Choices::MOONGEISTBEAM
+        || choice.move_id == Choices::PHOTONGEYSER
+        || choice.move_id == Choices::SUNSTEELSTRIKE
 }
 
 pub fn ability_modify_attack_against(
@@ -2483,6 +2871,16 @@ pub fn ability_modify_attack_against(
                     chance: 11.0,
                     target: MoveTarget::User,
                     effect: Effect::Status(PokemonStatus::SLEEP),
+                });
+            }
+        }
+        // Cursed Body: 30% to Disable the move that hit it (any damaging move, sdb.28)
+        Abilities::CURSEDBODY => {
+            if attacker_choice.category != MoveCategory::Status {
+                attacker_choice.add_or_create_secondaries(Secondary {
+                    chance: 30.0,
+                    target: MoveTarget::User,
+                    effect: Effect::VolatileStatus(PokemonVolatileStatus::DISABLE),
                 });
             }
         }
@@ -2832,7 +3230,7 @@ pub fn ability_modify_attack_against(
             }
         }
         Abilities::OVERCOAT => {
-            if attacker_choice.flags.powder {
+            if attacker_choice.flags.powder && attacker_choice.move_id != Choices::LEECHSEED {
                 attacker_choice.remove_all_effects();
                 attacker_choice.accuracy = 0.0
             }

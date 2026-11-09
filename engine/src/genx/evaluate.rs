@@ -4,6 +4,49 @@ use super::state::PokemonVolatileStatus;
 use crate::choices::MoveCategory;
 use crate::state::{Pokemon, PokemonStatus, Side, State};
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// Experimental (bead 589.32), process-wide, default 0.0 = stock behaviour.
+/// When `knee > 0`, the "alive" and "has item" bonuses of a Pokemon are scaled by
+/// `min(1, hp_fraction / knee)`: a Pokemon far below `knee` of its max HP is worth little
+/// beyond its remaining HP (it is close to dead whatever the search horizon shows).
+static LOW_HP_KNEE_BITS: AtomicU32 = AtomicU32::new(0);
+
+pub fn set_low_hp_knee(knee: f32) {
+    LOW_HP_KNEE_BITS.store(knee.max(0.0).to_bits(), Ordering::Relaxed);
+}
+
+/// Experimental (589.32): multiplier on every stat-boost term (1.0 = stock).
+static BOOST_SCALE_BITS: AtomicU32 = AtomicU32::new(0x3f800000); // 1.0f32
+
+pub fn set_boost_scale(scale: f32) {
+    BOOST_SCALE_BITS.store(scale.max(0.0).to_bits(), Ordering::Relaxed);
+}
+
+pub fn boost_scale() -> f32 {
+    f32::from_bits(BOOST_SCALE_BITS.load(Ordering::Relaxed))
+}
+
+pub fn low_hp_knee() -> f32 {
+    f32::from_bits(LOW_HP_KNEE_BITS.load(Ordering::Relaxed))
+}
+
+/// Share of a Pokemon's "future value" that survives its current HP: 1.0 unless the knee is
+/// set and the Pokemon is below it.
+fn vitality(pokemon: &Pokemon) -> f32 {
+    let knee = low_hp_knee();
+    if knee > 0.0 {
+        (pokemon.hp as f32 / pokemon.maxhp as f32 / knee).min(1.0)
+    } else {
+        1.0
+    }
+}
+
+/// vitality for the stat-boost terms: also carries the experimental boost scale.
+fn boost_weight(pokemon: &Pokemon) -> f32 {
+    vitality(pokemon) * boost_scale()
+}
+
 const POKEMON_ALIVE: f32 = 30.0;
 const POKEMON_HP: f32 = 100.0;
 const USED_TERA: f32 = -75.0;
@@ -129,7 +172,9 @@ fn evaluate_hazards(pokemon: &Pokemon, side: &Side) -> f32 {
 
 fn evaluate_pokemon(pokemon: &Pokemon) -> f32 {
     let mut score = 0.0;
-    score += POKEMON_HP * pokemon.hp as f32 / pokemon.maxhp as f32;
+    let hp_fraction = pokemon.hp as f32 / pokemon.maxhp as f32;
+    score += POKEMON_HP * hp_fraction;
+    let vitality = vitality(pokemon);
 
     match pokemon.status {
         PokemonStatus::BURN => score += evaluate_burned(pokemon),
@@ -142,7 +187,7 @@ fn evaluate_pokemon(pokemon: &Pokemon) -> f32 {
     }
 
     if pokemon.item != Items::NONE {
-        score += 10.0;
+        score += 10.0 * vitality;
     }
 
     // without this a low hp pokemon could get a negative score and incentivize the other side
@@ -151,7 +196,7 @@ fn evaluate_pokemon(pokemon: &Pokemon) -> f32 {
         score = 0.0;
     }
 
-    score += POKEMON_ALIVE;
+    score += POKEMON_ALIVE * vitality;
 
     score
 }
@@ -188,13 +233,13 @@ pub fn evaluate(state: &State) -> f32 {
                     score += CONFUSION;
                 }
 
-                score += get_boost_multiplier(state.side_one.attack_boost) * POKEMON_ATTACK_BOOST;
-                score += get_boost_multiplier(state.side_one.defense_boost) * POKEMON_DEFENSE_BOOST;
+                score += get_boost_multiplier(state.side_one.attack_boost) * POKEMON_ATTACK_BOOST * boost_weight(pkmn);
+                score += get_boost_multiplier(state.side_one.defense_boost) * POKEMON_DEFENSE_BOOST * boost_weight(pkmn);
                 score += get_boost_multiplier(state.side_one.special_attack_boost)
-                    * POKEMON_SPECIAL_ATTACK_BOOST;
+                    * POKEMON_SPECIAL_ATTACK_BOOST * boost_weight(pkmn);
                 score += get_boost_multiplier(state.side_one.special_defense_boost)
-                    * POKEMON_SPECIAL_DEFENSE_BOOST;
-                score += get_boost_multiplier(state.side_one.speed_boost) * POKEMON_SPEED_BOOST;
+                    * POKEMON_SPECIAL_DEFENSE_BOOST * boost_weight(pkmn);
+                score += get_boost_multiplier(state.side_one.speed_boost) * POKEMON_SPEED_BOOST * boost_weight(pkmn);
             }
         }
         if pkmn.terastallized {
@@ -234,13 +279,13 @@ pub fn evaluate(state: &State) -> f32 {
                     score -= CONFUSION;
                 }
 
-                score -= get_boost_multiplier(state.side_two.attack_boost) * POKEMON_ATTACK_BOOST;
-                score -= get_boost_multiplier(state.side_two.defense_boost) * POKEMON_DEFENSE_BOOST;
+                score -= get_boost_multiplier(state.side_two.attack_boost) * POKEMON_ATTACK_BOOST * boost_weight(pkmn);
+                score -= get_boost_multiplier(state.side_two.defense_boost) * POKEMON_DEFENSE_BOOST * boost_weight(pkmn);
                 score -= get_boost_multiplier(state.side_two.special_attack_boost)
-                    * POKEMON_SPECIAL_ATTACK_BOOST;
+                    * POKEMON_SPECIAL_ATTACK_BOOST * boost_weight(pkmn);
                 score -= get_boost_multiplier(state.side_two.special_defense_boost)
-                    * POKEMON_SPECIAL_DEFENSE_BOOST;
-                score -= get_boost_multiplier(state.side_two.speed_boost) * POKEMON_SPEED_BOOST;
+                    * POKEMON_SPECIAL_DEFENSE_BOOST * boost_weight(pkmn);
+                score -= get_boost_multiplier(state.side_two.speed_boost) * POKEMON_SPEED_BOOST * boost_weight(pkmn);
             }
         }
         if pkmn.terastallized {
@@ -266,4 +311,30 @@ pub fn evaluate(state: &State) -> f32 {
     score -= state.side_two.side_conditions.healing_wish as f32 * HEALING_WISH;
 
     score
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn low_hp_knee_scales_alive_and_item_bonus_only_below_knee() {
+        let mut state = State::default();
+        let maxhp = state.side_one.get_active().maxhp;
+        state.side_one.get_active().hp = maxhp / 5; // 20%
+        state.side_one.get_active().item = Items::LEFTOVERS;
+        set_low_hp_knee(0.0);
+        let stock = evaluate(&state);
+        set_low_hp_knee(0.4);
+        let discounted = evaluate(&state);
+        // vitality = 0.2 / 0.4 = 0.5: half of (30 alive + 10 item) is removed
+        assert!((stock - discounted - 20.0).abs() < 1e-2, "{stock} vs {discounted}");
+        // a healthy Pokemon is untouched
+        state.side_one.get_active().hp = maxhp;
+        set_low_hp_knee(0.0);
+        let healthy_stock = evaluate(&state);
+        set_low_hp_knee(0.4);
+        assert_eq!(healthy_stock, evaluate(&state));
+        set_low_hp_knee(0.0);
+    }
 }

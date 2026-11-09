@@ -1,7 +1,9 @@
-use super::abilities::{
+﻿use super::abilities::{
     ability_after_damage_hit, ability_before_move, ability_end_of_turn,
+    ability_field_change_activation, ability_status_cure_residual,
+    ability_weather_residual,
     ability_modify_attack_against, ability_modify_attack_being_used, ability_on_switch_in,
-    ability_on_switch_out, Abilities,
+    ability_on_switch_out, permanent_forme_change, Abilities,
 };
 use super::choice_effects::{
     charge_choice_to_volatile, choice_after_damage_hit, choice_before_move, choice_hazard_clear,
@@ -17,25 +19,29 @@ use crate::instruction::{
     ChangeSideConditionInstruction, ChangeTerrain, ChangeType,
     ChangeVolatileStatusDurationInstruction, ChangeWeather, DecrementRestTurnsInstruction,
     DecrementWishInstruction, HealInstruction, RemoveVolatileStatusInstruction,
-    SetSecondMoveSwitchOutMoveInstruction, SetSleepTurnsInstruction, ToggleBatonPassingInstruction,
+    SetLastItemInstruction, SetSecondMoveSwitchOutMoveInstruction, SetSleepTurnsInstruction,
+    ToggleBatonPassingInstruction,
     ToggleDamageDealtHitSubstituteInstruction, ToggleMegaEvolvedInstruction,
     ToggleShedTailingInstruction, ToggleTrickRoomInstruction,
 };
+use crate::pokemon::PokemonName;
 use crate::instruction::{ChangeAbilityInstruction, ToggleTerastallizedInstruction};
 use crate::instruction::{DecrementFutureSightInstruction, FormeChangeInstruction};
 use crate::instruction::{DecrementPPInstruction, SetLastUsedMoveInstruction};
+use crate::instruction::{DisableMoveInstruction, EnableMoveInstruction};
 
 use super::damage_calc::calculate_futuresight_damage;
 use super::damage_calc::{calculate_damage, type_effectiveness_modifier, DamageRolls};
 use super::items::{
-    item_before_move, item_end_of_turn, item_modify_attack_against, item_modify_attack_being_used,
-    item_on_switch_in, Items,
+    item_before_move, item_end_of_turn, item_residual_heal, item_modify_attack_against, item_modify_attack_being_used,
+    item_on_switch_in, record_eaten_berry, unnerves, Items,
 };
 use super::state::{MoveChoice, PokemonVolatileStatus, Terrain, Weather};
 use crate::choices::{Choice, MoveCategory};
 use crate::instruction::{
     ChangeStatusInstruction, DamageInstruction, Instruction, StateInstructions, SwitchInstruction,
 };
+use crate::state::encore_fails_against_last_move;
 use crate::state::{
     LastUsedMove, Pokemon, PokemonBoostableStat, PokemonIndex, PokemonMoveIndex, PokemonSideCondition,
     PokemonStatus, PokemonType, Side, SideMovesFirst, SideReference, State,
@@ -483,11 +489,13 @@ fn generate_instructions_from_switch(
         if side.side_conditions.sticky_web == 1 && switched_in_pkmn.is_grounded() {
             // a pkmn switching in doesn't have any other speed drops,
             // so no need to check for going below -6
+            // sdb (589.39): Showdown credits the foe as the source of the Sticky Web drop, so
+            // Defiant / Competitive trigger and Clear Body / White Smoke / Clear Amulet block it.
             apply_boost_instruction(
                 side,
                 &PokemonBoostableStat::Speed,
                 &-1,
-                &switching_side_ref,
+                &switching_side_ref.get_other_side(),
                 &switching_side_ref,
                 incoming_instructions,
             );
@@ -735,6 +743,127 @@ fn get_instructions_from_volatile_statuses(
         side.volatile_statuses
             .insert(volatile_status.volatile_status);
         incoming_instructions.instruction_list.push(ins);
+
+        // Disable (Cursed Body): the move the target just used, for 4 residuals including this
+        // turn's (Showdown duration 5, minus one when applied during the target's own move)
+        if volatile_status.volatile_status == PokemonVolatileStatus::DISABLE {
+            let slot = attacker_choice.move_index;
+            let side = state.get_side(&target_side);
+            let current = side.volatile_status_durations.disable;
+            let start = 4 * 4 + slot as i8;
+            side.volatile_status_durations.disable = start;
+            incoming_instructions
+                .instruction_list
+                .push(Instruction::ChangeVolatileStatusDuration(
+                    ChangeVolatileStatusDurationInstruction {
+                        side_ref: target_side,
+                        volatile_status: PokemonVolatileStatus::DISABLE,
+                        amount: start - current,
+                    },
+                ));
+            let active = side.get_active();
+            if !active.moves[&slot].disabled {
+                active.moves[&slot].disabled = true;
+                incoming_instructions
+                    .instruction_list
+                    .push(Instruction::DisableMove(DisableMoveInstruction {
+                        side_ref: target_side,
+                        move_index: slot,
+                    }));
+            }
+            return;
+        }
+
+        // timed volatiles: remaining turns (Showdown `duration`; ticks down in the residual step)
+        let start = match volatile_status.volatile_status {
+            PokemonVolatileStatus::HEALBLOCK => {
+                if attacker_choice.move_id == Choices::PSYCHICNOISE {
+                    2
+                } else {
+                    5
+                }
+            }
+            PokemonVolatileStatus::THROATCHOP => 2,
+            _ => 0,
+        };
+        if start != 0 {
+            let start = if volatile_status.volatile_status == PokemonVolatileStatus::HEALBLOCK
+                && attacker_choice.move_id != Choices::PSYCHICNOISE
+                && state
+                    .get_side_immutable(&attacking_side_reference)
+                    .get_active_immutable()
+                    .ability
+                    == Abilities::PERSISTENT
+            {
+                7
+            } else {
+                start
+            };
+            let side = state.get_side(&target_side);
+            let current = match volatile_status.volatile_status {
+                PokemonVolatileStatus::HEALBLOCK => side.volatile_status_durations.healblock,
+                _ => side.volatile_status_durations.throatchop,
+            };
+            match volatile_status.volatile_status {
+                PokemonVolatileStatus::HEALBLOCK => side.volatile_status_durations.healblock = start,
+                _ => side.volatile_status_durations.throatchop = start,
+            }
+            incoming_instructions
+                .instruction_list
+                .push(Instruction::ChangeVolatileStatusDuration(
+                    ChangeVolatileStatusDurationInstruction {
+                        side_ref: target_side,
+                        volatile_status: volatile_status.volatile_status,
+                        amount: start - current,
+                    },
+                ));
+        }
+    }
+}
+
+/// Residual tick for a timed volatile (Heal Block order 20, Throat Chop order 22): the duration
+/// drops by one and the volatile ends when it reaches 0. A volatile carrying duration 0 (a state
+/// serialized before sdb.22) is treated as freshly applied with `fresh_start` turns.
+fn tick_timed_volatile(
+    side: &mut Side,
+    side_ref: &SideReference,
+    volatile_status: PokemonVolatileStatus,
+    fresh_start: i8,
+    instructions: &mut StateInstructions,
+) {
+    if !side.volatile_statuses.contains(&volatile_status) {
+        return;
+    }
+    let current = match volatile_status {
+        PokemonVolatileStatus::HEALBLOCK => side.volatile_status_durations.healblock,
+        _ => side.volatile_status_durations.throatchop,
+    };
+    let remaining = if current <= 0 { fresh_start } else { current } - 1;
+    match volatile_status {
+        PokemonVolatileStatus::HEALBLOCK => side.volatile_status_durations.healblock = remaining,
+        _ => side.volatile_status_durations.throatchop = remaining,
+    }
+    if remaining != current {
+        instructions
+            .instruction_list
+            .push(Instruction::ChangeVolatileStatusDuration(
+                ChangeVolatileStatusDurationInstruction {
+                    side_ref: *side_ref,
+                    volatile_status,
+                    amount: remaining - current,
+                },
+            ));
+    }
+    if remaining == 0 {
+        side.volatile_statuses.remove(&volatile_status);
+        instructions
+            .instruction_list
+            .push(Instruction::RemoveVolatileStatus(
+                RemoveVolatileStatusInstruction {
+                    side_ref: *side_ref,
+                    volatile_status,
+                },
+            ));
     }
 }
 
@@ -908,18 +1037,49 @@ fn get_instructions_from_status_effects(
         return;
     }
 
+    let foe_unnerves = unnerves(
+        state
+            .get_side_immutable(&target_side_ref.get_other_side())
+            .get_active_immutable(),
+    );
     let target_side = state.get_side(&target_side_ref);
     let target_side_active = target_side.active_index;
     let target_pkmn = target_side.get_active();
 
-    let instruction = if target_pkmn.item == Items::LUMBERRY {
+    // Lum / Chesto block the status and are eaten (Harvest remembers the berry)
+    if !foe_unnerves
+        && (target_pkmn.item == Items::LUMBERRY
+            || (target_pkmn.item == Items::CHESTOBERRY && status.status == PokemonStatus::SLEEP))
+    {
+        let berry = target_pkmn.item;
+        let mut extra = vec![];
+        target_pkmn.item = Items::NONE;
+        record_eaten_berry(target_pkmn, &target_side_ref, berry, &mut extra);
+        target_pkmn.item = berry;
+        if !extra.is_empty() {
+            // keep the original order: ChangeItem first, then SetLastItem
+            let ins = Instruction::ChangeItem(ChangeItemInstruction {
+                side_ref: target_side_ref,
+                current_item: berry,
+                new_item: Items::NONE,
+            });
+            target_pkmn.item = Items::NONE;
+            incoming_instructions.instruction_list.push(ins);
+            incoming_instructions.instruction_list.extend(extra);
+            return;
+        }
+    }
+    let instruction = if target_pkmn.item == Items::LUMBERRY && !foe_unnerves {
         target_pkmn.item = Items::NONE;
         Instruction::ChangeItem(ChangeItemInstruction {
             side_ref: target_side_ref,
             current_item: Items::LUMBERRY,
             new_item: Items::NONE,
         })
-    } else if target_pkmn.item == Items::CHESTOBERRY && status.status == PokemonStatus::SLEEP {
+    } else if target_pkmn.item == Items::CHESTOBERRY
+        && status.status == PokemonStatus::SLEEP
+        && !foe_unnerves
+    {
         target_pkmn.item = Items::NONE;
         Instruction::ChangeItem(ChangeItemInstruction {
             side_ref: target_side_ref,
@@ -1633,12 +1793,22 @@ fn move_has_no_effect(state: &State, choice: &Choice, attacking_side_ref: &SideR
     {
         return true;
     } else if choice.move_id == Choices::ENCORE {
-        return match state
-            .get_side_immutable(&attacking_side_ref.get_other_side())
-            .last_used_move
+        // sdb: Showdown's Encore fails if the target is already encored, has no last move,
+        // or its last move carries `failencore` (Sleep Talk, Encore, Transform, Mimic,
+        // Struggle, ...) or has no PP left. A move Sleep Talk called does not count: the
+        // last move is Sleep Talk itself (see `sleep_talk_move` below).
+        if defending_side
+            .volatile_statuses
+            .contains(&PokemonVolatileStatus::ENCORE)
         {
+            return true;
+        }
+        return match defending_side.last_used_move {
             LastUsedMove::None => true,
-            LastUsedMove::Move(_) => false,
+            LastUsedMove::Move(index) => {
+                let last_move = &defender.moves[&index];
+                encore_fails_against_last_move(last_move.id) || last_move.pp <= 0
+            }
             LastUsedMove::Switch(_) => true,
         };
     } else if state.terrain_is_active(&Terrain::PSYCHICTERRAIN)
@@ -1675,6 +1845,12 @@ fn cannot_use_move(state: &State, choice: &Choice, attacking_side_ref: &SideRefe
         && attacking_side
             .volatile_statuses
             .contains(&PokemonVolatileStatus::HEALBLOCK)
+    {
+        return true;
+    } else if choice.flags.sound
+        && attacking_side
+            .volatile_statuses
+            .contains(&PokemonVolatileStatus::THROATCHOP)
     {
         return true;
     }
@@ -2058,6 +2234,12 @@ fn generate_instructions_from_existing_status_conditions(
                     CONSECUTIVE_PROTECT_CHANCE.powi(attacking_side.side_conditions.protect as i32);
                 let mut protect_fail_instruction = incoming_instructions.clone();
                 protect_fail_instruction.update_percentage(1.0 - protect_success_chance);
+                // a failed Protect still spends its PP (deducted after BeforeMove in Showdown)
+                if let Some(pp) = pp_deduction(state, attacking_side_ref, attacker_choice) {
+                    protect_fail_instruction
+                        .instruction_list
+                        .push(Instruction::DecrementPP(pp));
+                }
                 final_instructions.push(protect_fail_instruction);
                 incoming_instructions.update_percentage(protect_success_chance);
             }
@@ -2268,11 +2450,18 @@ pub fn generate_instructions_from_move(
         return;
     }
 
+    // PP is spent when a move starts, not on the 2nd turn of a charge move / locked move
+    let mut continuation_turn = state
+        .get_side_immutable(&attacking_side)
+        .volatile_statuses
+        .contains(&PokemonVolatileStatus::LOCKEDMOVE);
+
     // If the move is a charge move, remove the volatile status if damage was done
     if choice.flags.charge {
         let side = state.get_side(&attacking_side);
         let volatile_status = charge_choice_to_volatile(&choice.move_id);
         if side.volatile_statuses.contains(&volatile_status) {
+            continuation_turn = true;
             choice.flags.charge = false;
             let instruction = Instruction::RemoveVolatileStatus(RemoveVolatileStatusInstruction {
                 side_ref: attacking_side,
@@ -2295,7 +2484,9 @@ pub fn generate_instructions_from_move(
         return;
     }
 
-    if state.use_last_used_move {
+    // sdb: a move called by Sleep Talk is not the user's "last move" (Sleep Talk is, which
+    // is what Encore / choice locks look at), so only the outer Sleep Talk sets it.
+    if state.use_last_used_move && !choice.sleep_talk_move {
         set_last_used_move_as_move(
             state.get_side(&attacking_side),
             choice.move_index,
@@ -2305,34 +2496,30 @@ pub fn generate_instructions_from_move(
     }
 
     if cannot_use_move(state, &choice, &attacking_side) {
+        // A move aimed at a target that fainted earlier in the turn fails for lack of a target
+        // after Showdown has already deducted its PP (`[notarget]`), unless the user could not
+        // act at all (asleep / frozen / flinched: BeforeMove, no PP).
+        let (attacker_side, defender_side) = state.get_both_sides_immutable(&attacking_side);
+        let attacker = attacker_side.get_active_immutable();
+        if defender_side.get_active_immutable().hp == 0
+            && choice.category != MoveCategory::Status
+            && !continuation_turn
+            && !choice.sleep_talk_move
+            && attacker.status != PokemonStatus::SLEEP
+            && attacker.status != PokemonStatus::FREEZE
+            && !attacker_side
+                .volatile_statuses
+                .contains(&PokemonVolatileStatus::FLINCH)
+        {
+            deduct_pp(state, &attacking_side, &choice, &mut incoming_instructions);
+        }
         state.reverse_instructions(&incoming_instructions.instruction_list);
         final_instructions.push(incoming_instructions);
         return;
     }
 
-    // most of the time pp decrement doesn't matter and just adds another instruction
-    // so we only decrement pp if the move is at 10 or less pp since that is when it starts
-    // to matter
-    let (attacker_side, defender_side) = state.get_both_sides(&attacking_side);
-    let active = attacker_side.get_active();
-    if active.moves[&choice.move_index].pp < 10 {
-        let pp_decrement_amount = if choice.target == MoveTarget::Opponent
-            && defender_side.get_active_immutable().ability == Abilities::PRESSURE
-        {
-            2
-        } else {
-            1
-        };
-        incoming_instructions
-            .instruction_list
-            .push(Instruction::DecrementPP(DecrementPPInstruction {
-                side_ref: attacking_side,
-                move_index: choice.move_index,
-                amount: pp_decrement_amount,
-            }));
-        active.moves[&choice.move_index].pp -= pp_decrement_amount;
-    }
-
+    // PP is spent once the move is actually attempted (Showdown deducts it after BeforeMove:
+    // not when asleep / fully paralysed / flinched); see `deduct_pp` below the sleep checks.
     if !choice.sleep_talk_move {
         generate_instructions_from_existing_status_conditions(
             state,
@@ -2347,7 +2534,14 @@ pub fn generate_instructions_from_move(
         .get_active_immutable();
     if choice.move_id == Choices::SLEEPTALK && attacker.status == PokemonStatus::SLEEP {
         let new_choices = attacker.get_sleep_talk_choices();
+        // a sleeping Sleep Talk user still pays for Sleep Talk itself
+        deduct_pp(state, &attacking_side, &choice, &mut incoming_instructions);
         state.reverse_instructions(&incoming_instructions.instruction_list);
+        if new_choices.is_empty() {
+            // nothing callable: Sleep Talk fails (and must not lose the branch's probability)
+            final_instructions.push(incoming_instructions);
+            return;
+        }
         let num_choices = new_choices.len() as f32;
         for mut new_choice in new_choices {
             new_choice.sleep_talk_move = true;
@@ -2370,6 +2564,10 @@ pub fn generate_instructions_from_move(
             final_instructions.push(incoming_instructions);
         }
         return;
+    }
+
+    if !continuation_turn {
+        deduct_pp(state, &attacking_side, &choice, &mut incoming_instructions);
     }
 
     if move_has_no_effect(state, &choice, &attacking_side) {
@@ -2553,9 +2751,10 @@ fn get_effective_speed(state: &State, side_reference: &SideReference) -> i16 {
             boosted_speed *= 2.0
         }
         Abilities::UNBURDEN
-            if side
-                .volatile_statuses
-                .contains(&PokemonVolatileStatus::UNBURDEN) =>
+            if active_pkmn.item == Items::NONE
+                && side
+                    .volatile_statuses
+                    .contains(&PokemonVolatileStatus::UNBURDEN) =>
         {
             boosted_speed *= 2.0
         }
@@ -2849,13 +3048,16 @@ fn on_terrain_end(
     }
 }
 
+/// End-of-turn residuals. Mutates `state` along `incoming_instructions` (the caller reverses).
+/// Returns extra branches when a residual is random (Harvest): each is a complete instruction
+/// list for an alternative outcome, with its own percentage, NOT applied to `state`.
 fn add_end_of_turn_instructions(
     state: &mut State,
     mut incoming_instructions: &mut StateInstructions,
     first_move_side: &SideReference,
-) {
+) -> Vec<StateInstructions> {
     if state.side_one.force_switch || state.side_two.force_switch {
-        return;
+        return vec![];
     }
 
     let sides = [first_move_side, &first_move_side.get_other_side()];
@@ -2902,29 +3104,6 @@ fn add_end_of_turn_instructions(
 
     // Terrain decrement / dissipation
     if state.terrain.turns_remaining > 0 && state.terrain.terrain_type != Terrain::NONE {
-        if state.terrain.terrain_type == Terrain::GRASSYTERRAIN {
-            for side_ref in sides {
-                let side = state.get_side(side_ref);
-                let active_pkmn = side.get_active();
-                if active_pkmn.hp == 0 || !active_pkmn.is_grounded() {
-                    continue;
-                }
-                let heal_amount = cmp::min(
-                    (active_pkmn.maxhp as f32 * 0.0625) as i16,
-                    active_pkmn.maxhp - active_pkmn.hp,
-                );
-                if heal_amount > 0 {
-                    let heal_instruction = Instruction::Heal(HealInstruction {
-                        side_ref: *side_ref,
-                        heal_amount,
-                    });
-                    active_pkmn.hp += heal_amount;
-                    incoming_instructions
-                        .instruction_list
-                        .push(heal_instruction);
-                }
-            }
-        }
         let terrain_dissipate_instruction = Instruction::DecrementTerrainTurnsRemaining;
         incoming_instructions
             .instruction_list
@@ -3005,6 +3184,7 @@ fn add_end_of_turn_instructions(
             if active_pkmn.hp == 0
                 || active_pkmn.ability == Abilities::MAGICGUARD
                 || active_pkmn.ability == Abilities::OVERCOAT
+                || active_pkmn.item == Items::SAFETYGOGGLES
                 || active_pkmn.ability == Abilities::ICEBODY
                 || active_pkmn.has_type(&PokemonType::ICE)
             {
@@ -3027,6 +3207,7 @@ fn add_end_of_turn_instructions(
             if active_pkmn.hp == 0
                 || active_pkmn.ability == Abilities::MAGICGUARD
                 || active_pkmn.ability == Abilities::OVERCOAT
+                || active_pkmn.item == Items::SAFETYGOGGLES
                 || active_pkmn.has_type(&PokemonType::GROUND)
                 || active_pkmn.has_type(&PokemonType::STEEL)
                 || active_pkmn.has_type(&PokemonType::ROCK)
@@ -3044,6 +3225,11 @@ fn add_end_of_turn_instructions(
                 .instruction_list
                 .push(sand_damage_instruction);
         }
+    }
+
+    // Weather damage abilities / heals (Solar Power, Dry Skin, Rain Dish, Ice Body)
+    for side_ref in sides {
+        ability_weather_residual(state, side_ref, &mut incoming_instructions);
     }
 
     // future sight
@@ -3082,13 +3268,20 @@ fn add_end_of_turn_instructions(
     for side_ref in sides {
         let side = state.get_side(side_ref);
         let side_wish = side.wish;
+        let wish_heal_blocked = side
+            .volatile_statuses
+            .contains(&PokemonVolatileStatus::HEALBLOCK);
         let active_pkmn = side.get_active();
 
         if side_wish.0 > 0 {
             let decrement_wish_instruction = Instruction::DecrementWish(DecrementWishInstruction {
                 side_ref: *side_ref,
             });
-            if side_wish.0 == 1 && 0 < active_pkmn.hp && active_pkmn.hp < active_pkmn.maxhp {
+            if side_wish.0 == 1
+                && 0 < active_pkmn.hp
+                && active_pkmn.hp < active_pkmn.maxhp
+                && !wish_heal_blocked
+            {
                 #[cfg(not(feature = "gen4"))]
                 let heal_amount = cmp::min(active_pkmn.maxhp - active_pkmn.hp, side_wish.1);
 
@@ -3112,10 +3305,91 @@ fn add_end_of_turn_instructions(
         }
     }
 
+    // Grassy Terrain heal (Showdown order 5/2): only while the terrain is still up after its
+    // own duration tick (a terrain on its last turn ends without healing)
+    if state.terrain.terrain_type == Terrain::GRASSYTERRAIN {
+        for side_ref in sides {
+            let side = state.get_side(side_ref);
+            let blocked = side
+                .volatile_statuses
+                .contains(&PokemonVolatileStatus::HEALBLOCK);
+            let active_pkmn = side.get_active();
+            if blocked || active_pkmn.hp == 0 || !active_pkmn.is_grounded() {
+                continue;
+            }
+            let heal_amount = cmp::min(
+                (active_pkmn.maxhp as f32 * 0.0625) as i16,
+                active_pkmn.maxhp - active_pkmn.hp,
+            );
+            if heal_amount > 0 {
+                incoming_instructions
+                    .instruction_list
+                    .push(Instruction::Heal(HealInstruction {
+                        side_ref: *side_ref,
+                        heal_amount,
+                    }));
+                active_pkmn.hp += heal_amount;
+            }
+        }
+    }
+
+    // Hydration / Shed Skin (order 5/3), then Leftovers / Black Sludge (order 5/4)
+    for side_ref in sides {
+        ability_status_cure_residual(state, side_ref, &mut incoming_instructions);
+    }
+    for side_ref in sides {
+        item_residual_heal(state, side_ref, &mut incoming_instructions);
+    }
+
+    // leechseed sap
+    for side_ref in sides {
+        let (leechseed_side, other_side) = state.get_both_sides(side_ref);
+        if leechseed_side
+            .volatile_statuses
+            .contains(&PokemonVolatileStatus::LEECHSEED)
+        {
+            let other_blocked = other_side
+                .volatile_statuses
+                .contains(&PokemonVolatileStatus::HEALBLOCK);
+            let active_pkmn = leechseed_side.get_active();
+            let other_active_pkmn = other_side.get_active();
+            if active_pkmn.hp == 0
+                || other_active_pkmn.hp == 0
+                || active_pkmn.ability == Abilities::MAGICGUARD
+            {
+                continue;
+            }
+
+            let health_sapped = cmp::min((active_pkmn.maxhp as f32 * 0.125) as i16, active_pkmn.hp);
+            let damage_ins = Instruction::Damage(DamageInstruction {
+                side_ref: *side_ref,
+                damage_amount: health_sapped,
+            });
+            active_pkmn.hp -= health_sapped;
+            incoming_instructions.instruction_list.push(damage_ins);
+
+            let health_recovered = cmp::min(
+                health_sapped,
+                other_active_pkmn.maxhp - other_active_pkmn.hp,
+            );
+            if health_recovered > 0 && !other_blocked {
+                let heal_ins = Instruction::Heal(HealInstruction {
+                    side_ref: side_ref.get_other_side(),
+                    heal_amount: health_recovered,
+                });
+                other_active_pkmn.hp += health_recovered;
+                incoming_instructions.instruction_list.push(heal_ins);
+            }
+        }
+    }
+
     // status damage
     for side_ref in sides {
         let (side, other_side) = state.get_both_sides(side_ref);
         let toxic_count = side.side_conditions.toxic_count as f32;
+        let heal_blocked = side
+            .volatile_statuses
+            .contains(&PokemonVolatileStatus::HEALBLOCK);
         let active_pkmn = side.get_active();
         let other_side_active = other_side.get_active();
         if active_pkmn.hp == 0 || active_pkmn.ability == Abilities::MAGICGUARD {
@@ -3145,7 +3419,38 @@ fn add_end_of_turn_instructions(
                     .instruction_list
                     .push(burn_damage_instruction);
             }
-            PokemonStatus::POISON if active_pkmn.ability != Abilities::POISONHEAL => {
+            PokemonStatus::POISON | PokemonStatus::TOXIC
+                if active_pkmn.ability == Abilities::POISONHEAL
+                    && other_side_active.ability != Abilities::NEUTRALIZINGGAS =>
+            {
+                // Poison Heal replaces the poison tick with a heal (blocked by Heal Block);
+                // the toxic counter still advances
+                let is_toxic = active_pkmn.status == PokemonStatus::TOXIC;
+                if is_toxic {
+                    incoming_instructions.instruction_list.push(
+                        Instruction::ChangeSideCondition(ChangeSideConditionInstruction {
+                            side_ref: *side_ref,
+                            side_condition: PokemonSideCondition::ToxicCount,
+                            amount: 1,
+                        }),
+                    );
+                }
+                if !heal_blocked && active_pkmn.hp < active_pkmn.maxhp {
+                    let heal_amount =
+                        cmp::min(active_pkmn.maxhp / 8, active_pkmn.maxhp - active_pkmn.hp);
+                    incoming_instructions
+                        .instruction_list
+                        .push(Instruction::Heal(HealInstruction {
+                            side_ref: *side_ref,
+                            heal_amount,
+                        }));
+                    active_pkmn.hp += heal_amount;
+                }
+                if is_toxic {
+                    side.side_conditions.toxic_count += 1;
+                }
+            }
+            PokemonStatus::POISON => {
                 let damage_amount = cmp::max(
                     1,
                     cmp::min((active_pkmn.maxhp as f32 * 0.125) as i16, active_pkmn.hp),
@@ -3199,54 +3504,50 @@ fn add_end_of_turn_instructions(
         }
     }
 
-    // ability/item end-of-turn effects
+    // bind / Salt Cure (Showdown residual order 13)
     for side_ref in sides {
         let side = state.get_side(side_ref);
-        let active_pkmn = side.get_active();
-        if active_pkmn.hp == 0 {
+        if side.get_active().hp == 0 {
             continue;
         }
 
-        item_end_of_turn(state, side_ref, &mut incoming_instructions);
-        ability_end_of_turn(state, side_ref, &mut incoming_instructions);
-    }
-
-    // leechseed sap
-    for side_ref in sides {
-        let (leechseed_side, other_side) = state.get_both_sides(side_ref);
-        if leechseed_side
+        if side
             .volatile_statuses
-            .contains(&PokemonVolatileStatus::LEECHSEED)
+            .contains(&PokemonVolatileStatus::PARTIALLYTRAPPED)
         {
-            let active_pkmn = leechseed_side.get_active();
-            let other_active_pkmn = other_side.get_active();
-            if active_pkmn.hp == 0
-                || other_active_pkmn.hp == 0
-                || active_pkmn.ability == Abilities::MAGICGUARD
-            {
-                continue;
-            }
-
-            let health_sapped = cmp::min((active_pkmn.maxhp as f32 * 0.125) as i16, active_pkmn.hp);
-            let damage_ins = Instruction::Damage(DamageInstruction {
-                side_ref: *side_ref,
-                damage_amount: health_sapped,
-            });
-            active_pkmn.hp -= health_sapped;
-            incoming_instructions.instruction_list.push(damage_ins);
-
-            let health_recovered = cmp::min(
-                health_sapped,
-                other_active_pkmn.maxhp - other_active_pkmn.hp,
+            let active_pkmn = side.get_active();
+            let damage_amount = cmp::min(
+                (active_pkmn.maxhp as f32 * PARTIALLY_TRAPPED_DAMAGE_PCT) as i16,
+                active_pkmn.hp,
             );
-            if health_recovered > 0 {
-                let heal_ins = Instruction::Heal(HealInstruction {
-                    side_ref: side_ref.get_other_side(),
-                    heal_amount: health_recovered,
-                });
-                other_active_pkmn.hp += health_recovered;
-                incoming_instructions.instruction_list.push(heal_ins);
+            incoming_instructions
+                .instruction_list
+                .push(Instruction::Damage(DamageInstruction {
+                    side_ref: *side_ref,
+                    damage_amount,
+                }));
+            active_pkmn.hp -= damage_amount;
+        }
+        if side
+            .volatile_statuses
+            .contains(&PokemonVolatileStatus::SALTCURE)
+        {
+            let active_pkmn = side.get_active();
+            let mut divisor = SALT_CURE_DAMAGE_DIVISOR;
+            if active_pkmn.has_type(&PokemonType::WATER)
+                || active_pkmn.has_type(&PokemonType::STEEL)
+            {
+                divisor /= 2.0;
             }
+            let damage_amount =
+                cmp::min((active_pkmn.maxhp as f32 / divisor) as i16, active_pkmn.hp);
+            incoming_instructions
+                .instruction_list
+                .push(Instruction::Damage(DamageInstruction {
+                    side_ref: *side_ref,
+                    damage_amount: damage_amount,
+                }));
+            active_pkmn.hp -= damage_amount;
         }
     }
 
@@ -3255,6 +3556,55 @@ fn add_end_of_turn_instructions(
         let side = state.get_side(side_ref);
         if side.get_active().hp == 0 {
             continue;
+        }
+
+        // Disable (residual order 17): ends after its turns, re-enabling the move
+        if side
+            .volatile_statuses
+            .contains(&PokemonVolatileStatus::DISABLE)
+            && side.volatile_status_durations.disable >= 4
+        {
+            let encoded = side.volatile_status_durations.disable;
+            let remaining = encoded - 4;
+            let new_value = if remaining < 4 { 0 } else { remaining };
+            incoming_instructions
+                .instruction_list
+                .push(Instruction::ChangeVolatileStatusDuration(
+                    ChangeVolatileStatusDurationInstruction {
+                        side_ref: *side_ref,
+                        volatile_status: PokemonVolatileStatus::DISABLE,
+                        amount: new_value - encoded,
+                    },
+                ));
+            side.volatile_status_durations.disable = new_value;
+            if new_value == 0 {
+                side.volatile_statuses
+                    .remove(&PokemonVolatileStatus::DISABLE);
+                incoming_instructions
+                    .instruction_list
+                    .push(Instruction::RemoveVolatileStatus(
+                        RemoveVolatileStatusInstruction {
+                            side_ref: *side_ref,
+                            volatile_status: PokemonVolatileStatus::DISABLE,
+                        },
+                    ));
+                let slot = match encoded % 4 {
+                    0 => PokemonMoveIndex::M0,
+                    1 => PokemonMoveIndex::M1,
+                    2 => PokemonMoveIndex::M2,
+                    _ => PokemonMoveIndex::M3,
+                };
+                let active = side.get_active();
+                if active.moves[&slot].disabled {
+                    active.moves[&slot].disabled = false;
+                    incoming_instructions
+                        .instruction_list
+                        .push(Instruction::EnableMove(EnableMoveInstruction {
+                            side_ref: *side_ref,
+                            move_index: slot,
+                        }));
+                }
+            }
         }
 
         if side
@@ -3400,6 +3750,21 @@ fn add_end_of_turn_instructions(
             }
         }
 
+        tick_timed_volatile(
+            side,
+            side_ref,
+            PokemonVolatileStatus::HEALBLOCK,
+            5,
+            incoming_instructions,
+        );
+        tick_timed_volatile(
+            side,
+            side_ref,
+            PokemonVolatileStatus::THROATCHOP,
+            2,
+            incoming_instructions,
+        );
+
         if side
             .volatile_statuses
             .contains(&PokemonVolatileStatus::PERISH1)
@@ -3511,45 +3876,6 @@ fn add_end_of_turn_instructions(
                 ));
         }
 
-        if side
-            .volatile_statuses
-            .contains(&PokemonVolatileStatus::PARTIALLYTRAPPED)
-        {
-            let active_pkmn = side.get_active();
-            let damage_amount = cmp::min(
-                (active_pkmn.maxhp as f32 * PARTIALLY_TRAPPED_DAMAGE_PCT) as i16,
-                active_pkmn.hp,
-            );
-            incoming_instructions
-                .instruction_list
-                .push(Instruction::Damage(DamageInstruction {
-                    side_ref: *side_ref,
-                    damage_amount,
-                }));
-            active_pkmn.hp -= damage_amount;
-        }
-        if side
-            .volatile_statuses
-            .contains(&PokemonVolatileStatus::SALTCURE)
-        {
-            let active_pkmn = side.get_active();
-            let mut divisor = SALT_CURE_DAMAGE_DIVISOR;
-            if active_pkmn.has_type(&PokemonType::WATER)
-                || active_pkmn.has_type(&PokemonType::STEEL)
-            {
-                divisor /= 2.0;
-            }
-            let damage_amount =
-                cmp::min((active_pkmn.maxhp as f32 / divisor) as i16, active_pkmn.hp);
-            incoming_instructions
-                .instruction_list
-                .push(Instruction::Damage(DamageInstruction {
-                    side_ref: *side_ref,
-                    damage_amount: damage_amount,
-                }));
-            active_pkmn.hp -= damage_amount;
-        }
-
         let possible_statuses = [
             PokemonVolatileStatus::PROTECT,
             PokemonVolatileStatus::BANEFULBUNKER,
@@ -3600,6 +3926,148 @@ fn add_end_of_turn_instructions(
             side.side_conditions.protect -= side.side_conditions.protect;
         }
     } // end volatile statuses
+
+    // ability/item end-of-turn effects
+    for side_ref in sides {
+        let side = state.get_side(side_ref);
+        let active_pkmn = side.get_active();
+        if active_pkmn.hp == 0 {
+            continue;
+        }
+
+        item_end_of_turn(state, side_ref, &mut incoming_instructions);
+        ability_end_of_turn(state, side_ref, &mut incoming_instructions);
+    }
+
+    unburden_activation(state, incoming_instructions);
+    harvest_end_of_turn(state, sides, incoming_instructions)
+}
+
+/// Harvest (Showdown residual order 28.2): an itemless holder whose last eaten item was a berry
+/// regrows it, always in sun, otherwise with 50%. A regrown berry whose condition already holds
+/// (Sitrus at <= 1/2 HP, Lum while statused, ...) is eaten again right away (the `Update` event
+/// after the residuals). The main branch (`incoming_instructions`, applied to `state`) is the one
+/// where every roll succeeds; the other combinations are returned.
+fn harvest_end_of_turn(
+    state: &mut State,
+    sides: [&SideReference; 2],
+    incoming_instructions: &mut StateInstructions,
+) -> Vec<StateInstructions> {
+    let mut rolls: Vec<(f32, Vec<Instruction>)> = vec![];
+    let sun = matches!(state.weather.weather_type, Weather::SUN | Weather::HARSHSUN);
+    for side_ref in sides {
+        let active = state.get_side_immutable(side_ref).get_active_immutable();
+        if active.hp == 0
+            || active.ability != Abilities::HARVEST
+            || active.item != Items::NONE
+            || active.last_item == Items::NONE
+        {
+            continue;
+        }
+        let berry = active.last_item;
+        let mut block = StateInstructions::default();
+        block
+            .instruction_list
+            .push(Instruction::ChangeItem(ChangeItemInstruction {
+                side_ref: *side_ref,
+                current_item: Items::NONE,
+                new_item: berry,
+            }));
+        block
+            .instruction_list
+            .push(Instruction::SetLastItem(SetLastItemInstruction {
+                side_ref: *side_ref,
+                new_item: Items::NONE,
+                previous_item: berry,
+            }));
+        {
+            let active = state.get_side(side_ref).get_active();
+            active.item = berry;
+            active.last_item = Items::NONE;
+        }
+        item_end_of_turn(state, side_ref, &mut block);
+        rolls.push((if sun { 1.0 } else { 0.5 }, block.instruction_list));
+    }
+    if rolls.is_empty() {
+        return vec![];
+    }
+    let base = incoming_instructions.clone();
+    let mut extra = vec![];
+    let full = (1usize << rolls.len()) - 1;
+    for mask in 0..full {
+        let mut branch = base.clone();
+        let mut p = 1.0;
+        for (i, (chance, block)) in rolls.iter().enumerate() {
+            if mask & (1 << i) != 0 {
+                p *= chance;
+                branch.instruction_list.extend(block.iter().cloned());
+            } else {
+                p *= 1.0 - chance;
+            }
+        }
+        if p > 0.0 {
+            branch.update_percentage(p);
+            extra.push(branch);
+        }
+    }
+    let mut p = 1.0;
+    for (chance, block) in rolls {
+        p *= chance;
+        incoming_instructions.instruction_list.extend(block);
+    }
+    incoming_instructions.update_percentage(p);
+    extra
+}
+
+/// Spend PP for the move the attacker is using (Pressure on the target costs one more).
+///
+/// A move whose `max_pp` is known (> 0: states built from a real battle) always tracks PP and
+/// never goes below 0. A move with unknown max PP (`max_pp == 0`: hand-built states, records
+/// serialized before sdb.22) keeps the legacy behaviour of only tracking PP below 10, because
+/// above that it rarely matters and each decrement is an extra instruction in the search.
+/// A Sleep Talk-called move does not spend PP (the outer Sleep Talk does).
+fn deduct_pp(
+    state: &mut State,
+    attacking_side: &SideReference,
+    choice: &Choice,
+    instructions: &mut StateInstructions,
+) {
+    if let Some(pp) = pp_deduction(state, attacking_side, choice) {
+        state.get_side(attacking_side).get_active().moves[&pp.move_index].pp -= pp.amount;
+        instructions
+            .instruction_list
+            .push(Instruction::DecrementPP(pp));
+    }
+}
+
+/// The PP decrement `deduct_pp` would make, without touching the state (see `deduct_pp`).
+fn pp_deduction(
+    state: &State,
+    attacking_side: &SideReference,
+    choice: &Choice,
+) -> Option<DecrementPPInstruction> {
+    if choice.sleep_talk_move {
+        return None;
+    }
+    let (attacker_side, defender_side) = state.get_both_sides_immutable(attacking_side);
+    let pressure = choice.target == MoveTarget::Opponent
+        && defender_side.get_active_immutable().ability == Abilities::PRESSURE;
+    let mv = &attacker_side.get_active_immutable().moves[&choice.move_index];
+    if mv.max_pp == 0 && mv.pp >= 10 {
+        return None;
+    }
+    let mut amount: i8 = if pressure { 2 } else { 1 };
+    if mv.max_pp > 0 {
+        amount = cmp::min(amount, cmp::max(mv.pp, 0));
+        if amount == 0 {
+            return None;
+        }
+    }
+    Some(DecrementPPInstruction {
+        side_ref: *attacking_side,
+        move_index: choice.move_index,
+        amount,
+    })
 }
 
 fn run_move(
@@ -3655,6 +4123,24 @@ fn run_move(
             get_instructions_from_heal(state, heal, &attacking_side, &mut instructions);
         }
     } // end multi-hit
+
+    // Charge boosts the next Electric move and is used up by it (Showdown `onAfterMove`)
+    if choice.move_type == PokemonType::ELECTRIC && choice.move_id != Choices::CHARGE {
+        let attacker_side = state.get_side(&attacking_side);
+        if attacker_side
+            .volatile_statuses
+            .remove_with_check(&PokemonVolatileStatus::CHARGE)
+        {
+            instructions
+                .instruction_list
+                .push(Instruction::RemoveVolatileStatus(
+                    RemoveVolatileStatusInstruction {
+                        side_ref: attacking_side,
+                        volatile_status: PokemonVolatileStatus::CHARGE,
+                    },
+                ));
+        }
+    }
       // this is wrong, but I am deciding it is good enough for this engine (for now)
       // each multi-hit move should trigger a chance for a secondary effect,
       // but the way this engine was structured makes it difficult to implement
@@ -3814,9 +4300,62 @@ fn run_move(
     }
 }
 
+/// Unburden (Showdown `onAfterUseItem` / `onTakeItem`): the holder gets the `unburden` volatile
+/// (Speed x2 while it has no item) once it loses its item. Detected from this branch's
+/// instructions so every item-losing site (berries, gems, herbs, Knock Off, ...) is covered.
+fn unburden_activation(state: &mut State, instructions: &mut StateInstructions) {
+    for side_ref in [SideReference::SideOne, SideReference::SideTwo] {
+        let side = state.get_side_immutable(&side_ref);
+        let active = side.get_active_immutable();
+        if active.ability != Abilities::UNBURDEN
+            || active.item != Items::NONE
+            || active.hp <= 0
+            || side
+                .volatile_statuses
+                .contains(&PokemonVolatileStatus::UNBURDEN)
+        {
+            continue;
+        }
+        let mut lost = false;
+        for ins in instructions.instruction_list.iter().rev() {
+            match ins {
+                Instruction::Switch(sw) if sw.side_ref == side_ref => break,
+                Instruction::ChangeItem(c)
+                    if c.side_ref == side_ref
+                        && c.current_item != Items::NONE
+                        && c.new_item == Items::NONE =>
+                {
+                    lost = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if lost {
+            instructions
+                .instruction_list
+                .push(Instruction::ApplyVolatileStatus(
+                    ApplyVolatileStatusInstruction {
+                        side_ref,
+                        volatile_status: PokemonVolatileStatus::UNBURDEN,
+                    },
+                ));
+            state
+                .get_side(&side_ref)
+                .volatile_statuses
+                .insert(PokemonVolatileStatus::UNBURDEN);
+        }
+    }
+}
+
 fn after_move_finish(state: &mut State, final_instructions: &mut Vec<StateInstructions>) {
     for state_instructions in final_instructions.iter_mut() {
         state.apply_instructions(&state_instructions.instruction_list);
+
+        // Protosynthesis / Quark Drive when sun / Electric Terrain started with the mon out
+        for side_ref in [SideReference::SideOne, SideReference::SideTwo] {
+            ability_field_change_activation(state, &side_ref, state_instructions);
+        }
 
         // check if anybody has negative boosts and a whiteherb
         // if so, consume the item and set the boosts to 0
@@ -3837,6 +4376,7 @@ fn after_move_finish(state: &mut State, final_instructions: &mut Vec<StateInstru
                 }
             }
         }
+        unburden_activation(state, state_instructions);
         state.reverse_instructions(&state_instructions.instruction_list);
     }
 }
@@ -4060,6 +4600,95 @@ pub fn generate_instructions_for_bss_team_preview(
     vec![state_instructions]
 }
 
+/// Terastallizing a masked Ogerpon changes it to its -Tera forme, gives it the matching
+/// Embody Aspect ability, and that ability activates immediately (+1 Spe/SpD/Atk/Def).
+/// Called right after ToggleTerastallized has been applied to the active Pokemon.
+fn ogerpon_terastallize_effects(
+    state: &mut State,
+    side_ref: SideReference,
+    instructions: &mut StateInstructions,
+) {
+    // Terapagos-Terastal becomes Terapagos-Stellar (Teraform Zero) when it Terastallizes, and
+    // Teraform Zero clears the weather and terrain
+    if state.get_side(&side_ref).get_active().id == PokemonName::TERAPAGOSTERASTAL {
+        permanent_forme_change(
+            state.get_side(&side_ref),
+            &side_ref,
+            PokemonName::TERAPAGOSSTELLAR,
+            Some(Abilities::TERAFORMZERO),
+            instructions,
+        );
+        if state.weather.weather_type != Weather::NONE {
+            instructions
+                .instruction_list
+                .push(Instruction::ChangeWeather(ChangeWeather {
+                    new_weather: Weather::NONE,
+                    new_weather_turns_remaining: 0,
+                    previous_weather: state.weather.weather_type,
+                    previous_weather_turns_remaining: state.weather.turns_remaining,
+                }));
+            state.weather.weather_type = Weather::NONE;
+            state.weather.turns_remaining = 0;
+        }
+        if state.terrain.terrain_type != Terrain::NONE {
+            instructions
+                .instruction_list
+                .push(Instruction::ChangeTerrain(ChangeTerrain {
+                    new_terrain: Terrain::NONE,
+                    new_terrain_turns_remaining: 0,
+                    previous_terrain: state.terrain.terrain_type,
+                    previous_terrain_turns_remaining: state.terrain.turns_remaining,
+                }));
+            state.terrain.terrain_type = Terrain::NONE;
+            state.terrain.turns_remaining = 0;
+        }
+        return;
+    }
+    let (tera_forme, ability, stat) = match state.get_side(&side_ref).get_active().id {
+        PokemonName::OGERPON => (
+            PokemonName::OGERPONTEALTERA,
+            Abilities::EMBODYASPECTTEAL,
+            PokemonBoostableStat::Speed,
+        ),
+        PokemonName::OGERPONWELLSPRING => (
+            PokemonName::OGERPONWELLSPRINGTERA,
+            Abilities::EMBODYASPECTWELLSPRING,
+            PokemonBoostableStat::SpecialDefense,
+        ),
+        PokemonName::OGERPONHEARTHFLAME => (
+            PokemonName::OGERPONHEARTHFLAMETERA,
+            Abilities::EMBODYASPECTHEARTHFLAME,
+            PokemonBoostableStat::Attack,
+        ),
+        PokemonName::OGERPONCORNERSTONE => (
+            PokemonName::OGERPONCORNERSTONETERA,
+            Abilities::EMBODYASPECTCORNERSTONE,
+            PokemonBoostableStat::Defense,
+        ),
+        _ => return,
+    };
+    let side = state.get_side(&side_ref);
+    let active = side.get_active();
+    instructions
+        .instruction_list
+        .push(Instruction::FormeChange(FormeChangeInstruction {
+            side_ref,
+            name_change: tera_forme as i16 - active.id as i16,
+        }));
+    active.id = tera_forme;
+    active.recalculate_stats(&side_ref, instructions);
+    if active.ability != ability {
+        instructions
+            .instruction_list
+            .push(Instruction::ChangeAbility(ChangeAbilityInstruction {
+                side_ref,
+                ability_change: ability as i16 - active.ability as i16,
+            }));
+        active.ability = ability;
+    }
+    apply_boost_instruction(side, &stat, &1, &side_ref, &side_ref, instructions);
+}
+
 pub fn generate_instructions_from_move_pair(
     state: &mut State,
     side_one_move: &MoveChoice,
@@ -4153,6 +4782,22 @@ pub fn generate_instructions_from_move_pair(
         }
     }
 
+    // sdb: when one side only replaces a fainted Pokemon (`(switch, none)`), the other side's
+    // `none` is not a turn: it must not consume that side's MUSTRECHARGE / TRUANT volatile
+    // (a Giga Impact that KOs would otherwise lose its recharge turn in the follow-up call).
+    if s1_replacing_fainted_pkmn
+        && matches!(side_two_move, MoveChoice::None)
+        && side_two_choice.category != MoveCategory::Switch
+    {
+        side_two_choice.category = MoveCategory::Switch;
+    }
+    if s2_replacing_fainted_pkmn
+        && matches!(side_one_move, MoveChoice::None)
+        && side_one_choice.category != MoveCategory::Switch
+    {
+        side_one_choice.category = MoveCategory::Switch;
+    }
+
     let mut state_instructions_vec: Vec<StateInstructions> = Vec::with_capacity(4);
     let mut incoming_instructions: StateInstructions = StateInstructions::default();
 
@@ -4224,6 +4869,7 @@ pub fn generate_instructions_from_move_pair(
                     side_ref: SideReference::SideOne,
                 },
             ));
+        ogerpon_terastallize_effects(state, SideReference::SideOne, &mut incoming_instructions);
     }
     if s2_tera {
         state.side_two.get_active().terastallized = true;
@@ -4234,6 +4880,7 @@ pub fn generate_instructions_from_move_pair(
                     side_ref: SideReference::SideTwo,
                 },
             ));
+        ogerpon_terastallize_effects(state, SideReference::SideTwo, &mut incoming_instructions);
     }
 
     run_mega_evolutions(state, s1_mega, s2_mega, &mut incoming_instructions);
@@ -4261,6 +4908,7 @@ pub fn generate_instructions_from_move_pair(
                 branch_on_damage,
             );
 
+            let mut eot_extra = vec![];
             for state_instruction in state_instructions_vec.iter_mut() {
                 state.apply_instructions(&state_instruction.instruction_list);
                 if !(s1_replacing_fainted_pkmn
@@ -4268,10 +4916,15 @@ pub fn generate_instructions_from_move_pair(
                     || state.side_one.force_switch
                     || state.side_two.force_switch)
                 {
-                    add_end_of_turn_instructions(state, state_instruction, &SideReference::SideOne);
+                    eot_extra.extend(add_end_of_turn_instructions(
+                        state,
+                        state_instruction,
+                        &SideReference::SideOne,
+                    ));
                 }
                 state.reverse_instructions(&state_instruction.instruction_list);
             }
+            state_instructions_vec.extend(eot_extra);
         }
         SideMovesFirst::SideTwo => {
             handle_both_moves(
@@ -4283,6 +4936,7 @@ pub fn generate_instructions_from_move_pair(
                 &mut state_instructions_vec,
                 branch_on_damage,
             );
+            let mut eot_extra = vec![];
             for state_instruction in state_instructions_vec.iter_mut() {
                 state.apply_instructions(&state_instruction.instruction_list);
                 if !(s1_replacing_fainted_pkmn
@@ -4290,10 +4944,15 @@ pub fn generate_instructions_from_move_pair(
                     || state.side_one.force_switch
                     || state.side_two.force_switch)
                 {
-                    add_end_of_turn_instructions(state, state_instruction, &SideReference::SideTwo);
+                    eot_extra.extend(add_end_of_turn_instructions(
+                        state,
+                        state_instruction,
+                        &SideReference::SideTwo,
+                    ));
                 }
                 state.reverse_instructions(&state_instruction.instruction_list);
             }
+            state_instructions_vec.extend(eot_extra);
         }
         SideMovesFirst::SpeedTie => {
             let mut side_one_moves_first_instruction = incoming_instructions.clone();
@@ -4310,6 +4969,7 @@ pub fn generate_instructions_from_move_pair(
                 &mut state_instructions_vec,
                 branch_on_damage,
             );
+            let mut eot_extra = vec![];
             for state_instruction in state_instructions_vec.iter_mut() {
                 state.apply_instructions(&state_instruction.instruction_list);
                 if !(s1_replacing_fainted_pkmn
@@ -4317,10 +4977,15 @@ pub fn generate_instructions_from_move_pair(
                     || state.side_one.force_switch
                     || state.side_two.force_switch)
                 {
-                    add_end_of_turn_instructions(state, state_instruction, &SideReference::SideOne);
+                    eot_extra.extend(add_end_of_turn_instructions(
+                        state,
+                        state_instruction,
+                        &SideReference::SideOne,
+                    ));
                 }
                 state.reverse_instructions(&state_instruction.instruction_list);
             }
+            state_instructions_vec.extend(eot_extra);
 
             // side_two moves first
             let mut side_two_moves_first_si = Vec::with_capacity(4);
@@ -4333,6 +4998,7 @@ pub fn generate_instructions_from_move_pair(
                 &mut side_two_moves_first_si,
                 branch_on_damage,
             );
+            let mut eot_extra = vec![];
             for state_instruction in side_two_moves_first_si.iter_mut() {
                 state.apply_instructions(&state_instruction.instruction_list);
                 if !(s1_replacing_fainted_pkmn
@@ -4340,10 +5006,15 @@ pub fn generate_instructions_from_move_pair(
                     || state.side_one.force_switch
                     || state.side_two.force_switch)
                 {
-                    add_end_of_turn_instructions(state, state_instruction, &SideReference::SideTwo);
+                    eot_extra.extend(add_end_of_turn_instructions(
+                        state,
+                        state_instruction,
+                        &SideReference::SideTwo,
+                    ));
                 }
                 state.reverse_instructions(&state_instruction.instruction_list);
             }
+            side_two_moves_first_si.extend(eot_extra);
 
             // combine both vectors into the final vector
             state_instructions_vec.extend(side_two_moves_first_si);
@@ -4377,9 +5048,10 @@ fn get_instructions_from_pursuit_hitting_switching_target(
             .instruction_list
             .push(Instruction::ToggleTerastallized(
                 ToggleTerastallizedInstruction {
-                    side_ref: SideReference::SideOne,
+                    side_ref: pursuiting_side_ref,
                 },
             ));
+        ogerpon_terastallize_effects(state, pursuiting_side_ref, &mut incoming_instructions);
     }
 
     // reverse instructions because mega/tera might've added some
@@ -4418,11 +5090,17 @@ fn get_instructions_from_pursuit_hitting_switching_target(
         i += 1;
     }
 
+    let mut eot_extra = vec![];
     for state_instruction in state_instructions_vec.iter_mut() {
         state.apply_instructions(&state_instruction.instruction_list);
-        add_end_of_turn_instructions(state, state_instruction, &SideReference::SideOne);
+        eot_extra.extend(add_end_of_turn_instructions(
+            state,
+            state_instruction,
+            &SideReference::SideOne,
+        ));
         state.reverse_instructions(&state_instruction.instruction_list);
     }
+    state_instructions_vec.extend(eot_extra);
 }
 
 pub fn calculate_damage_rolls(
@@ -4567,6 +5245,33 @@ mod tests {
         Move, PokemonBoostableStat, PokemonIndex, PokemonMoveIndex, PokemonSideCondition,
         PokemonStatus, SideReference, State,
     };
+
+    #[cfg(feature = "terastallization")]
+    #[test]
+    fn test_acrobatics_without_item_is_110_bp_even_when_tera_floored() {
+        let bp_after_before_move = |tera: bool, item: Items| {
+            let mut state: State = State::default();
+            {
+                let a = state.side_one.get_active();
+                a.item = item;
+                a.terastallized = tera;
+                a.tera_type = PokemonType::FLYING;
+            }
+            let mut choice = MOVES.get(&Choices::ACROBATICS).unwrap().to_owned();
+            let mut instructions = StateInstructions::default();
+            before_move(
+                &mut state,
+                &mut choice,
+                &MOVES.get(&Choices::SPLASH).unwrap().to_owned(),
+                &SideReference::SideOne,
+                &mut instructions,
+            );
+            choice.base_power
+        };
+        assert_eq!(bp_after_before_move(false, Items::NONE), 110.0);
+        assert_eq!(bp_after_before_move(true, Items::NONE), 110.0); // not 60 * 2
+        assert_eq!(bp_after_before_move(true, Items::LEFTOVERS), 60.0); // floor still applies with an item
+    }
 
     #[test]
     fn test_drag_move_as_second_move_exits_early_if_opponent_used_drag_move() {
@@ -6382,7 +7087,11 @@ mod tests {
 
         let expected_instructions = vec![StateInstructions {
             percentage: 100.0,
-            instruction_list: vec![],
+            instruction_list: vec![Instruction::Boost(BoostInstruction {
+                side_ref: SideReference::SideTwo,
+                stat: PokemonBoostableStat::Evasion,
+                amount: -1,
+            })],
         }];
 
         assert_eq!(instructions, expected_instructions)
@@ -6409,12 +7118,19 @@ mod tests {
 
         let expected_instructions = vec![StateInstructions {
             percentage: 100.0,
-            instruction_list: vec![Instruction::ChangeTerrain(ChangeTerrain {
-                new_terrain: Terrain::NONE,
-                new_terrain_turns_remaining: 0,
-                previous_terrain: Terrain::ELECTRICTERRAIN,
-                previous_terrain_turns_remaining: 1,
-            })],
+            instruction_list: vec![
+                Instruction::ChangeTerrain(ChangeTerrain {
+                    new_terrain: Terrain::NONE,
+                    new_terrain_turns_remaining: 0,
+                    previous_terrain: Terrain::ELECTRICTERRAIN,
+                    previous_terrain_turns_remaining: 1,
+                }),
+                Instruction::Boost(BoostInstruction {
+                    side_ref: SideReference::SideTwo,
+                    stat: PokemonBoostableStat::Evasion,
+                    amount: -1,
+                }),
+            ],
         }];
 
         assert_eq!(instructions, expected_instructions)
@@ -6450,11 +7166,12 @@ mod tests {
                     previous_terrain: Terrain::ELECTRICTERRAIN,
                     previous_terrain_turns_remaining: 1,
                 }),
-                Instruction::ChangeSideCondition(ChangeSideConditionInstruction {
-                    side_ref: SideReference::SideOne,
-                    side_condition: PokemonSideCondition::Reflect,
+                Instruction::Boost(BoostInstruction {
+                    side_ref: SideReference::SideTwo,
+                    stat: PokemonBoostableStat::Evasion,
                     amount: -1,
                 }),
+                // only the target's screens are removed; the user's own Reflect stays
                 Instruction::ChangeSideCondition(ChangeSideConditionInstruction {
                     side_ref: SideReference::SideTwo,
                     side_condition: PokemonSideCondition::Reflect,
@@ -8626,6 +9343,158 @@ mod tests {
         );
 
         assert_eq!(expected_instructions, incoming_instructions);
+    }
+
+    fn imposter_setup() -> State {
+        let mut state: State = State::default();
+        {
+            let ditto = &mut state.side_one.pokemon[PokemonIndex::P1];
+            ditto.id = crate::pokemon::PokemonName::DITTO;
+            ditto.ability = Abilities::IMPOSTER;
+            ditto.base_ability = Abilities::IMPOSTER;
+            ditto.attack = 48;
+            ditto.special_attack = 48;
+            ditto.speed = 48;
+            ditto.weight_kg = 4.0;
+            ditto.maxhp = 100;
+            ditto.hp = 100;
+            ditto.moves.m0 = Move {
+                id: Choices::TRANSFORM,
+                disabled: false,
+                pp: 16,
+                max_pp: 0,
+                choice: MOVES.get(&Choices::TRANSFORM).unwrap().to_owned(),
+            };
+            ditto.moves.m1 = Move::default();
+            ditto.moves.m2 = Move::default();
+            ditto.moves.m3 = Move::default();
+        }
+        {
+            let foe = state.side_two.get_active();
+            foe.types = (PokemonType::DRAGON, PokemonType::FIRE);
+            foe.ability = Abilities::INTIMIDATE;
+            foe.attack = 300;
+            foe.defense = 250;
+            foe.special_attack = 310;
+            foe.special_defense = 200;
+            foe.speed = 280;
+            foe.hp = 150;
+            foe.maxhp = 300;
+            foe.weight_kg = 77.7;
+            foe.moves.m0.id = Choices::NASTYPLOT;
+            foe.moves.m0.choice = MOVES.get(&Choices::NASTYPLOT).unwrap().to_owned();
+            foe.moves.m1.id = Choices::DRACOMETEOR;
+            foe.moves.m1.choice = MOVES.get(&Choices::DRACOMETEOR).unwrap().to_owned();
+            foe.moves.m1.pp = 8;
+            foe.moves.m2 = Move::default();
+            foe.moves.m3 = Move::default();
+        }
+        state.side_two.special_attack_boost = 2;
+        state.side_two.speed_boost = -1;
+        state
+    }
+
+    #[test]
+    fn test_imposter_switch_in_copies_target_and_reverses() {
+        let mut state = imposter_setup();
+        let before = state.serialize();
+        let mut incoming = StateInstructions::default();
+        generate_instructions_from_switch(
+            &mut state,
+            PokemonIndex::P1,
+            SideReference::SideOne,
+            &mut incoming,
+        );
+        let d = state.side_one.get_active_immutable();
+        assert_eq!(d.id, crate::pokemon::PokemonName::DITTO);
+        assert_eq!(d.types, (PokemonType::DRAGON, PokemonType::FIRE));
+        assert_eq!(d.ability, Abilities::INTIMIDATE);
+        assert_eq!((d.attack, d.defense, d.special_attack), (300, 250, 310));
+        assert_eq!((d.special_defense, d.speed), (200, 280));
+        assert_eq!(d.hp, 100, "HP is not copied");
+        assert_eq!(d.maxhp, 100);
+        assert_eq!(d.weight_kg, 77.7);
+        assert_eq!(d.moves.m0.id, Choices::NASTYPLOT);
+        assert_eq!(d.moves.m1.id, Choices::DRACOMETEOR);
+        assert_eq!(d.moves.m0.pp, 5);
+        assert_eq!(d.moves.m1.pp, 5);
+        assert_eq!(d.moves.m2.id, Choices::NONE);
+        assert_eq!(state.side_one.special_attack_boost, 2);
+        assert_eq!(state.side_one.speed_boost, -1);
+        assert!(state
+            .side_one
+            .volatile_statuses
+            .contains(&PokemonVolatileStatus::TRANSFORMED));
+        // transformed mon round-trips through serialization
+        let rt = State::deserialize(&state.serialize());
+        assert_eq!(rt.serialize(), state.serialize());
+        assert_eq!(
+            rt.side_one.get_active_immutable().moves.m1.id,
+            Choices::DRACOMETEOR
+        );
+
+        state.reverse_instructions(&incoming.instruction_list);
+        assert_eq!(state.serialize(), before);
+    }
+
+    #[test]
+    fn test_imposter_fails_against_substitute_and_transformed_target() {
+        let mut state = imposter_setup();
+        state
+            .side_two
+            .volatile_statuses
+            .insert(PokemonVolatileStatus::SUBSTITUTE);
+        let mut incoming = StateInstructions::default();
+        generate_instructions_from_switch(
+            &mut state,
+            PokemonIndex::P1,
+            SideReference::SideOne,
+            &mut incoming,
+        );
+        assert_eq!(incoming.instruction_list.len(), 1); // only the Switch
+        assert_eq!(state.side_one.get_active_immutable().attack, 48);
+
+        let mut state = imposter_setup();
+        state
+            .side_two
+            .volatile_statuses
+            .insert(PokemonVolatileStatus::TRANSFORMED);
+        let mut incoming = StateInstructions::default();
+        generate_instructions_from_switch(
+            &mut state,
+            PokemonIndex::P1,
+            SideReference::SideOne,
+            &mut incoming,
+        );
+        assert_eq!(incoming.instruction_list.len(), 1);
+    }
+
+    #[test]
+    fn test_imposter_clears_transformed_volatile_and_ability_on_switch_out() {
+        let mut state = imposter_setup();
+        let mut incoming = StateInstructions::default();
+        generate_instructions_from_switch(
+            &mut state,
+            PokemonIndex::P1,
+            SideReference::SideOne,
+            &mut incoming,
+        );
+        let mut out = StateInstructions::default();
+        generate_instructions_from_switch(
+            &mut state,
+            PokemonIndex::P0,
+            SideReference::SideOne,
+            &mut out,
+        );
+        assert!(!state
+            .side_one
+            .volatile_statuses
+            .contains(&PokemonVolatileStatus::TRANSFORMED));
+        assert_eq!(state.side_one.speed_boost, 0);
+        assert_eq!(
+            state.side_one.pokemon[PokemonIndex::P1].ability,
+            Abilities::IMPOSTER
+        );
     }
 
     #[test]
@@ -10944,6 +11813,7 @@ mod tests {
                 id: Choices::TACKLE,
                 disabled: false,
                 pp: 32,
+                max_pp: 0,
                 choice: MOVES.get(&Choices::TACKLE).unwrap().clone(),
             };
         }
@@ -11033,6 +11903,102 @@ mod tests {
             );
             assert!(result.iteration_count > 0);
         }
+    }
+
+    #[test]
+    fn test_mcts_selection_modes_run_and_report_strategies() {
+        use crate::selection::{SelectionConfig, SelectionMode};
+        for mode in [SelectionMode::Ucb1, SelectionMode::Exp3, SelectionMode::Rm] {
+            let mut state = state_with_tackle();
+            let before = state.serialize();
+            let (s1, s2) = state.root_get_all_options();
+            let result = crate::mcts::perform_mcts_selecting(
+                &mut state,
+                s1,
+                s2,
+                std::time::Duration::from_millis(5),
+                3000,
+                None,
+                &SelectionConfig { mode, gamma: 0.1, prior: None },
+            );
+            assert!(result.iteration_count >= 3000);
+            assert_eq!(state.serialize(), before, "{:?} must restore the state", mode);
+            for side in [&result.s1, &result.s2] {
+                let total: f32 = side.iter().map(|r| r.avg_strategy).sum();
+                assert!((total - 1.0).abs() < 1e-3, "{:?} strategy sums to {}", mode, total);
+                assert_eq!(
+                    side.iter().map(|r| r.visits).sum::<u32>(),
+                    result.iteration_count
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_mcts_joint_matrix_is_consistent() {
+        use crate::selection::{SelectionConfig, SelectionMode};
+        for mode in [SelectionMode::Ucb1, SelectionMode::Exp3, SelectionMode::Rm] {
+            let mut state = state_with_tackle();
+            let (s1, s2) = state.root_get_all_options();
+            let (k1, k2) = (s1.len(), s2.len());
+            let sel = SelectionConfig { mode, gamma: 0.1, prior: None };
+            let plain = crate::mcts::perform_mcts_selecting(
+                &mut state, s1.clone(), s2.clone(),
+                std::time::Duration::from_millis(5), 500, None, &sel,
+            );
+            assert!(plain.joint.is_none());
+            let result = crate::mcts::perform_mcts_joint(
+                &mut state, s1, s2,
+                std::time::Duration::from_millis(5), 4000, None, &sel, true,
+            );
+            let joint = result.joint.as_ref().expect("joint requested");
+            assert!(!joint.is_empty());
+            let total: u32 = joint.iter().map(|c| c.visits).sum();
+            assert!(total <= result.iteration_count);
+            // only the unexpanded-root iterations (terminal / both-None) are missing
+            assert!(result.iteration_count - total <= 1, "{:?}", mode);
+            for c in joint {
+                assert!(c.s1 < k1 && c.s2 < k2);
+                assert!((0.0..=1.0).contains(&c.mean), "mean {}", c.mean);
+            }
+            // row sums of joint visits equal the side-one option visits
+            for (i, opt) in result.s1.iter().enumerate() {
+                let row: u32 = joint.iter().filter(|c| c.s1 == i).map(|c| c.visits).sum();
+                assert_eq!(row, opt.visits);
+            }
+        }
+    }
+
+    #[test]
+    fn test_mcts_exports_interior_nodes() {
+        use crate::mcts::{perform_mcts_export, ExportConfig};
+        use crate::selection::SelectionConfig;
+        let mut state = state_with_tackle();
+        let before = state.serialize();
+        let (s1, s2) = state.root_get_all_options();
+        let cfg = ExportConfig { max_nodes: 12, min_visits: 8 };
+        let result = perform_mcts_export(
+            &mut state, s1.clone(), s2.clone(),
+            std::time::Duration::from_millis(5), 20000, None,
+            &SelectionConfig::default(), false, Some(&cfg),
+        );
+        assert_eq!(before, state.serialize(), "the walk must leave the root state intact");
+        let nodes = result.nodes.expect("export requested");
+        assert!(!nodes.is_empty() && nodes.len() <= 12, "{} nodes", nodes.len());
+        for n in &nodes {
+            assert!(n.visits >= 8 && n.visits <= result.iteration_count);
+            assert!(n.depth >= 1);
+            assert!(n.value > 0.0 && n.value < 1.0, "value {}", n.value);
+            assert!(n.static_value > 0.0 && n.static_value < 1.0);
+            State::deserialize(&n.state); // parses back
+        }
+        assert!((0.0..=1.0).contains(&result.root_value));
+        // without a request nothing is exported and the search is unchanged
+        let plain = perform_mcts_export(
+            &mut state, s1, s2, std::time::Duration::from_millis(5), 2000, None,
+            &SelectionConfig::default(), false, None,
+        );
+        assert!(plain.nodes.is_none());
     }
 
     #[test]
@@ -11224,4 +12190,375 @@ mod tests {
         assert_eq!(Items::LEPPABERRY, Items::from_str("leppaberry").unwrap());
         assert_eq!(Items::SCOPELENS, Items::from_str("scopelens").unwrap());
     }
+
+    // --- Sleep / Rest / Sleep Talk / Encore fidelity (589.35) -------------------------
+
+    fn set_move(side: &mut Side, slot: PokemonMoveIndex, id: Choices, pp: i8) {
+        side.get_active().moves[&slot] = Move {
+            id,
+            disabled: false,
+            pp,
+            max_pp: 0,
+            choice: MOVES.get(&id).unwrap().clone(),
+        };
+    }
+
+    fn use_move(
+        state: &mut State,
+        side: SideReference,
+        id: Choices,
+        slot: PokemonMoveIndex,
+        other: Choices,
+    ) -> Vec<StateInstructions> {
+        let mut choice = MOVES.get(&id).unwrap().to_owned();
+        choice.move_index = slot;
+        let mut outcomes = vec![];
+        generate_instructions_from_move(
+            state,
+            &mut choice,
+            MOVES.get(&other).unwrap(),
+            side,
+            StateInstructions::default(),
+            &mut outcomes,
+            false,
+        );
+        outcomes
+    }
+
+    fn applies_status(outcomes: &[StateInstructions], status: PokemonVolatileStatus) -> bool {
+        outcomes.iter().any(|o| {
+            o.instruction_list.iter().any(|i| {
+                matches!(i, Instruction::ApplyVolatileStatus(a) if a.volatile_status == status)
+            })
+        })
+    }
+
+    fn changes_status(outcomes: &[StateInstructions]) -> bool {
+        outcomes.iter().any(|o| {
+            o.instruction_list
+                .iter()
+                .any(|i| matches!(i, Instruction::ChangeStatus(_)))
+        })
+    }
+
+    fn total_percentage(outcomes: &[StateInstructions]) -> f32 {
+        outcomes.iter().map(|o| o.percentage).sum()
+    }
+
+    /// Side one (Encore user) vs side two whose last used move is `last` in slot M0.
+    fn encore_outcomes(last: Choices, pp: i8, already_encored: bool) -> Vec<StateInstructions> {
+        let mut state = State::default();
+        state.use_last_used_move = true;
+        set_move(&mut state.side_one, PokemonMoveIndex::M0, Choices::ENCORE, 8);
+        set_move(&mut state.side_two, PokemonMoveIndex::M0, last, pp);
+        state.side_two.last_used_move = LastUsedMove::Move(PokemonMoveIndex::M0);
+        if already_encored {
+            state
+                .side_two
+                .volatile_statuses
+                .insert(PokemonVolatileStatus::ENCORE);
+        }
+        use_move(
+            &mut state,
+            SideReference::SideOne,
+            Choices::ENCORE,
+            PokemonMoveIndex::M0,
+            Choices::TACKLE,
+        )
+    }
+
+    #[test]
+    fn test_encore_fails_against_failencore_last_moves() {
+        assert!(applies_status(
+            &encore_outcomes(Choices::TACKLE, 32, false),
+            PokemonVolatileStatus::ENCORE
+        ));
+        for last in [
+            Choices::SLEEPTALK,
+            Choices::ENCORE,
+            Choices::TRANSFORM,
+            Choices::MIMIC,
+            Choices::STRUGGLE,
+            Choices::METRONOME,
+            Choices::COPYCAT,
+            Choices::SKETCH,
+        ] {
+            let outcomes = encore_outcomes(last, 16, false);
+            assert!(
+                !applies_status(&outcomes, PokemonVolatileStatus::ENCORE),
+                "Encore must fail against last move {:?}",
+                last
+            );
+            assert!((total_percentage(&outcomes) - 100.0).abs() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn test_encore_fails_when_target_move_has_no_pp_or_is_already_encored() {
+        assert!(!applies_status(
+            &encore_outcomes(Choices::TACKLE, 0, false),
+            PokemonVolatileStatus::ENCORE
+        ));
+        assert!(!applies_status(
+            &encore_outcomes(Choices::TACKLE, 32, true),
+            PokemonVolatileStatus::ENCORE
+        ));
+    }
+
+    #[test]
+    fn test_sleep_talk_choices_exclude_uncallable_moves() {
+        let mut state = State::default();
+        let active = state.side_one.get_active();
+        active.moves.m0 = Move {
+            id: Choices::SLEEPTALK,
+            disabled: false,
+            pp: 16,
+            max_pp: 0,
+            choice: MOVES.get(&Choices::SLEEPTALK).unwrap().clone(),
+        };
+        active.moves.m1 = Move {
+            id: Choices::FLY,
+            disabled: false,
+            pp: 16,
+            max_pp: 0,
+            choice: MOVES.get(&Choices::FLY).unwrap().clone(),
+        };
+        active.moves.m2 = Move {
+            id: Choices::REST,
+            disabled: false,
+            pp: 16,
+            max_pp: 0,
+            choice: MOVES.get(&Choices::REST).unwrap().clone(),
+        };
+        active.moves.m3 = Move {
+            id: Choices::UPROAR,
+            disabled: false,
+            pp: 16,
+            max_pp: 0,
+            choice: MOVES.get(&Choices::UPROAR).unwrap().clone(),
+        };
+        let ids: Vec<Choices> = active
+            .get_sleep_talk_choices()
+            .iter()
+            .map(|c| c.move_id)
+            .collect();
+        assert_eq!(ids, vec![Choices::REST]);
+    }
+
+    fn sleeping_state(rest_turns: i8) -> State {
+        let mut state = State::default();
+        state.use_last_used_move = true;
+        let active = state.side_one.get_active();
+        active.status = PokemonStatus::SLEEP;
+        active.rest_turns = rest_turns;
+        active.hp = active.maxhp / 2;
+        set_move(&mut state.side_one, PokemonMoveIndex::M0, Choices::SLEEPTALK, 5);
+        set_move(&mut state.side_one, PokemonMoveIndex::M1, Choices::TACKLE, 9);
+        set_move(&mut state.side_one, PokemonMoveIndex::M2, Choices::SPLASH, 40);
+        state
+    }
+
+    #[test]
+    fn test_sleep_talk_calls_uniformly_and_keeps_sleep_talk_as_last_move() {
+        let mut state = sleeping_state(3);
+        let outcomes = use_move(
+            &mut state,
+            SideReference::SideOne,
+            Choices::SLEEPTALK,
+            PokemonMoveIndex::M0,
+            Choices::TACKLE,
+        );
+        assert!((total_percentage(&outcomes) - 100.0).abs() < 1e-3);
+        // two callable moves (Tackle, Splash), 50% each; Tackle's outcomes damage the foe
+        let damaging: f32 = outcomes
+            .iter()
+            .filter(|o| {
+                o.instruction_list
+                    .iter()
+                    .any(|i| matches!(i, Instruction::Damage(d) if d.side_ref == SideReference::SideTwo))
+            })
+            .map(|o| o.percentage)
+            .sum();
+        assert!(damaging > 40.0 && damaging <= 50.0 + 1e-3, "damaging={damaging}");
+        for outcome in &outcomes {
+            for instruction in &outcome.instruction_list {
+                match instruction {
+                    // the last move stays Sleep Talk (slot M0): never the called move's slot
+                    Instruction::SetLastUsedMove(s) => {
+                        assert_eq!(s.last_used_move, LastUsedMove::Move(PokemonMoveIndex::M0))
+                    }
+                    // only Sleep Talk's own PP is spent (slot M0), not the called move's
+                    Instruction::DecrementPP(d) => assert_eq!(d.move_index, PokemonMoveIndex::M0),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_sleep_talk_with_nothing_callable_fails_without_losing_probability() {
+        let mut state = sleeping_state(3);
+        set_move(&mut state.side_one, PokemonMoveIndex::M1, Choices::NONE, 0);
+        set_move(&mut state.side_one, PokemonMoveIndex::M2, Choices::FLY, 16);
+        let outcomes = use_move(
+            &mut state,
+            SideReference::SideOne,
+            Choices::SLEEPTALK,
+            PokemonMoveIndex::M0,
+            Choices::TACKLE,
+        );
+        assert!((total_percentage(&outcomes) - 100.0).abs() < 1e-3, "{outcomes:?}");
+    }
+
+    #[test]
+    fn test_sleep_talk_only_works_while_asleep() {
+        let mut state = sleeping_state(0);
+        state.side_one.get_active().status = PokemonStatus::NONE;
+        let outcomes = use_move(
+            &mut state,
+            SideReference::SideOne,
+            Choices::SLEEPTALK,
+            PokemonMoveIndex::M0,
+            Choices::TACKLE,
+        );
+        assert!(!outcomes.iter().any(|o| o
+            .instruction_list
+            .iter()
+            .any(|i| matches!(i, Instruction::Damage(_)))));
+    }
+
+    #[test]
+    fn test_rest_sleeps_exactly_two_turns_then_acts_on_the_third() {
+        let mut state = State::default();
+        set_move(&mut state.side_one, PokemonMoveIndex::M0, Choices::REST, 16);
+        set_move(&mut state.side_one, PokemonMoveIndex::M1, Choices::TACKLE, 16);
+        state.side_one.get_active().hp = 10;
+        let rest = use_move(
+            &mut state,
+            SideReference::SideOne,
+            Choices::REST,
+            PokemonMoveIndex::M0,
+            Choices::TACKLE,
+        );
+        assert_eq!(rest.len(), 1);
+        state.apply_instructions(&rest[0].instruction_list);
+        assert_eq!(state.side_one.get_active().status, PokemonStatus::SLEEP);
+        assert_eq!(state.side_one.get_active().rest_turns, 3);
+        let mut turns_without_acting = 0;
+        loop {
+            let outcomes = use_move(
+                &mut state,
+                SideReference::SideOne,
+                Choices::TACKLE,
+                PokemonMoveIndex::M1,
+                Choices::TACKLE,
+            );
+            assert_eq!(outcomes.len(), 1, "Rest sleep is deterministic");
+            let acted = outcomes[0]
+                .instruction_list
+                .iter()
+                .any(|i| matches!(i, Instruction::Damage(d) if d.side_ref == SideReference::SideTwo));
+            state.apply_instructions(&outcomes[0].instruction_list);
+            if acted {
+                break;
+            }
+            turns_without_acting += 1;
+            assert!(turns_without_acting <= 2, "slept more than two turns");
+        }
+        assert_eq!(turns_without_acting, 2);
+        assert_eq!(state.side_one.get_active().status, PokemonStatus::NONE);
+        assert_eq!(state.side_one.get_active().rest_turns, 0);
+    }
+
+    #[test]
+    fn test_heal_block_stops_rest() {
+        let mut state = State::default();
+        set_move(&mut state.side_one, PokemonMoveIndex::M0, Choices::REST, 16);
+        state.side_one.get_active().hp = 10;
+        state
+            .side_one
+            .volatile_statuses
+            .insert(PokemonVolatileStatus::HEALBLOCK);
+        let outcomes = use_move(
+            &mut state,
+            SideReference::SideOne,
+            Choices::REST,
+            PokemonMoveIndex::M0,
+            Choices::TACKLE,
+        );
+        assert!(!changes_status(&outcomes));
+        assert!(!outcomes.iter().any(|o| o
+            .instruction_list
+            .iter()
+            .any(|i| matches!(i, Instruction::Heal(_)))));
+    }
+
+    #[test]
+    fn test_sleep_talk_into_rest_does_nothing_while_asleep_or_heal_blocked() {
+        for heal_block in [false, true] {
+            let mut state = sleeping_state(3);
+            set_move(&mut state.side_one, PokemonMoveIndex::M1, Choices::REST, 5);
+            set_move(&mut state.side_one, PokemonMoveIndex::M2, Choices::NONE, 0);
+            if heal_block {
+                state
+                    .side_one
+                    .volatile_statuses
+                    .insert(PokemonVolatileStatus::HEALBLOCK);
+            }
+            let outcomes = use_move(
+                &mut state,
+                SideReference::SideOne,
+                Choices::SLEEPTALK,
+                PokemonMoveIndex::M0,
+                Choices::TACKLE,
+            );
+            assert!((total_percentage(&outcomes) - 100.0).abs() < 1e-3);
+            assert!(!outcomes.iter().any(|o| o
+                .instruction_list
+                .iter()
+                .any(|i| matches!(i, Instruction::Heal(_) | Instruction::ChangeStatus(_)))));
+        }
+    }
+
+    #[test]
+    fn test_rest_fails_at_full_hp_and_with_insomnia() {
+        for (hp_full, ability) in [(true, Abilities::NONE), (false, Abilities::INSOMNIA)] {
+            let mut state = State::default();
+            set_move(&mut state.side_one, PokemonMoveIndex::M0, Choices::REST, 16);
+            let active = state.side_one.get_active();
+            active.ability = ability;
+            if !hp_full {
+                active.hp = 10;
+            }
+            let outcomes = use_move(
+                &mut state,
+                SideReference::SideOne,
+                Choices::REST,
+                PokemonMoveIndex::M0,
+                Choices::TACKLE,
+            );
+            assert!(!changes_status(&outcomes), "hp_full={hp_full} {ability:?}");
+        }
+    }
+
+    #[test]
+    fn test_thunder_wave_fails_on_an_already_statused_target() {
+        for status in [PokemonStatus::PARALYZE, PokemonStatus::SLEEP, PokemonStatus::BURN] {
+            let mut state = State::default();
+            set_move(&mut state.side_one, PokemonMoveIndex::M0, Choices::THUNDERWAVE, 32);
+            state.side_two.get_active().status = status;
+            let outcomes = use_move(
+                &mut state,
+                SideReference::SideOne,
+                Choices::THUNDERWAVE,
+                PokemonMoveIndex::M0,
+                Choices::TACKLE,
+            );
+            assert!(!changes_status(&outcomes), "{status:?}");
+        }
+    }
+    include!("fail_move_tests.inc.rs");
+    include!("sdb22_tests.inc.rs");
+    include!("sdb22_tests2.inc.rs");
+    include!("sdb28_tests.inc.rs");
 }

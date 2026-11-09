@@ -264,6 +264,7 @@ define_enum_with_from_str! {
         UNBURDEN,
         UPROAR,
         YAWN,
+        TRANSFORMED,
     },
     default = NONE
 }
@@ -485,7 +486,7 @@ impl Pokemon {
         vec: &mut Vec<MoveChoice>,
         last_used_move: &LastUsedMove,
         encored: bool,
-        taunted: bool,
+        taunted: MoveRestrictions,
         can_tera: bool,
         side_can_mega: bool,
     ) {
@@ -509,8 +510,15 @@ impl Pokemon {
                         // just assume nothing is locked in this case
                     }
                 }
-                if (self.item == Items::ASSAULTVEST || taunted)
-                    && self.moves[&iter.pokemon_move_index].choice.category == MoveCategory::Status
+                let mv_choice = &self.moves[&iter.pokemon_move_index].choice;
+                if (self.item == Items::ASSAULTVEST || taunted.taunt)
+                    && mv_choice.category == MoveCategory::Status
+                {
+                    continue;
+                }
+                // Heal Block disables heal moves, Throat Chop sound moves
+                if (taunted.healblock && mv_choice.flags.heal)
+                    || (taunted.throatchop && mv_choice.flags.sound)
                 {
                     continue;
                 }
@@ -804,7 +812,27 @@ const ALL_POKEMON_INDICES: [PokemonIndex; 6] = [
     PokemonIndex::P5,
 ];
 
+/// Volatile restrictions on which moves the active can be sent out with.
+#[derive(Clone, Copy, Default)]
+pub struct MoveRestrictions {
+    pub taunt: bool,
+    pub healblock: bool,
+    pub throatchop: bool,
+}
+
 impl Side {
+    pub fn move_restrictions(&self) -> MoveRestrictions {
+        MoveRestrictions {
+            taunt: self.volatile_statuses.contains(&PokemonVolatileStatus::TAUNT),
+            healblock: self
+                .volatile_statuses
+                .contains(&PokemonVolatileStatus::HEALBLOCK),
+            throatchop: self
+                .volatile_statuses
+                .contains(&PokemonVolatileStatus::THROATCHOP),
+        }
+    }
+
     // generates BSS team preview options
     // BSS is a 6v6 game at team preview, but only 3v3 in battle.
     // This should generate all 60 options for both sides using MoveChoice::TeamPreview.
@@ -1187,10 +1215,7 @@ impl State {
                 .side_one
                 .volatile_statuses
                 .contains(&PokemonVolatileStatus::ENCORE);
-            let taunted = self
-                .side_one
-                .volatile_statuses
-                .contains(&PokemonVolatileStatus::TAUNT);
+            let taunted = self.side_one.move_restrictions();
             self.side_one.get_active_immutable().add_available_moves(
                 &mut s1_options,
                 &self.side_one.last_used_move,
@@ -1215,10 +1240,7 @@ impl State {
                 .side_two
                 .volatile_statuses
                 .contains(&PokemonVolatileStatus::ENCORE);
-            let taunted = self
-                .side_two
-                .volatile_statuses
-                .contains(&PokemonVolatileStatus::TAUNT);
+            let taunted = self.side_two.move_restrictions();
             self.side_two.get_active_immutable().add_available_moves(
                 &mut s2_options,
                 &self.side_two.last_used_move,
@@ -1304,10 +1326,7 @@ impl State {
                 .side_one
                 .volatile_statuses
                 .contains(&PokemonVolatileStatus::ENCORE);
-            let taunted = self
-                .side_one
-                .volatile_statuses
-                .contains(&PokemonVolatileStatus::TAUNT);
+            let taunted = self.side_one.move_restrictions();
             self.side_one.get_active_immutable().add_available_moves(
                 &mut side_one_options,
                 &self.side_one.last_used_move,
@@ -1334,10 +1353,7 @@ impl State {
                 .side_two
                 .volatile_statuses
                 .contains(&PokemonVolatileStatus::ENCORE);
-            let taunted = self
-                .side_two
-                .volatile_statuses
-                .contains(&PokemonVolatileStatus::TAUNT);
+            let taunted = self.side_two.move_restrictions();
             self.side_two.get_active_immutable().add_available_moves(
                 &mut side_two_options,
                 &self.side_two.last_used_move,
@@ -1396,7 +1412,7 @@ impl State {
             let should_retain = match pkmn_volatile_status {
                 PokemonVolatileStatus::SUBSTITUTE => baton_passing || shed_tailing,
                 PokemonVolatileStatus::LEECHSEED => baton_passing,
-                PokemonVolatileStatus::TYPECHANGE => {
+                PokemonVolatileStatus::TYPECHANGE | PokemonVolatileStatus::TRANSFORMED => {
                     let active = side.get_active();
                     if active.base_types != active.types {
                         instructions.push(Instruction::ChangeType(ChangeType {
@@ -1440,6 +1456,32 @@ impl State {
                         },
                     ));
                     side.volatile_status_durations.taunt = 0;
+                    false
+                }
+                PokemonVolatileStatus::HEALBLOCK => {
+                    if side.volatile_status_durations.healblock != 0 {
+                        instructions.push(Instruction::ChangeVolatileStatusDuration(
+                            ChangeVolatileStatusDurationInstruction {
+                                side_ref: *side_ref,
+                                volatile_status: *pkmn_volatile_status,
+                                amount: -1 * side.volatile_status_durations.healblock,
+                            },
+                        ));
+                        side.volatile_status_durations.healblock = 0;
+                    }
+                    false
+                }
+                PokemonVolatileStatus::THROATCHOP => {
+                    if side.volatile_status_durations.throatchop != 0 {
+                        instructions.push(Instruction::ChangeVolatileStatusDuration(
+                            ChangeVolatileStatusDurationInstruction {
+                                side_ref: *side_ref,
+                                volatile_status: *pkmn_volatile_status,
+                                amount: -1 * side.volatile_status_durations.throatchop,
+                            },
+                        ));
+                        side.volatile_status_durations.throatchop = 0;
+                    }
                     false
                 }
                 _ => false,

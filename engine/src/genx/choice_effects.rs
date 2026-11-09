@@ -1,7 +1,7 @@
 use super::abilities::Abilities;
 use super::damage_calc::type_effectiveness_modifier;
 use super::generate_instructions::{add_remove_status_instructions, apply_boost_instruction};
-use super::items::{get_choice_move_disable_instructions, Items};
+use super::items::{get_choice_move_disable_instructions, on_item_taken, Items};
 use super::state::{PokemonVolatileStatus, Terrain, Weather};
 use crate::choices::{
     Boost, Choice, Choices, Effect, Heal, MoveCategory, MoveTarget, Secondary, StatBoosts,
@@ -508,8 +508,15 @@ pub fn modify_choice(
         }
 
         Choices::ACROBATICS => {
-            if attacking_side.get_active_immutable().item == Items::NONE {
-                attacker_choice.base_power *= 2.0;
+            let attacker = attacking_side.get_active_immutable();
+            if attacker.item == Items::NONE {
+                if attacker.terastallized && attacker_choice.move_type == attacker.tera_type {
+                    // The Tera 60-BP floor was already applied to the base 55; Showdown floors the
+                    // callback result (110), so it must not be doubled to 120.
+                    attacker_choice.base_power = 110.0;
+                } else {
+                    attacker_choice.base_power *= 2.0;
+                }
             }
         }
         Choices::FOCUSPUNCH => {
@@ -818,10 +825,17 @@ pub fn choice_after_damage_hit(
                     new_item: Items::NONE,
                 });
                 instructions.instruction_list.push(instruction);
+                let old_item = defender_active.item;
                 defender_active.item = Items::NONE;
+                on_item_taken(
+                    defending_side,
+                    &attacking_side_ref.get_other_side(),
+                    old_item,
+                    &mut instructions.instruction_list,
+                );
             }
         }
-        Choices::THIEF => {
+        Choices::THIEF | Choices::COVET => {
             let attacker_active = attacking_side.get_active();
             let defender_active = defending_side.get_active();
             if defender_active.item_can_be_removed()
@@ -846,6 +860,12 @@ pub fn choice_after_damage_hit(
                 });
                 instructions.instruction_list.push(instruction);
                 attacker_active.item = defender_item;
+                on_item_taken(
+                    defending_side,
+                    &attacking_side_ref.get_other_side(),
+                    defender_item,
+                    &mut instructions.instruction_list,
+                );
             }
         }
         Choices::CLEARSMOG => {
@@ -1099,17 +1119,39 @@ pub fn choice_hazard_clear(
                 state.terrain.terrain_type = Terrain::NONE;
                 state.terrain.turns_remaining = 0;
             }
-            let side_condition_clears = [
+            // sdb (589.39): Showdown's Defog lowers the target's evasion by 1 (which triggers
+            // Defiant/Competitive; a Substitute or Clear Body blocks it, hazard removal still
+            // happens) and removes screens/Safeguard/Mist from the TARGET's side only; hazards
+            // go from both sides.
+            let defender_ref = attacking_side_ref.get_other_side();
+            apply_boost_instruction(
+                state.get_side(&defender_ref),
+                &PokemonBoostableStat::Evasion,
+                &-1,
+                attacking_side_ref,
+                &defender_ref,
+                instructions,
+            );
+            let hazards = [
                 PokemonSideCondition::Stealthrock,
                 PokemonSideCondition::Spikes,
                 PokemonSideCondition::ToxicSpikes,
                 PokemonSideCondition::StickyWeb,
+            ];
+            let target_only = [
                 PokemonSideCondition::Reflect,
                 PokemonSideCondition::LightScreen,
                 PokemonSideCondition::AuroraVeil,
+                PokemonSideCondition::Safeguard,
+                PokemonSideCondition::Mist,
             ];
 
             for side in [SideReference::SideOne, SideReference::SideTwo] {
+                let side_condition_clears: Vec<PokemonSideCondition> = if side == defender_ref {
+                    hazards.iter().chain(target_only.iter()).copied().collect()
+                } else {
+                    hazards.to_vec()
+                };
                 for side_condition in side_condition_clears {
                     let side_condition_num = state
                         .get_side_immutable(&side)
@@ -1265,6 +1307,22 @@ pub fn choice_special_effect(
     attacking_side_ref: &SideReference,
     instructions: &mut StateInstructions,
 ) {
+    // fixed-damage moves are applied here, so a Protect-ed target (the choice was turned into a
+    // Status move by `remove_effects_for_protect`) must not take them
+    if choice.category == MoveCategory::Status
+        && matches!(
+            choice.move_id,
+            Choices::SEISMICTOSS
+                | Choices::NIGHTSHADE
+                | Choices::SUPERFANG
+                | Choices::NATURESMADNESS
+                | Choices::RUINATION
+                | Choices::ENDEAVOR
+                | Choices::FINALGAMBIT
+        )
+    {
+        return;
+    }
     let (attacking_side, defending_side) = state.get_both_sides(attacking_side_ref);
     match choice.move_id {
         Choices::BELLYDRUM => {
@@ -1363,7 +1421,7 @@ pub fn choice_special_effect(
                 attacking_side.wish = (2, attacking_side.get_active_immutable().maxhp / 2);
             }
         }
-        Choices::REFRESH => {
+        Choices::REFRESH | Choices::TAKEHEART => {
             let active_index = attacking_side.active_index;
             let active_pkmn = attacking_side.get_active();
             if active_pkmn.status != PokemonStatus::NONE {
@@ -1396,7 +1454,14 @@ pub fn choice_special_effect(
             let attacking_side = state.get_side(attacking_side_ref);
             let active_index = attacking_side.active_index;
             let active_pkmn = attacking_side.get_active();
-            if active_pkmn.status != PokemonStatus::SLEEP && !electric_terrain_active {
+            // sdb: like Showdown's Rest.onTry, fail at full HP or with Insomnia / Vital Spirit
+            // (and while asleep, e.g. when called by Sleep Talk)
+            if active_pkmn.status != PokemonStatus::SLEEP
+                && !electric_terrain_active
+                && active_pkmn.hp != active_pkmn.maxhp
+                && active_pkmn.ability != Abilities::INSOMNIA
+                && active_pkmn.ability != Abilities::VITALSPIRIT
+            {
                 let heal_amount = active_pkmn.maxhp - active_pkmn.hp;
                 instructions
                     .instruction_list
@@ -1673,6 +1738,42 @@ pub fn choice_special_effect(
             instructions
                 .instruction_list
                 .push(change_defender_item_instruction);
+            on_item_taken(
+                attacking_side,
+                attacking_side_ref,
+                attacker_item,
+                &mut instructions.instruction_list,
+            );
+            on_item_taken(
+                defending_side,
+                &attacking_side_ref.get_other_side(),
+                defender_item,
+                &mut instructions.instruction_list,
+            );
+        }
+        Choices::CORROSIVEGAS => {
+            let defender_has_sub = defending_side
+                .volatile_statuses
+                .contains(&PokemonVolatileStatus::SUBSTITUTE);
+            let defender = defending_side.get_active();
+            let defender_item = defender.item;
+            if defender_item == Items::NONE || !defender.item_can_be_removed() || defender_has_sub {
+                return;
+            }
+            instructions
+                .instruction_list
+                .push(Instruction::ChangeItem(ChangeItemInstruction {
+                    side_ref: attacking_side_ref.get_other_side(),
+                    current_item: defender_item,
+                    new_item: Items::NONE,
+                }));
+            defender.item = Items::NONE;
+            on_item_taken(
+                defending_side,
+                &attacking_side_ref.get_other_side(),
+                defender_item,
+                &mut instructions.instruction_list,
+            );
         }
         Choices::SUNNYDAY => {
             if state.weather.weather_type != Weather::SUN {

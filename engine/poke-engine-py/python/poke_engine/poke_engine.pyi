@@ -18,6 +18,12 @@ class VolatileStatusDurations:
     :type taunt: int
     :param yawn: Yawn turns remaining
     :type yawn: int
+    :param healblock: Heal Block turns remaining (sdb.22; 0 with the volatile set = fresh 5)
+    :type healblock: int
+    :param throatchop: Throat Chop turns remaining (sdb.22; 0 with the volatile set = fresh 2)
+    :type throatchop: int
+    :param disable: Disable (sdb.28): ``turns_remaining * 4 + move_slot``, 0 when not disabled
+    :type disable: int
     """
 
     confusion: int
@@ -26,6 +32,9 @@ class VolatileStatusDurations:
     slowstart: int
     taunt: int
     yawn: int
+    healblock: int
+    throatchop: int
+    disable: int
 
     def __init__(
         self,
@@ -35,6 +44,9 @@ class VolatileStatusDurations:
         slowstart: int = 0,
         taunt: int = 0,
         yawn: int = 0,
+        healblock: int = 0,
+        throatchop: int = 0,
+        disable: int = 0,
     ) -> None: ...
 
 class SideConditions:
@@ -134,17 +146,21 @@ class Move:
     :type disabled: bool
     :param pp: Remaining PP
     :type pp: int
+    :param max_pp: Maximum PP; 0 = unknown (engine then tracks PP only below 10)
+    :type max_pp: int
     """
 
     id: str
     disabled: bool
     pp: int
+    max_pp: int
 
     def __init__(
         self,
         id: str = "none",
         pp: int = 16,
         disabled: bool = False,
+        max_pp: int = 0,
     ) -> None: ...
 
 class Pokemon:
@@ -203,6 +219,8 @@ class Pokemon:
     :type times_attacked: int
     :param stellar_boosted_types: For pokemon terastallized into the Stellar type, this keeps track the types that have been boosted by Stellar Boost.
     :type stellar_boosted_types: list[str]
+    :param last_item: The berry Harvest can regrow (Showdown ``lastItem``), "none" otherwise (sdb.28)
+    :type last_item: str
     """
 
     id: str
@@ -231,6 +249,7 @@ class Pokemon:
     moves: List[Move]
     times_attacked: int
     stellar_boosted_types: Optional[list[str]]
+    last_item: str
 
     def __init__(
         self,
@@ -260,6 +279,7 @@ class Pokemon:
         tera_type: str = "typeless",
         times_attacked: int = 0,
         stellar_boosted_types: Optional[list[str]] = None,
+        last_item: str = "none",
     ) -> None: ...
     @staticmethod
     def create_fainted() -> Pokemon: ...
@@ -425,6 +445,7 @@ class MctsSideResult:
     move_choice: Tuple[str, str]
     total_score: float
     visits: int
+    avg_strategy: float
 
 class MctsResult:
     """Result from MCTS algorithm."""
@@ -432,18 +453,39 @@ class MctsResult:
     side_one: List[MctsSideResult]
     side_two: List[MctsSideResult]
     iteration_count: int
+    joint: Optional[List[Tuple[int, int, int, float]]]
+    nodes: Optional[List[Tuple[str, int, float, float, int]]]
+    root_value: float
+    root_search_value: float
 
 FEATURE_VERSION: int
 FEATURE_LENGTH: int
+FEATURE_LENGTH_V2: int
+FEATURE_LENGTH_V3: int
+FEATURE_LENGTH_V4: int
+FEATURE_LENGTH_V5: int
+FEATURE_VERSIONS: List[int]
+IDENTITY_LENGTH: int
+IDENTITY_IDS_PER_SLOT: int
+
+def feature_length(version: Optional[int] = None) -> int: ...
 
 class Evaluator:
     """Learned leaf evaluator for MCTS (linear or 2-layer MLP). Output is a logit of P(side one wins)."""
 
     @staticmethod
-    def load(path: str, relative_to_root: bool = True) -> "Evaluator": ...
+    def load(
+        path: str, relative_to_root: bool = True, leaf_scale: float = 1.0, material: float = 0.0
+    ) -> "Evaluator": ...
     @staticmethod
     def linear(
-        weights: List[float], bias: float = 0.0, relative_to_root: bool = True
+        weights: List[float],
+        bias: float = 0.0,
+        relative_to_root: bool = True,
+        leaf_scale: float = 1.0,
+        stock_coef: float = 0.0,
+        feature_version: int = 1,
+        material: float = 0.0,
     ) -> "Evaluator": ...
     @staticmethod
     def mlp(
@@ -452,21 +494,90 @@ class Evaluator:
         w2: List[float],
         b2: float = 0.0,
         relative_to_root: bool = True,
+        leaf_scale: float = 1.0,
+        stock_coef: float = 0.0,
+        feature_version: int = 1,
+        material: float = 0.0,
     ) -> "Evaluator": ...
     def save(self, path: str) -> None: ...
+    @property
+    def feature_version(self) -> int: ...
+    @property
+    def embed_dims(self) -> Optional[List[int]]:
+        """Embedding dims (species, item, ability, move) of a feature-version-4 net, else None."""
+        ...
     def evaluate(self, py_state: State) -> float: ...
+    def logit(self, py_state: State) -> float:
+        """Model logit of P(side one wins); same as ``evaluate``."""
+        ...
+    @property
+    def leaf_scale(self) -> float: ...
+    @property
+    def material(self) -> float: ...
     @property
     def kind(self) -> str: ...
     @property
     def hidden_size(self) -> int: ...
     @property
     def relative_to_root(self) -> bool: ...
+    @property
+    def residual(self) -> bool:
+        """True if the logit is ``stock_coef * evaluate(state) + net(features)``."""
+        ...
+    @property
+    def stock_coef(self) -> float:
+        """Multiplier on the raw stock ``evaluate()`` (0.0 when not residual)."""
+        ...
 
-def state_features(py_state: State, side: int = 1) -> List[float]:
+def evaluate(py_state: State) -> float:
+    """Stock hand-written evaluation (eval points) of the state."""
+    ...
+
+def state_features(py_state: State, side: int = 1, version: Optional[int] = None) -> List[float]:
     """Fixed-length feature vector (length FEATURE_LENGTH) from side's perspective."""
     ...
 
-def state_feature_names() -> List[str]: ...
+def state_feature_names(version: Optional[int] = None) -> List[str]: ...
+
+def state_identity(py_state: State, side: int = 1) -> List[int]:
+    """Feature version 4 identity indices (IDENTITY_LENGTH ints): per slot (own 0..5, opp 0..5)
+    [species, item, ability, move0..3]; 0 = pad (fainted), 1 = unknown, else enum id + 2."""
+    ...
+
+def state_tokens(
+    py_state: State, side: int = 1,
+    opp_reveal: Optional[List[Tuple[str, List[str], bool, bool, bool]]] = None,
+    with_choices: bool = False,
+) -> Tuple[bytes, bytes, List[str]]:
+    """Transformer tokens (docs/tokens.md): (int16 `cat` bytes, float32 `cont` bytes, slot names).
+    `token_layout()` says where each field lives; `opp_reveal` rows are
+    (species, revealed moves, item revealed, ability revealed, tera revealed)."""
+    ...
+
+def state_tokens_str(
+    state: str, side: int = 1,
+    opp_reveal: Optional[List[Tuple[str, List[str], bool, bool, bool]]] = None,
+    with_choices: bool = False,
+) -> Tuple[bytes, bytes, List[str]]:
+    """`state_tokens` for a serialized state string (skips the State object round trip)."""
+    ...
+
+def state_hidden_targets(state: str, truth: str, side: int = 1) -> bytes:
+    """int16 bytes: 6 x 8 hidden-set ids, 6 mask flags, 6 true opponent species ids."""
+    ...
+
+def tokens_bench(state: str, side: int = 1, n: int = 1000, scrub: bool = False) -> float:
+    """Mean seconds per core token computation."""
+    ...
+
+def token_layout() -> List[Tuple[str, str, int, List[int], str]]:
+    """(name, buffer 'cat'|'cont', element offset, shape, dtype) of every token field."""
+    ...
+
+def token_constants() -> List[Tuple[str, int]]: ...
+def identity_vocab_sizes() -> List[int]: ...
+def identity_vocab(table: int) -> List[str]: ...
+def identity_vocab_hash() -> int: ...
 
 def mcts(
     py_state: State,
@@ -474,6 +585,11 @@ def mcts(
     iterations: int,
     threads: int,
     evaluator: Optional[Evaluator] = None,
+    selection: str = "ucb1",
+    gamma: float = 0.1,
+    return_joint: bool = False,
+    export_nodes: int = 0,
+    export_min_visits: int = 16,
 ) -> MctsResult:
     """
     Perform Monte Carlo Tree Search on the given state.
@@ -482,6 +598,8 @@ def mcts(
     :param duration_ms: Duration in milliseconds to run MCTS. ignored if iterations > 0.
     :param iterations: Exact number of monte-carlo iterations to run
     :param threads: Number of threads to use for MCTS
+    :param selection: "ucb1" (default), "exp3" or "rm"; exp3/rm require threads == 1
+    :param gamma: exploration rate in (0, 1] for exp3/rm
     :return: MCTS results for both sides
     """
     ...

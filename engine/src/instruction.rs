@@ -76,6 +76,8 @@ pub enum Instruction {
     SetSleepTurns(SetSleepTurnsInstruction),
     ChangeSubstituteHealth(ChangeSubsituteHealthInstruction),
     FormeChange(FormeChangeInstruction),
+    ChangeMove(ChangeMoveInstruction),
+    ChangeWeight(ChangeWeightInstruction),
     SetSideOneMoveSecondSwitchOutMove(SetSecondMoveSwitchOutMoveInstruction),
     SetSideTwoMoveSecondSwitchOutMove(SetSecondMoveSwitchOutMoveInstruction),
     ToggleBatonPassing(ToggleBatonPassingInstruction),
@@ -93,6 +95,8 @@ pub enum Instruction {
     ToggleMegaEvolved(ToggleMegaEvolvedInstruction),
     TeamPreviewFaintIndex(SideReference, PokemonIndex),
     ToggleTeamPreview,
+    SetLastItem(SetLastItemInstruction),
+    ChangeMaxHp(ChangeStatInstruction),
 }
 
 impl fmt::Debug for Instruction {
@@ -270,6 +274,16 @@ impl fmt::Debug for Instruction {
             Instruction::FormeChange(s) => {
                 write!(f, "FormeChange {:?} {}", s.side_ref, s.name_change)
             }
+            Instruction::ChangeMove(s) => {
+                write!(
+                    f,
+                    "ChangeMove {:?} {:?} {}",
+                    s.side_ref, s.move_index, s.id_change
+                )
+            }
+            Instruction::ChangeWeight(s) => {
+                write!(f, "ChangeWeight {:?} {}hg", s.side_ref, s.amount_hg)
+            }
             Instruction::SetSideOneMoveSecondSwitchOutMove(s) => {
                 write!(
                     f,
@@ -351,6 +365,16 @@ impl fmt::Debug for Instruction {
             }
             Instruction::ToggleTeamPreview => {
                 write!(f, "ToggleTeamPreview")
+            }
+            Instruction::ChangeMaxHp(c) => {
+                write!(f, "ChangeMaxHp {:?}: {}", c.side_ref, c.amount)
+            }
+            Instruction::SetLastItem(i) => {
+                write!(
+                    f,
+                    "SetLastItem {:?}: {:?} -> {:?}",
+                    i.side_ref, i.previous_item, i.new_item
+                )
             }
         }
     }
@@ -459,6 +483,14 @@ pub struct ChangeItemInstruction {
     pub new_item: Items,
 }
 
+/// The active Pokemon's `last_item` (the berry Harvest can regrow). Reversible: `previous_item`.
+#[derive(Debug, PartialEq, Clone)]
+pub struct SetLastItemInstruction {
+    pub side_ref: SideReference,
+    pub new_item: Items,
+    pub previous_item: Items,
+}
+
 #[derive(Debug, PartialEq, Clone)]
 pub struct ChangeStatInstruction {
     pub side_ref: SideReference,
@@ -490,6 +522,24 @@ pub struct FormeChangeInstruction {
     // PokemonName is represented as i16
     // This is the amount the name has changed by
     pub name_change: i16,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct ChangeMoveInstruction {
+    pub side_ref: SideReference,
+    pub move_index: PokemonMoveIndex,
+
+    // Choices is represented as u16
+    // This is the amount the move id has changed by
+    pub id_change: i16,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct ChangeWeightInstruction {
+    pub side_ref: SideReference,
+
+    // change in weight, in hectograms (0.1kg)
+    pub amount_hg: i16,
 }
 
 #[derive(Debug, PartialEq, Clone)]

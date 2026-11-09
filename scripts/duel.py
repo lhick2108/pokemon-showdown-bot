@@ -3,7 +3,12 @@
     python -m uv run python scripts/duel.py --evaluator models/x.pev --games 100 --pairs 4
 
 Both sides get the same SearchConfig (time per world, worlds, threads, mode)
-except for ``evaluator``; each side's config is passed to its player as a
+except for ``evaluator`` and, if asked, the engine selection mode
+(--net-selection / --stock-selection, gamma --selection-gamma) and the final
+move rule (--net-mode / --stock-mode: mixed, argmax or nash); with
+--stock-uses-evaluator both sides use the same evaluator, so e.g.
+``--net-selection rm --stock-selection ucb1 --stock-uses-evaluator`` isolates
+the selection rule; each side's config is passed to its player as a
 constructor argument, so the process-wide SHOWDOWN_SEARCH_* env vars are not
 used. The two sides of every pair share one MCTS process pool, so CPU
 contention is symmetric. Needs the local server on 127.0.0.1:8000
@@ -16,6 +21,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import math
 import os
 import secrets
 import sys
@@ -24,16 +30,114 @@ from pathlib import Path
 
 from poke_env.ps_client import AccountConfiguration, LocalhostServerConfiguration
 
-from showdown_bot import bench
-from showdown_bot.players.search import SearchConfig, SearchNetPlayer, SearchPlayer, get_pool
+from showdown_bot import bench, compute
+from showdown_bot import teams as teams_module
+from showdown_bot.players.search import (
+    MODES, SELECTIONS, SearchConfig, SearchNetPlayer, SearchPlayer, get_pool,
+)
 
 
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
-    p.add_argument("--evaluator", type=Path, required=True, help="learned .pev file")
+    p.add_argument("--evaluator", type=Path, default=None,
+                   help="learned .pev file; omit to duel two stock searches (no evaluator on "
+                        "either side), e.g. --net-mode nash --stock-mode mixed")
+    p.add_argument("--leaf-scale", type=float, default=1.0,
+                   help="learned leaf scale k: score = sigmoid(k * dz); net side only")
+    p.add_argument("--net-evaluator2", type=Path, default=None,
+                   help="second .pev for the net side: its sampled worlds alternate between "
+                        "--evaluator (even worlds) and this net (odd worlds), so with an odd "
+                        "world count --evaluator gets the extra world; needs --evaluator, 2+ worlds")
+    p.add_argument("--net-evaluator2-scale", type=float, default=1.0,
+                   help="leaf scale of --net-evaluator2 (default 1.0)")
+    p.add_argument("--net-selection", choices=SELECTIONS, default="ucb1",
+                   help="engine tree policy of the net side (default ucb1)")
+    p.add_argument("--stock-selection", choices=SELECTIONS, default="ucb1",
+                   help="engine tree policy of the stock side (default ucb1)")
+    p.add_argument("--net-mode", choices=MODES, default="mixed",
+                   help="final move rule of the net side (default mixed; nash needs --threads 1)")
+    p.add_argument("--stock-mode", choices=MODES, default="mixed",
+                   help="final move rule of the stock side (default mixed)")
+    p.add_argument("--net-inference", choices=("on", "off"), default="on",
+                   help="589.28 opponent set inference on the net side (default on)")
+    p.add_argument("--stock-inference", choices=("on", "off"), default="on",
+                   help="589.28 opponent set inference on the stock side (default on)")
+    p.add_argument("--net-damage-inference", choices=("on", "off"), default="on",
+                   help="damage-roll part of the net side's inference (default on)")
+    p.add_argument("--stock-damage-inference", choices=("on", "off"), default="on",
+                   help="damage-roll part of the stock side's inference (default on)")
+    p.add_argument("--net-eval-lowhp", type=float, default=0.0,
+                   help="589.32: low-HP evaluation knee for the net side (0 = stock; needs the 589.32 engine wheel)")
+    p.add_argument("--stock-eval-lowhp", type=float, default=0.0,
+                   help="589.32: low-HP evaluation knee for the stock side (0 = stock)")
+    p.add_argument("--net-eval-boost-scale", type=float, default=1.0,
+                   help="589.32: multiplier on stat-boost eval terms for the net side (1 = stock)")
+    p.add_argument("--stock-eval-boost-scale", type=float, default=1.0,
+                   help="589.32: multiplier on stat-boost eval terms for the stock side (1 = stock)")
+    p.add_argument("--net-tendency", choices=("on", "off"), default="off",
+                   help="589.40 opponent tendency model on the net side (default off)")
+    p.add_argument("--stock-tendency", choices=("on", "off"), default="off",
+                   help="589.40 opponent tendency model on the stock side (default off)")
+    for side in ("net", "stock"):
+        p.add_argument(f"--{side}-belief", action="store_true",
+                       help=f"{side} side: soft Bayesian belief reweighting of opponent sets "
+                            "(bead showdown-bot-1wu; default off)")
+    p.add_argument("--belief-tau", type=float, default=None,
+                   help="tempering exponent for action evidence (default 0.5)")
+    p.add_argument("--belief-floor", type=float, default=None,
+                   help="min share of the likeliest set (default 0.05)")
+    p.add_argument("--tendency-kappa", type=float, default=None, help="prior pseudo-observations")
+    p.add_argument("--tendency-delta", type=float, default=None, help="max loss vs Nash")
+    for side in ("net", "stock"):
+        p.add_argument(f"--{side}-escalate", action="store_true",
+                       help=f"589.47: {side} side re-searches longer when the top two options are flat")
+        p.add_argument(f"--{side}-escalate-gap", type=float, default=0.02,
+                       help="flat when the top two mean scores differ by less than this")
+        p.add_argument(f"--{side}-escalate-factor", type=float, default=4.0,
+                       help="escalated per-world budget as a multiple of --search-time-ms")
+        p.add_argument(f"--{side}-escalate-steps", type=int, default=1)
+        p.add_argument(f"--{side}-escalate-cap-ms", type=int, default=3000,
+                       help="hard wall-clock cap of one decision's search")
+        p.add_argument(f"--{side}-prune-noop", action="store_true",
+                       help=f"589.47: {side} side drops moves the engine proves have no effect")
+        p.add_argument(f"--{side}-prune-noop-loose", action="store_true",
+                       help="with --prune-noop: ignore opponent switches when proving a no-op "
+                            "(also prunes status into an already-statused target)")
+        p.add_argument(f"--{side}-tera-margin", type=float, default=0.0,
+                       help="589.47: X-tera needs a mean this much above X, else it folds into X (0 = off)")
+    for side in ("net", "stock"):
+        p.add_argument(f"--{side}-endgame", choices=("off", "safest", "nash"), default="off",
+                       help=f"{side} side: exact expectiminimax in small endgames instead of MCTS "
+                            "(stock eval, no learned evaluator; default off)")
+    p.add_argument("--endgame-alive", type=int, default=5,
+                   help="endgame trigger: total alive Pokemon on both sides <= N (default 5)")
+    p.add_argument("--endgame-side", type=int, default=0,
+                   help="also require each side's alive <= N (0 = no per-side cap)")
+    p.add_argument("--endgame-ms", type=int, default=1500, help="per-world endgame search ms")
+    p.add_argument("--endgame-worlds", type=int, default=2, help="worlds per endgame decision")
+    p.add_argument("--endgame-cap-ms", type=int, default=4000,
+                   help="wall-clock budget one endgame decision must fit under (clamps --endgame-ms)")
+    p.add_argument("--selection-gamma", type=float, default=0.1,
+                   help="exploration rate in (0, 1] for exp3/rm sides")
+    p.add_argument("--stock-uses-evaluator", action="store_true",
+                   help="give the second side the same evaluator/leaf scale (isolates selection)")
+    p.add_argument("--opponent-evaluator", type=Path, default=None,
+                   help="learned .pev for the second side (e.g. the v1 net when --evaluator is a "
+                        "v2 net); overrides --stock-uses-evaluator")
+    p.add_argument("--opponent-leaf-scale", type=float, default=1.0,
+                   help="leaf scale of --opponent-evaluator (default 1.0)")
     p.add_argument("--games", type=bench._positive_int, default=100)
     p.add_argument("--pairs", type=bench._positive_int, default=4, help="parallel pairs")
     p.add_argument("--format", default="gen9randombattle")
+    p.add_argument("--teams", choices=teams_module.MODES, default="random",
+                   help="random: fresh random teams every game (default). swap: team pair (T1, T2), "
+                        "game 1 net=T1/stock=T2, game 2 teams swap seats and bots. mirror: both "
+                        "sides get the same team, net plays it from both seats. swap/mirror play "
+                        "in the gen9randombattlefixed server format (needs the custom-formats "
+                        "install of scripts/start_server.ps1), need an even --games, and report a "
+                        "paired CI over team pairs")
+    p.add_argument("--team-seed", type=int, default=0,
+                   help="seed of the generated teams (--teams swap/mirror); same seed, same teams")
     p.add_argument("--search-time-ms", type=bench._positive_int, default=100,
                    help="per-world search time, identical for both sides")
     p.add_argument("--parallelism", type=bench._positive_int, default=1)
@@ -41,46 +145,175 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--threads", type=bench._positive_int, default=1)
     p.add_argument("--workers", type=bench._positive_int, default=os.cpu_count() or 4,
                    help="shared MCTS process pool size")
+    p.add_argument("--strict-compute", action="store_true",
+                   help="refuse to start when --workers > cores - 2 (room for the main process "
+                        "and the node server); otherwise only warn")
+    p.add_argument("--port", type=int, default=8000, help="local Showdown server port")
     p.add_argument("--connect-timeout", type=bench._positive_seconds, default=30)
     p.add_argument("--game-timeout", type=bench._positive_seconds, default=900)
     return p
 
 
-async def _duel_pair(args, share: int, pool):
+def _tendency_fields(args, flag: str) -> dict:
+    fields = {"tendency": flag == "on"}
+    if args.tendency_kappa is not None:
+        fields["tendency_kappa"] = args.tendency_kappa
+    if args.tendency_delta is not None:
+        fields["tendency_delta"] = args.tendency_delta
+    return fields
+
+
+def _belief_fields(args, side: str) -> dict:
+    fields = {"belief_reweight": bool(getattr(args, f"{side}_belief"))}
+    if args.belief_tau is not None:
+        fields["belief_tau"] = args.belief_tau
+    if args.belief_floor is not None:
+        fields["belief_floor"] = args.belief_floor
+    return fields
+
+
+def _endgame_fields(args, side: str) -> dict:
+    return {
+        "endgame": getattr(args, f"{side}_endgame"), "endgame_max_alive": args.endgame_alive,
+        "endgame_max_side": args.endgame_side, "endgame_time_ms": args.endgame_ms,
+        "endgame_worlds": args.endgame_worlds, "endgame_cap_ms": args.endgame_cap_ms,
+    }
+
+
+def _quality(args, side: str) -> dict:
+    """SearchConfig fields of the 589.47 decision-quality options for one side."""
+    get = lambda name: getattr(args, f"{side}_{name}")  # noqa: E731
+    return {
+        "escalate": get("escalate"), "escalate_gap": get("escalate_gap"),
+        "escalate_factor": get("escalate_factor"), "escalate_steps": get("escalate_steps"),
+        "escalate_cap_ms": get("escalate_cap_ms"), "prune_noop": get("prune_noop"),
+        "noop_vs_switches": not get("prune_noop_loose"),
+        "tera_margin": get("tera_margin"),
+    }
+
+
+async def _duel_pair(args, share: int, pool, plans=None, live=None):
+    """One parallel net-vs-stock pair. Returns (net, stock, results), ``results`` being
+    ``[(team pair, net score)]`` for the games of ``plans`` (empty with --teams random)."""
     options = {
-        "battle_format": args.format,
+        "battle_format": teams_module.battle_format_for(args.teams, args.format),
         "max_concurrent_battles": 1,
-        "server_configuration": LocalhostServerConfiguration,
+        "server_configuration": bench.local_server(args.port),
         "log_level": logging.ERROR,
         "open_timeout": args.connect_timeout,
     }
     base = SearchConfig(
         search_time_ms=args.search_time_ms, parallelism=args.parallelism,
-        worlds=args.worlds, threads=args.threads,
+        worlds=args.worlds, threads=args.threads, selection_gamma=args.selection_gamma,
     )
-    net = SearchNetPlayer(
+    evaluator_fields = ({"evaluator": str(args.evaluator.resolve()),
+                         "evaluator_scale": args.leaf_scale} if args.evaluator else {})
+    ensemble_fields = ({"evaluator2": str(args.net_evaluator2.resolve()),
+                        "evaluator2_scale": args.net_evaluator2_scale}
+                       if args.net_evaluator2 else {})
+    net_cls = SearchNetPlayer if args.evaluator else SearchPlayer
+    net = net_cls(
         account_configuration=AccountConfiguration("dn" + secrets.token_hex(5), None),
-        config=SearchConfig(**{**base.__dict__, "evaluator": str(args.evaluator.resolve())}),
+        config=SearchConfig(**{**base.__dict__, **evaluator_fields, **ensemble_fields,
+                          "selection": args.net_selection,
+                          "inference": args.net_inference == "on",
+                          "damage_inference": args.net_damage_inference == "on",
+                          "mode": args.net_mode,
+                          "eval_lowhp_knee": args.net_eval_lowhp,
+                          "eval_boost_scale": args.net_eval_boost_scale,
+                          **_tendency_fields(args, args.net_tendency),
+                          **_belief_fields(args, "net"),
+                          **_quality(args, "net"),
+                          **_endgame_fields(args, "net")}),
         executor=pool, **options,
     )
-    stock = SearchPlayer(
+    if args.opponent_evaluator:
+        stock_eval_fields = {"evaluator": str(args.opponent_evaluator.resolve()),
+                             "evaluator_scale": args.opponent_leaf_scale}
+    elif args.stock_uses_evaluator and args.evaluator:
+        stock_eval_fields = evaluator_fields
+    else:
+        stock_eval_fields = {}
+    stock_cls = SearchNetPlayer if stock_eval_fields else SearchPlayer
+    stock = stock_cls(
         account_configuration=AccountConfiguration("ds" + secrets.token_hex(5), None),
-        config=base, executor=pool, **options,
+        config=SearchConfig(**{
+            **base.__dict__, **stock_eval_fields,
+            "selection": args.stock_selection,
+            "inference": args.stock_inference == "on",
+            "damage_inference": args.stock_damage_inference == "on",
+            "mode": args.stock_mode,
+            "eval_lowhp_knee": args.stock_eval_lowhp,
+            "eval_boost_scale": args.stock_eval_boost_scale,
+            **_tendency_fields(args, args.stock_tendency),
+            **_belief_fields(args, "stock"),
+            **_quality(args, "stock"),
+            **_endgame_fields(args, "stock"),
+        }),
+        executor=pool, **options,
     )
+    results: list[tuple[int, float]] = []
+    if live is not None:
+        live.append((net, stock, results))
     try:
         await bench._wait_for_player_logins([net, stock], args.connect_timeout)
-        await asyncio.wait_for(
-            net.battle_against(stock, n_battles=share), timeout=args.game_timeout * share
-        )
+        if plans is None:
+            await asyncio.wait_for(
+                net.battle_against(stock, n_battles=share), timeout=args.game_timeout * share
+            )
+        else:
+            for plan in plans:  # one game at a time: both sides take their team per game
+                won, tied, done = net.n_won_battles, net.n_tied_battles, net.n_finished_battles
+                await teams_module.play_plan(plan, net, stock, args.game_timeout,
+                                             mode=args.teams, seed=args.team_seed)
+                if net.n_finished_battles != done + 1:
+                    raise RuntimeError(f"game {plan.index} did not finish")
+                score = 1.0 if net.n_won_battles > won else 0.5 if net.n_tied_battles > tied else 0.0
+                results.append((plan.pair, score))
     finally:
         await asyncio.gather(*(bench._disconnect_player(p) for p in (net, stock)))
-    return net, stock
+    return net, stock, results
+
+
+def _tally(live) -> tuple[int, int, int, int]:
+    """(finished, net wins, stock wins, ties) over every pair so far."""
+    done = sum(net.n_finished_battles for net, _, _ in live)
+    wins = sum(net.n_won_battles for net, _, _ in live)
+    ties = sum(net.n_tied_battles for net, _, _ in live)
+    return done, wins, done - wins - ties, ties
+
+
+async def _progress(args, live, interval: float = 2.0, heartbeat: float = 120.0):
+    """Print a flushed progress line whenever a game finishes (and every ``heartbeat`` s)."""
+    printer = compute.ProgressPrinter(args.games)
+    quiet_since = time.monotonic()
+    while True:
+        await asyncio.sleep(interval)
+        done, wins, losses, ties = _tally(live)
+        rows = [r for _, _, res in live for r in res]
+        paired = compute.paired_text(rows) if args.teams != "random" else None
+        if printer.update(done, "net", wins, losses, ties, paired):
+            quiet_since = time.monotonic()
+        elif time.monotonic() - quiet_since > heartbeat:
+            printer.last = -1  # still running, no game finished: say so
+            printer.update(done, "net", wins, losses, ties, paired)
+            quiet_since = time.monotonic()
 
 
 async def _run(args):
     pool = get_pool(args.workers)
-    shares = bench.split_games(args.games, args.pairs)
-    tasks = [asyncio.ensure_future(_duel_pair(args, s, pool)) for s in shares]
+    if args.teams == "random":
+        shares = bench.split_games(args.games, args.pairs)
+        share_plans = [None] * len(shares)
+    else:
+        shares = teams_module.split_pairs(args.games, args.pairs)
+        plans = teams_module.plan_games(args.teams, args.games, args.team_seed)
+        starts = [sum(shares[:i]) for i in range(len(shares))]
+        share_plans = [teams_module.slice_plans(plans, s, st) for s, st in zip(shares, starts)]
+    live: list = []
+    tasks = [asyncio.ensure_future(_duel_pair(args, s, pool, sp, live))
+             for s, sp in zip(shares, share_plans)]
+    ticker = asyncio.ensure_future(_progress(args, live))
     try:
         return await asyncio.gather(*tasks)
     except BaseException:
@@ -88,12 +321,69 @@ async def _run(args):
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         raise
+    finally:
+        ticker.cancel()
+        await asyncio.gather(ticker, return_exceptions=True)
+        done, wins, losses, ties = _tally(live)
+        compute.ProgressPrinter(args.games).update(done, "net", wins, losses, ties)
+
+
+def _preflight(args) -> bool:
+    """Print the compute preflight; False when --strict-compute refuses to start."""
+    worlds = args.worlds or SearchConfig(parallelism=args.parallelism).plan(True)[0]
+    demand = args.pairs * 2 * worlds  # both players of every pair search at once
+    info, warnings, refuse = compute.preflight(args.workers, demand, strict=args.strict_compute)
+    print(f"{info[0]} ({args.pairs} pairs x 2 players x {worlds} worlds)", flush=True)
+    for w in warnings:
+        print(w, file=sys.stderr, flush=True)
+    return not refuse
 
 
 def main(argv=None) -> int:
     args = _parser().parse_args(argv)
-    if not args.evaluator.is_file():
-        print(f"no such evaluator: {args.evaluator}", file=sys.stderr)
+    if not (math.isfinite(args.leaf_scale) and args.leaf_scale > 0):
+        print(f"--leaf-scale must be finite and > 0, got {args.leaf_scale}", file=sys.stderr)
+        return 2
+    if not (math.isfinite(args.selection_gamma) and 0 < args.selection_gamma <= 1):
+        print(f"--selection-gamma must be in (0, 1], got {args.selection_gamma}", file=sys.stderr)
+        return 2
+    if "ucb1" != args.net_selection or "ucb1" != args.stock_selection:
+        if args.threads > 1:
+            print("exp3/rm selection needs --threads 1", file=sys.stderr)
+            return 2
+    if "on" in (args.net_tendency, args.stock_tendency) and args.threads > 1:
+        print("tendency needs --threads 1", file=sys.stderr)
+        return 2
+    if "nash" in (args.net_mode, args.stock_mode) and args.threads > 1:
+        print("nash mode needs --threads 1", file=sys.stderr)
+        return 2
+    if args.net_evaluator2 is not None:
+        if args.evaluator is None:
+            print("--net-evaluator2 needs --evaluator", file=sys.stderr)
+            return 2
+        if args.worlds is not None and args.worlds < 2:
+            print("--net-evaluator2 needs 2+ worlds", file=sys.stderr)
+            return 2
+        if not (math.isfinite(args.net_evaluator2_scale) and args.net_evaluator2_scale > 0):
+            print("--net-evaluator2-scale must be finite and > 0", file=sys.stderr)
+            return 2
+    for ev in (args.evaluator, args.opponent_evaluator, args.net_evaluator2):
+        if ev is not None and not ev.is_file():
+            print(f"no such evaluator: {ev}", file=sys.stderr)
+            return 2
+    if not (math.isfinite(args.opponent_leaf_scale) and args.opponent_leaf_scale > 0):
+        print(f"--opponent-leaf-scale must be finite and > 0, got {args.opponent_leaf_scale}",
+              file=sys.stderr)
+        return 2
+    if args.teams != "random":
+        try:
+            teams_module.battle_format_for(args.teams, args.format)
+            if args.games % 2:
+                raise ValueError(f"--teams {args.teams} plays pairs of games; --games must be even")
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+    if not _preflight(args):
         return 2
     start = time.perf_counter()
     try:
@@ -105,23 +395,52 @@ def main(argv=None) -> int:
         print(f"duel error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
     elapsed = time.perf_counter() - start
-    n = sum(net.n_finished_battles for net, _ in pairs)
-    wins = sum(net.n_won_battles for net, _ in pairs)
+    n = sum(net.n_finished_battles for net, _, _ in pairs)
+    wins = sum(net.n_won_battles for net, _, _ in pairs)
     lo, hi = bench.wilson_interval(wins, n)
     print("\n=== duel: search-net vs search ===")
-    print(f"evaluator: {args.evaluator}")
+    if args.evaluator:
+        print(f"evaluator: {args.evaluator} (leaf scale {args.leaf_scale:g}, "
+              f"{'both sides' if args.stock_uses_evaluator else 'net side only'})")
+    else:
+        print("evaluator: none (stock search on both sides)")
+    if args.net_evaluator2:
+        print(f"ensemble: net side alternates worlds between evaluator (even) and "
+              f"{args.net_evaluator2} (odd, leaf scale {args.net_evaluator2_scale:g})")
+    if args.opponent_evaluator:
+        print(f"opponent evaluator: {args.opponent_evaluator} "
+              f"(leaf scale {args.opponent_leaf_scale:g})")
+    print(f"selection: net={args.net_selection} stock={args.stock_selection} "
+          f"(gamma {args.selection_gamma:g} for exp3/rm); "
+          f"mode: net={args.net_mode} stock={args.stock_mode}; "
+          f"tendency: net={args.net_tendency} stock={args.stock_tendency}; "
+          f"belief: net={args.net_belief} stock={args.stock_belief}; "
+          f"endgame: net={args.net_endgame} stock={args.stock_endgame}")
+    for side in ("net", "stock"):
+        q = _quality(args, side)
+        if q["escalate"] or q["prune_noop"] or q["tera_margin"]:
+            print(f"589.47 {side}: {q}")
     print(f"compute (both sides): {args.search_time_ms} ms/world, parallelism {args.parallelism}, "
           f"worlds {args.worlds or '2 x parallelism (4x early)'}, threads {args.threads}; "
           f"{len(pairs)} parallel pairs, pool of {args.workers}")
     print(f"search-net wins: {wins}/{n} ({wins / max(n, 1):.1%}); Wilson 95% CI: [{lo:.1%}, {hi:.1%}]")
+    if args.teams != "random":
+        rows = [r for p in pairs for r in p[2]]
+        print(f"teams: {args.teams} (seed {args.team_seed}), format "
+              f"{teams_module.battle_format_for(args.teams, args.format)}")
+        print("search-net " + teams_module.format_paired(
+            teams_module.paired_summary(teams_module.pair_scores(rows))))
     for label, idx in (("search-net", 0), ("search    ", 1)):
         iters = sum(p[idx].stats.iterations for p in pairs)
         ms = sum(p[idx].stats.search_ms for p in pairs)
         fb = sum(p[idx].stats.fallbacks for p in pairs)
+        st = [p[idx].stats for p in pairs]
+        print(f"{label}: decisions={sum(x.searched for x in st)} escalations={sum(x.escalations for x in st)} "
+              f"noop_pruned={sum(x.noop_pruned for x in st)} tera_folded={sum(x.tera_folded for x in st)} "
+              f"endgame={sum(x.endgame_decisions for x in st)} "
+              f"endgame_fallbacks={sum(x.endgame_fallbacks for x in st)}")
         werr = sum(p[idx].stats.world_errors for p in pairs)
-        print(f"{label}: {iters / (ms / 1000) if ms else 0:,.0f} iterations per second of "
-              f"per-world budget ({iters:,} iterations over {ms / 1000:.0f} s); "
-              f"fallbacks={fb} world_errors={werr}")
+        print(compute.iterations_line(label, iters, ms, fallbacks=fb, world_errors=werr))
     print(f"wall time: {elapsed:.0f} s")
     return 0 if n else 1
 

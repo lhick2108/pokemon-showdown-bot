@@ -14,6 +14,54 @@ const DEFAULT_EVS: (u8, u8, u8, u8, u8, u8) = (85, 85, 85, 85, 85, 85);
 #[cfg(feature = "champions")]
 const DEFAULT_EVS: (u8, u8, u8, u8, u8, u8) = (11, 11, 11, 11, 11, 11);
 
+/// Showdown's `nosleeptalk` flag plus the two-turn `charge` moves (Gen 9 data).
+pub fn can_be_called_by_sleep_talk(id: Choices) -> bool {
+    !matches!(
+        id,
+        Choices::BEAKBLAST
+            | Choices::BELCH
+            | Choices::BOUNCE
+            | Choices::CELEBRATE
+            | Choices::COPYCAT
+            | Choices::DIG
+            | Choices::DIVE
+            | Choices::DYNAMAXCANNON
+            | Choices::ELECTROSHOT
+            | Choices::FLY
+            | Choices::FOCUSPUNCH
+            | Choices::FREEZESHOCK
+            | Choices::ICEBURN
+            | Choices::METEORBEAM
+            | Choices::METRONOME
+            | Choices::MIMIC
+            | Choices::PHANTOMFORCE
+            | Choices::SHADOWFORCE
+            | Choices::SKETCH
+            | Choices::SKYATTACK
+            | Choices::SLEEPTALK
+            | Choices::SOLARBEAM
+            | Choices::SOLARBLADE
+            | Choices::STRUGGLE
+            | Choices::UPROAR
+    )
+}
+
+/// Showdown's `failencore` flag: Encore fails against a target whose last move is one of these.
+pub fn encore_fails_against_last_move(id: Choices) -> bool {
+    matches!(
+        id,
+        Choices::COPYCAT
+            | Choices::DYNAMAXCANNON
+            | Choices::ENCORE
+            | Choices::METRONOME
+            | Choices::MIMIC
+            | Choices::SKETCH
+            | Choices::SLEEPTALK
+            | Choices::STRUGGLE
+            | Choices::TRANSFORM
+    )
+}
+
 #[derive(Debug, PartialEq, Copy, Clone)]
 pub enum SideReference {
     SideOne,
@@ -542,11 +590,20 @@ pub struct Move {
     pub id: Choices,
     pub disabled: bool,
     pub pp: i8,
+    /// Maximum PP (sdb.22). 0 = unknown: the engine then tracks PP only below 10 and does not
+    /// cap restores (hand-built states and records serialized before sdb.22).
+    pub max_pp: i8,
     pub choice: Choice,
 }
 impl Move {
+    /// `id;disabled;pp`, plus `;max_pp` only when it is known (> 0), so unknown-max moves
+    /// serialize exactly as before sdb.22 and old strings still parse.
     pub fn serialize(&self) -> String {
-        format!("{:?};{};{}", self.id, self.disabled, self.pp)
+        if self.max_pp > 0 {
+            format!("{:?};{};{};{}", self.id, self.disabled, self.pp, self.max_pp)
+        } else {
+            format!("{:?};{};{}", self.id, self.disabled, self.pp)
+        }
     }
     pub fn deserialize(serialized: &str) -> Move {
         let split: Vec<&str> = serialized.split(";").collect();
@@ -554,6 +611,7 @@ impl Move {
             id: Choices::from_str(split[0]).unwrap(),
             disabled: split[1].parse::<bool>().unwrap(),
             pp: split[2].parse::<i8>().unwrap(),
+            max_pp: split.get(3).map_or(0, |v| v.parse::<i8>().unwrap()),
             choice: MOVES
                 .get(&Choices::from_str(split[0]).unwrap())
                 .unwrap()
@@ -567,6 +625,7 @@ impl Default for Move {
             id: Choices::NONE,
             disabled: false,
             pp: 32,
+            max_pp: 0,
             choice: Choice::default(),
         }
     }
@@ -791,6 +850,14 @@ pub struct VolatileStatusDurations {
     pub slowstart: i8,
     pub taunt: i8,
     pub yawn: i8,
+    /// Heal Block turns remaining (5; Psychic Noise 2; Persistent 7). 0 with the volatile set
+    /// (states serialized before sdb.22) is read as a fresh 5-turn Heal Block.
+    pub healblock: i8,
+    /// Throat Chop turns remaining (2). 0 with the volatile set is read as a fresh 2.
+    pub throatchop: i8,
+    /// Disable (sdb.28, Cursed Body): `turns_remaining * 4 + move_slot` (slot 0-3 of the
+    /// disabled move), 0 when not disabled. Serialized after `throatchop` only when non-zero.
+    pub disable: i8,
 }
 
 impl Default for VolatileStatusDurations {
@@ -802,6 +869,9 @@ impl Default for VolatileStatusDurations {
             slowstart: 0,
             taunt: 0,
             yawn: 0,
+            healblock: 0,
+            throatchop: 0,
+            disable: 0,
         }
     }
 }
@@ -815,6 +885,9 @@ impl VolatileStatusDurations {
             ("slowstart", self.slowstart),
             ("taunt", self.taunt),
             ("yawn", self.yawn),
+            ("healblock", self.healblock),
+            ("throatchop", self.throatchop),
+            ("disable", self.disable),
         ];
 
         let mut output = String::new();
@@ -829,15 +902,31 @@ impl VolatileStatusDurations {
         output
     }
 
+    /// `confusion;encore;lockedmove;slowstart;taunt;yawn`, plus `;healblock;throatchop` only
+    /// when either is non-zero (sdb.22). Old 6-field strings still parse (new fields = 0).
     pub fn serialize(&self) -> String {
-        format!(
+        let base = format!(
             "{};{};{};{};{};{}",
             self.confusion, self.encore, self.lockedmove, self.slowstart, self.taunt, self.yawn
-        )
+        );
+        if self.disable != 0 {
+            format!(
+                "{};{};{};{}",
+                base, self.healblock, self.throatchop, self.disable
+            )
+        } else if self.healblock != 0 || self.throatchop != 0 {
+            format!("{};{};{}", base, self.healblock, self.throatchop)
+        } else {
+            base
+        }
     }
     pub fn deserialize(serialized: &str) -> VolatileStatusDurations {
         let split: Vec<&str> = serialized.split(";").collect();
+        let extra = |i: usize| split.get(i).map_or(0, |v| v.parse::<i8>().unwrap());
         VolatileStatusDurations {
+            healblock: extra(6),
+            throatchop: extra(7),
+            disable: extra(8),
             confusion: split[0].parse::<i8>().unwrap(),
             encore: split[1].parse::<i8>().unwrap(),
             lockedmove: split[2].parse::<i8>().unwrap(),
@@ -874,6 +963,9 @@ pub struct Pokemon {
     pub terastallized: bool,
     pub tera_type: PokemonType,
     pub moves: PokemonMoves,
+    /// Showdown's `pokemon.lastItem`, only tracked for Harvest: the berry it ate last (NONE =
+    /// nothing to regrow). Serialized as an optional trailing field (sdb.28).
+    pub last_item: Items,
 }
 
 impl Default for Pokemon {
@@ -902,6 +994,7 @@ impl Default for Pokemon {
             mega_evolved: false,
             terastallized: false,
             tera_type: PokemonType::NORMAL,
+            last_item: Items::NONE,
             moves: PokemonMoves {
                 m0: Default::default(),
                 m1: Default::default(),
@@ -917,10 +1010,14 @@ impl Pokemon {
         self.moves[&move_index].choice = MOVES.get(&new_move_name).unwrap().to_owned();
         self.moves[&move_index].id = new_move_name;
     }
+    /// The moves Sleep Talk can call: every known move except those Showdown flags
+    /// `nosleeptalk` or `charge` (Sleep Talk itself, Metronome, Mimic, Copycat, Focus
+    /// Punch, Uproar, Fly, Dig, Solar Beam, ...). Rest stays in (it fails while asleep).
     pub fn get_sleep_talk_choices(&self) -> Vec<Choice> {
         let mut vec = Vec::with_capacity(4);
         for p in self.moves.into_iter() {
-            if p.id != Choices::SLEEPTALK && p.id != Choices::NONE {
+            if p.id != Choices::NONE && !p.choice.flags.charge && can_be_called_by_sleep_talk(p.id)
+            {
                 vec.push(p.choice.clone());
             }
         }
@@ -963,7 +1060,7 @@ impl Pokemon {
             "{};{};{};{};{};{}",
             self.evs.0, self.evs.1, self.evs.2, self.evs.3, self.evs.4, self.evs.5
         );
-        format!(
+        let base = format!(
             "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             self.id,
             self.level,
@@ -994,7 +1091,14 @@ impl Pokemon {
             self.mega_evolved,
             self.terastallized,
             self.tera_type.to_string(),
-        )
+        );
+        // optional trailing fields (sdb.28): only written when set, so older readers and
+        // states without them are unaffected
+        if self.last_item != Items::NONE {
+            format!("{},{}", base, self.last_item.to_string())
+        } else {
+            base
+        }
     }
 
     pub fn deserialize(serialized: &str) -> Pokemon {
@@ -1048,6 +1152,10 @@ impl Pokemon {
             mega_evolved: split[26].parse::<bool>().unwrap(),
             terastallized: split[27].parse::<bool>().unwrap(),
             tera_type: PokemonType::from_str(split[28]).unwrap(),
+            last_item: match split.get(29) {
+                Some(v) if !v.is_empty() => Items::from_str(v).unwrap(),
+                _ => Items::NONE,
+            },
         }
     }
 }
@@ -1192,7 +1300,7 @@ impl Side {
 
         let mut vs_bitset = VolatileStatusBitset::default();
         if split[8] != "" {
-            for item in split[8].split(":") {
+            for item in split[8].split(":").filter(|i| !i.is_empty()) {
                 vs_bitset.insert(PokemonVolatileStatus::from_str(item).unwrap());
             }
         }
@@ -1632,6 +1740,15 @@ impl State {
             PokemonVolatileStatus::YAWN => {
                 side.volatile_status_durations.yawn += amount;
             }
+            PokemonVolatileStatus::HEALBLOCK => {
+                side.volatile_status_durations.healblock += amount;
+            }
+            PokemonVolatileStatus::THROATCHOP => {
+                side.volatile_status_durations.throatchop += amount;
+            }
+            PokemonVolatileStatus::DISABLE => {
+                side.volatile_status_durations.disable += amount;
+            }
             _ => panic!(
                 "Invalid volatile status for increment_volatile_status_duration: {:?}",
                 volatile_status
@@ -1878,6 +1995,9 @@ impl State {
             Instruction::ChangeSpeed(instruction) => {
                 self.get_side(&instruction.side_ref).get_active().speed += instruction.amount;
             }
+            Instruction::ChangeMaxHp(instruction) => {
+                self.get_side(&instruction.side_ref).get_active().maxhp += instruction.amount;
+            }
             Instruction::EnableMove(instruction) => {
                 self.enable_move(&instruction.side_ref, &instruction.move_index)
             }
@@ -1978,8 +2098,23 @@ impl State {
                 let active = self.get_side(&instruction.side_ref).get_active();
                 active.id = PokemonName::from(active.id as i16 + instruction.name_change);
             }
+            Instruction::ChangeMove(instruction) => {
+                let mv = &mut self.get_side(&instruction.side_ref).get_active().moves
+                    [&instruction.move_index];
+                mv.id = Choices::from((mv.id as i16 + instruction.id_change) as u16);
+                mv.choice = MOVES.get(&mv.id).unwrap().to_owned();
+            }
+            Instruction::ChangeWeight(instruction) => {
+                let active = self.get_side(&instruction.side_ref).get_active();
+                active.weight_kg =
+                    ((active.weight_kg * 10.0).round() as i32 + instruction.amount_hg as i32) as f32
+                        / 10.0;
+            }
             Instruction::TeamPreviewFaintIndex(side_ref, pkmn_index) => {
                 self.get_side(&side_ref).pokemon[*pkmn_index].hp = 0;
+            }
+            Instruction::SetLastItem(instruction) => {
+                self.get_side(&instruction.side_ref).get_active().last_item = instruction.new_item;
             }
             Instruction::ToggleTeamPreview => {
                 self.team_preview = !self.team_preview;
@@ -2088,6 +2223,9 @@ impl State {
             Instruction::ChangeSpeed(instruction) => {
                 self.get_side(&instruction.side_ref).get_active().speed -= instruction.amount;
             }
+            Instruction::ChangeMaxHp(instruction) => {
+                self.get_side(&instruction.side_ref).get_active().maxhp -= instruction.amount;
+            }
             Instruction::ChangeWish(instruction) => {
                 self.unset_wish(&instruction.side_ref, instruction.wish_amount_change)
             }
@@ -2180,9 +2318,25 @@ impl State {
                 let active = self.get_side(&instruction.side_ref).get_active();
                 active.id = PokemonName::from(active.id as i16 - instruction.name_change);
             }
+            Instruction::ChangeMove(instruction) => {
+                let mv = &mut self.get_side(&instruction.side_ref).get_active().moves
+                    [&instruction.move_index];
+                mv.id = Choices::from((mv.id as i16 - instruction.id_change) as u16);
+                mv.choice = MOVES.get(&mv.id).unwrap().to_owned();
+            }
+            Instruction::ChangeWeight(instruction) => {
+                let active = self.get_side(&instruction.side_ref).get_active();
+                active.weight_kg =
+                    ((active.weight_kg * 10.0).round() as i32 - instruction.amount_hg as i32) as f32
+                        / 10.0;
+            }
             Instruction::TeamPreviewFaintIndex(side_ref, pkmn_index) => {
                 let pkmn = &mut self.get_side(side_ref).pokemon[*pkmn_index];
                 pkmn.hp = pkmn.maxhp;
+            }
+            Instruction::SetLastItem(instruction) => {
+                self.get_side(&instruction.side_ref).get_active().last_item =
+                    instruction.previous_item;
             }
             Instruction::ToggleTeamPreview => {
                 self.team_preview = !self.team_preview;

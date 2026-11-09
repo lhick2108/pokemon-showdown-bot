@@ -8,7 +8,8 @@ use crate::define_enum_with_from_str;
 use crate::engine::generate_instructions::add_remove_status_instructions;
 use crate::instruction::{
     ChangeItemInstruction, ChangeStatusInstruction, DamageInstruction, DecrementPPInstruction,
-    DisableMoveInstruction, HealInstruction, Instruction, StateInstructions,
+    DisableMoveInstruction, EnableMoveInstruction, HealInstruction, Instruction,
+    SetLastItemInstruction, StateInstructions,
 };
 use crate::pokemon::PokemonName;
 use crate::state::{
@@ -188,6 +189,7 @@ define_enum_with_from_str! {
         LIGHTCLAY,
         LEPPABERRY,
         SCOPELENS,
+        SAFETYGOGGLES,
 
         // mega stones
         VENUSAURITE,
@@ -304,6 +306,89 @@ pub fn get_choice_move_disable_instructions(
     moves_to_disable
 }
 
+/// Unnerve / As One: while the holder is out, its foes cannot eat berries (`onFoeTryEatItem`).
+pub fn unnerves(foe: &Pokemon) -> bool {
+    foe.hp > 0
+        && matches!(
+            foe.ability,
+            Abilities::UNNERVE | Abilities::ASONEGLASTRIER | Abilities::ASONESPECTRIER
+        )
+}
+
+pub fn is_berry(item: Items) -> bool {
+    item != Items::NONE && format!("{:?}", item).ends_with("BERRY")
+}
+
+/// The item as far as eating it goes: NONE for a berry its holder cannot eat (foe has Unnerve).
+fn edible(item: Items, foe: &Pokemon) -> Items {
+    if unnerves(foe) && is_berry(item) {
+        Items::NONE
+    } else {
+        item
+    }
+}
+
+pub fn is_choice_item(item: Items) -> bool {
+    matches!(
+        item,
+        Items::CHOICEBAND | Items::CHOICESPECS | Items::CHOICESCARF
+    )
+}
+
+/// Called after the active Pokemon of `side` lost (or swapped) its item `old_item` to another
+/// Pokemon's move or ability (Knock Off, Thief, Covet, Trick, Corrosive Gas, Magician, ...).
+///
+/// Showdown's `choicelock` volatile ends as soon as the holder no longer holds a Choice item
+/// (`onBeforeMove` / `onDisableMove`), so the moves the lock disabled are re-enabled. Swapping
+/// one Choice item for another keeps the lock.
+pub fn on_item_taken(
+    side: &mut Side,
+    side_ref: &SideReference,
+    old_item: Items,
+    instructions: &mut Vec<Instruction>,
+) {
+    let active = side.get_active();
+    // Gorilla Tactics locks through the same disabled flags and is not released
+    if is_choice_item(old_item)
+        && !is_choice_item(active.item)
+        && active.ability != Abilities::GORILLATACTICS
+    {
+        let mut iter = active.moves.into_iter();
+        let mut to_enable = vec![];
+        while let Some(m) = iter.next() {
+            if m.disabled {
+                to_enable.push(iter.pokemon_move_index);
+            }
+        }
+        for move_index in to_enable {
+            active.moves[&move_index].disabled = false;
+            instructions.push(Instruction::EnableMove(EnableMoveInstruction {
+                side_ref: *side_ref,
+                move_index,
+            }));
+        }
+    }
+}
+
+/// Harvest: remember the berry the active Pokemon just ate (Showdown's `pokemon.lastItem`, set
+/// by `eatItem`, not by Knock Off / Thief / Trick). Only tracked for Harvest holders so other
+/// Pokemon emit no extra instructions.
+pub fn record_eaten_berry(
+    pkmn: &mut Pokemon,
+    side_ref: &SideReference,
+    berry: Items,
+    instructions: &mut Vec<Instruction>,
+) {
+    if pkmn.ability == Abilities::HARVEST && pkmn.last_item != berry {
+        instructions.push(Instruction::SetLastItem(SetLastItemInstruction {
+            side_ref: *side_ref,
+            new_item: berry,
+            previous_item: pkmn.last_item,
+        }));
+        pkmn.last_item = berry;
+    }
+}
+
 fn damage_reduction_berry(
     defending_pkmn: &mut Pokemon,
     attacking_side_ref: &SideReference,
@@ -323,6 +408,12 @@ fn damage_reduction_berry(
                 new_item: Items::NONE,
             }));
         defending_pkmn.item = Items::NONE;
+        record_eaten_berry(
+            defending_pkmn,
+            &attacking_side_ref.get_other_side(),
+            berry,
+            &mut instructions.instruction_list,
+        );
         choice.base_power /= 2.0;
     }
 }
@@ -389,6 +480,12 @@ fn lum_berry(
             new_item: Items::NONE,
         }));
     active_pkmn.item = Items::NONE;
+    record_eaten_berry(
+        active_pkmn,
+        side_ref,
+        Items::LUMBERRY,
+        &mut instructions.instruction_list,
+    );
 }
 
 fn sitrus_berry(
@@ -413,12 +510,18 @@ fn sitrus_berry(
             new_item: Items::NONE,
         }));
     active_pkmn.item = Items::NONE;
+    record_eaten_berry(
+        active_pkmn,
+        side_ref,
+        Items::SITRUSBERRY,
+        &mut instructions.instruction_list,
+    );
 }
 
 // Leppa Berry: restores 10 PP to the first move slot at 0 PP, then is consumed.
-// Showdown's onEat also falls back to the first slot below max PP, but the engine
-// only tracks PP once it is below 10 and has no max PP, so only a move at exactly 0 PP
-// (the item's actual trigger) is handled. The restored PP is not capped at the max.
+// Showdown's onEat also falls back to the first slot below max PP; only a move at exactly 0 PP
+// (the item's actual trigger) is handled. The restored PP is capped at the move's max PP when
+// it is known (sdb.22: `Move.max_pp`).
 fn leppa_berry(
     side_ref: &SideReference,
     attacking_side: &mut Side,
@@ -434,14 +537,21 @@ fn leppa_berry(
         }
     }
     if let Some(move_index) = empty_slot {
+        let mv = &mut active_pkmn.moves[&move_index];
+        // restores 10 PP, never above the move's max PP (when it is known)
+        let restored = if mv.max_pp > 0 {
+            cmp::min(10, mv.max_pp - mv.pp)
+        } else {
+            10
+        };
         instructions
             .instruction_list
             .push(Instruction::DecrementPP(DecrementPPInstruction {
                 side_ref: *side_ref,
                 move_index,
-                amount: -10,
+                amount: -restored,
             }));
-        active_pkmn.moves[&move_index].pp += 10;
+        mv.pp += restored;
         instructions
             .instruction_list
             .push(Instruction::ChangeItem(ChangeItemInstruction {
@@ -450,6 +560,12 @@ fn leppa_berry(
                 new_item: Items::NONE,
             }));
         active_pkmn.item = Items::NONE;
+        record_eaten_berry(
+            active_pkmn,
+            side_ref,
+            Items::LEPPABERRY,
+            &mut instructions.instruction_list,
+        );
     }
 }
 
@@ -472,6 +588,7 @@ fn status_cure_berry(
             new_item: Items::NONE,
         }));
     active_pkmn.item = Items::NONE;
+    record_eaten_berry(active_pkmn, side_ref, berry, &mut instructions.instruction_list);
     add_remove_status_instructions(instructions, active_index, *side_ref, attacking_side);
 }
 
@@ -497,7 +614,9 @@ fn boost_berry(
             current_item: attacker.item,
             new_item: Items::NONE,
         }));
+    let berry = attacker.item;
     attacker.item = Items::NONE;
+    record_eaten_berry(attacker, side_ref, berry, &mut instructions.instruction_list);
 }
 
 pub fn item_before_move(
@@ -509,7 +628,7 @@ pub fn item_before_move(
     let (attacking_side, defending_side) = state.get_both_sides(side_ref);
     let active_pkmn = attacking_side.get_active();
     let defending_pkmn = defending_side.get_active();
-    match defending_pkmn.item {
+    match edible(defending_pkmn.item, active_pkmn) {
         Items::CHOPLEBERRY => damage_reduction_berry(
             defending_pkmn,
             side_ref,
@@ -545,6 +664,12 @@ pub fn item_before_move(
                     },
                 ));
                 defending_pkmn.item = Items::NONE;
+                record_eaten_berry(
+                    defending_pkmn,
+                    &side_ref.get_other_side(),
+                    Items::CHILANBERRY,
+                    &mut instructions.instruction_list,
+                );
                 choice.base_power /= 2.0;
             }
         }
@@ -662,7 +787,7 @@ pub fn item_before_move(
         ),
         _ => {}
     }
-    match active_pkmn.item {
+    match edible(active_pkmn.item, defending_pkmn) {
         Items::NORMALGEM => power_up_gem(
             side_ref,
             active_pkmn,
@@ -942,14 +1067,66 @@ pub fn item_on_switch_in(
     }
 }
 
+/// Leftovers / Black Sludge residual (Showdown `onResidualOrder: 5, onResidualSubOrder: 4`).
+/// This runs before Leech Seed (8), poison / toxic (9) and burn (10) damage, so the heal comes
+/// first. Heal Block stops the heal; Black Sludge's damage on non-Poison mons is not a heal
+/// (Magic Guard prevents it, and it is clamped to the mon's remaining HP).
+pub fn item_residual_heal(
+    state: &mut State,
+    side_ref: &SideReference,
+    instructions: &mut StateInstructions,
+) {
+    let side = state.get_side(side_ref);
+    let blocked = side
+        .volatile_statuses
+        .contains(&super::state::PokemonVolatileStatus::HEALBLOCK);
+    let active_pkmn = side.get_active();
+    if active_pkmn.hp <= 0 {
+        return;
+    }
+    let heals = match active_pkmn.item {
+        Items::LEFTOVERS => true,
+        Items::BLACKSLUDGE => active_pkmn.has_type(&PokemonType::POISON),
+        _ => return,
+    };
+    if heals {
+        if blocked || active_pkmn.hp >= active_pkmn.maxhp {
+            return;
+        }
+        let heal_amount = cmp::min(active_pkmn.maxhp / 16, active_pkmn.maxhp - active_pkmn.hp);
+        if heal_amount > 0 {
+            instructions.instruction_list.push(Instruction::Heal(HealInstruction {
+                side_ref: *side_ref,
+                heal_amount,
+            }));
+            active_pkmn.hp += heal_amount;
+        }
+    } else if active_pkmn.ability != Abilities::MAGICGUARD {
+        let damage_amount = cmp::min(active_pkmn.maxhp / 16, active_pkmn.hp);
+        if damage_amount > 0 {
+            instructions
+                .instruction_list
+                .push(Instruction::Damage(DamageInstruction {
+                    side_ref: *side_ref,
+                    damage_amount,
+                }));
+            active_pkmn.hp -= damage_amount;
+        }
+    }
+}
+
 pub fn item_end_of_turn(
     state: &mut State,
     side_ref: &SideReference,
     instructions: &mut StateInstructions,
 ) {
-    let attacking_side = state.get_side(side_ref);
+    let (attacking_side, defending_side) = state.get_both_sides(side_ref);
+    let item = edible(
+        attacking_side.get_active_immutable().item,
+        defending_side.get_active_immutable(),
+    );
     let active_pkmn = attacking_side.get_active();
-    match active_pkmn.item {
+    match item {
         Items::LUMBERRY if active_pkmn.status != PokemonStatus::NONE => {
             lum_berry(side_ref, attacking_side, instructions)
         }
@@ -975,29 +1152,6 @@ pub fn item_end_of_turn(
             status_cure_berry(Items::RAWSTBERRY, side_ref, attacking_side, instructions)
         }
         Items::LEPPABERRY => leppa_berry(side_ref, attacking_side, instructions),
-        Items::BLACKSLUDGE => {
-            if active_pkmn.has_type(&PokemonType::POISON) {
-                if active_pkmn.hp < active_pkmn.maxhp {
-                    let heal_amount =
-                        cmp::min(active_pkmn.maxhp / 16, active_pkmn.maxhp - active_pkmn.hp);
-                    let ins = Instruction::Heal(HealInstruction {
-                        side_ref: side_ref.clone(),
-                        heal_amount: heal_amount,
-                    });
-                    active_pkmn.hp += heal_amount;
-                    instructions.instruction_list.push(ins);
-                }
-            } else {
-                let damage_amount =
-                    cmp::min(active_pkmn.maxhp / 16, active_pkmn.maxhp - active_pkmn.hp);
-                let ins = Instruction::Damage(DamageInstruction {
-                    side_ref: side_ref.clone(),
-                    damage_amount: damage_amount,
-                });
-                active_pkmn.hp -= damage_amount;
-                instructions.instruction_list.push(ins);
-            }
-        }
         Items::FLAMEORB => {
             if !immune_to_status(state, &MoveTarget::User, side_ref, &PokemonStatus::BURN) {
                 let side = state.get_side(side_ref);
@@ -1008,18 +1162,6 @@ pub fn item_end_of_turn(
                     old_status: PokemonStatus::NONE,
                 });
                 side.get_active().status = PokemonStatus::BURN;
-                instructions.instruction_list.push(ins);
-            }
-        }
-        Items::LEFTOVERS => {
-            let attacker = state.get_side(side_ref).get_active();
-            if attacker.hp < attacker.maxhp {
-                let heal_amount = cmp::min(attacker.maxhp / 16, attacker.maxhp - attacker.hp);
-                let ins = Instruction::Heal(HealInstruction {
-                    side_ref: side_ref.clone(),
-                    heal_amount: heal_amount,
-                });
-                attacker.hp += heal_amount;
                 instructions.instruction_list.push(ins);
             }
         }
@@ -1086,6 +1228,16 @@ pub fn item_modify_attack_against(
         Items::ASSAULTVEST => {
             if attacking_choice.targets_special_defense() {
                 attacking_choice.base_power /= 1.5;
+            }
+        }
+        // sdb (589.39): Safety Goggles make the holder immune to powder moves (like Overcoat).
+        Items::SAFETYGOGGLES => {
+            if attacking_choice.flags.powder
+                && attacking_choice.move_id != Choices::LEECHSEED
+                && attacking_choice.target == MoveTarget::Opponent
+            {
+                attacking_choice.remove_all_effects();
+                attacking_choice.accuracy = 0.0
             }
         }
         Items::METALPOWDER if attacking_side.get_active_immutable().id == PokemonName::DITTO => {
@@ -1250,8 +1402,12 @@ pub fn item_modify_attack_being_used(
                     });
                 }
 
+                // Showdown skips onAfterMoveSecondarySelf (Life Orb recoil) for a move whose
+                // secondaries Sheer Force removed
                 #[cfg(not(feature = "gen4"))]
-                if attacking_side.get_active_immutable().ability != Abilities::MAGICGUARD {
+                if attacking_side.get_active_immutable().ability != Abilities::MAGICGUARD
+                    && !attacking_choice.sheer_force_applied
+                {
                     attacking_choice.add_or_create_secondaries(Secondary {
                         chance: 100.0,
                         effect: Effect::Heal(-0.1),

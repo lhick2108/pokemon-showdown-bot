@@ -17,14 +17,22 @@ pub mod engine;
 
 pub mod choices;
 pub mod features;
+pub mod features_v2;
+pub mod features_v3;
+pub mod features_v4;
 pub mod instruction;
 pub mod io;
 pub mod learned;
 pub mod mcts;
 pub mod mcts_threaded;
+pub mod netsearch;
+pub mod selection;
 pub mod pokemon;
+pub mod prior;
 pub mod search;
+pub mod selfplay;
 pub mod state;
+pub mod tokens;
 
 #[macro_export]
 macro_rules! assert_unique_feature {
@@ -66,6 +74,13 @@ macro_rules! define_enum_with_from_str {
                     _ => Ok($name::$default_variant),
                 }
             }
+        }
+
+        impl $name {
+            /// Variant names in declaration order (index = discriminant for the dense enums).
+            pub const NAMES: &'static [&'static str] = &[$(stringify!($variant)),+];
+            /// Number of variants.
+            pub const COUNT: usize = Self::NAMES.len();
         }
 
         impl std::fmt::Display for $name {
@@ -116,6 +131,13 @@ macro_rules! define_enum_with_from_str {
                     _ => panic!("Invalid {}: {}", stringify!($name), input.to_uppercase().as_str()),
                 }
             }
+        }
+
+        impl $name {
+            /// Variant names in declaration order (index = discriminant for the dense enums).
+            pub const NAMES: &'static [&'static str] = &[$(stringify!($variant)),+];
+            /// Number of variants.
+            pub const COUNT: usize = Self::NAMES.len();
         }
 
         impl std::fmt::Display for $name {

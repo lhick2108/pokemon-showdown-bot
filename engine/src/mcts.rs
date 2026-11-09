@@ -2,6 +2,8 @@ use crate::engine::generate_instructions::generate_instructions_from_move_pair;
 use crate::engine::state::MoveChoice;
 use crate::instruction::StateInstructions;
 use crate::learned::{Evaluator, LeafEval};
+use crate::prior::{fill_priors, PriorConfig};
+use crate::selection::{SelectionConfig, NodeStats, SelectionMode, SideStats};
 use crate::state::State;
 use rand::prelude::*;
 use rand::rng;
@@ -13,6 +15,9 @@ pub struct Node {
     pub root: bool,
     pub parent: *mut Node,
     pub times_visited: u32,
+    // sum of rollout scores (side one's view, [0, 1]) over every visit of this node;
+    // for a chance child of the root this is the joint-action cell's score
+    pub total_score: f32,
 
     // represents the instructions & s1/s2 moves that led to this node from the parent
     pub instructions: StateInstructions,
@@ -23,6 +28,9 @@ pub struct Node {
     // de-coupled for s1 and s2
     pub s1_options: Option<Vec<MoveNode>>,
     pub s2_options: Option<Vec<MoveNode>>,
+
+    // Exp3 / regret-matching state; always None under ucb1
+    pub stats: Option<Box<NodeStats>>,
 }
 
 impl Node {
@@ -32,10 +40,12 @@ impl Node {
             parent: std::ptr::null_mut(),
             instructions: StateInstructions::default(),
             times_visited: 0,
+            total_score: 0.0,
             s1_choice: 0,
             s2_choice: 0,
             s1_options: None,
             s2_options: None,
+            stats: None,
         }
     }
     unsafe fn populate(&mut self, s1_options: Vec<MoveChoice>, s2_options: Vec<MoveChoice>) {
@@ -45,6 +55,7 @@ impl Node {
                 move_choice: x.clone(),
                 total_score: 0.0,
                 visits: 0,
+                prior: -1.0,
             })
             .collect();
         let s2_options_vec: Vec<MoveNode> = s2_options
@@ -53,6 +64,7 @@ impl Node {
                 move_choice: x.clone(),
                 total_score: 0.0,
                 visits: 0,
+                prior: -1.0,
             })
             .collect();
 
@@ -73,28 +85,99 @@ impl Node {
         choice
     }
 
+    /// PUCT for one side: `Q + c * P * sqrt(N) / (1 + n)` with `Q` the option's mean score
+    /// (side's view) and, for an unvisited option, the node's own mean minus
+    /// `fpu_reduction`. `is_side_one` selects which view the node's mean is read from.
+    /// Falls back to UCB1 for a side without priors (`prior < 0`).
+    pub fn maximize_puct_for_side(&self, side_map: &[MoveNode], pc: &PriorConfig, is_side_one: bool) -> usize {
+        if side_map[0].prior < 0.0 {
+            return self.maximize_ucb_for_side(side_map);
+        }
+        let n = self.times_visited as f32;
+        let sqrt_n = n.max(1.0).sqrt();
+        let mean = if self.times_visited > 0 {
+            let m = self.total_score / n;
+            if is_side_one { m } else { 1.0 - m }
+        } else {
+            0.5
+        };
+        let fpu = mean - pc.fpu_reduction;
+        let mut choice = 0;
+        let mut best = f32::MIN;
+        for (index, node) in side_map.iter().enumerate() {
+            let q = if node.visits == 0 { fpu } else { node.total_score / node.visits as f32 };
+            let score = q + pc.c_puct * node.prior * sqrt_n / (1.0 + node.visits as f32);
+            if score > best {
+                best = score;
+                choice = index;
+            }
+        }
+        choice
+    }
+
+    /// Walks from `self` down the tree to the first node whose chosen joint action has no
+    /// child yet. Iterative: in a stalling position the tree is a chain tens of thousands of
+    /// nodes deep, and recursing there overflowed the stack (bead sdb.8).
     pub unsafe fn selection(
         &mut self,
         state: &mut State,
         children: &mut HashMap<(usize, usize, usize), Box<[Node]>>,
         rng: &mut impl Rng,
+        sel: &SelectionConfig,
+        leaf_eval: &mut LeafEval,
     ) -> (*mut Node, usize, usize) {
-        if self.s1_options.is_none() {
-            let (s1_options, s2_options) = state.get_all_options();
-            self.populate(s1_options, s2_options);
-        }
-
-        let s1_mc_index = self.maximize_ucb_for_side(self.s1_options.as_ref().unwrap());
-        let s2_mc_index = self.maximize_ucb_for_side(self.s2_options.as_ref().unwrap());
-        let key = (self as *mut Node as usize, s1_mc_index, s2_mc_index);
-        match children.get_mut(&key) {
-            Some(child_vector) => {
-                let child_vec_ptr = child_vector as *mut Box<[Node]>;
-                let chosen_child = self.sample_node(child_vec_ptr, rng);
-                state.apply_instructions(&(*chosen_child).instructions.instruction_list);
-                (*chosen_child).selection(state, children, rng)
+        let mut node: *mut Node = self;
+        let mut depth = 0u32;
+        loop {
+            if (*node).s1_options.is_none() {
+                let (s1_options, s2_options) = state.get_all_options();
+                (*node).populate(s1_options, s2_options);
+                if let Some(pc) = sel.prior.as_ref() {
+                    fill_priors(
+                        pc,
+                        state,
+                        (*node).s1_options.as_mut().unwrap(),
+                        (*node).s2_options.as_mut().unwrap(),
+                        false,
+                        &mut leaf_eval.prior_scratch,
+                    );
+                }
             }
-            None => (self as *mut Node, s1_mc_index, s2_mc_index),
+
+            let (s1_mc_index, s2_mc_index) = if let (SelectionMode::Ucb1, Some(pc)) = (sel.mode, sel.prior.as_ref()) {
+                (
+                    (*node).maximize_puct_for_side((*node).s1_options.as_ref().unwrap(), pc, true),
+                    (*node).maximize_puct_for_side((*node).s2_options.as_ref().unwrap(), pc, false),
+                )
+            } else if sel.mode == SelectionMode::Ucb1 {
+                (
+                    (*node).maximize_ucb_for_side((*node).s1_options.as_ref().unwrap()),
+                    (*node).maximize_ucb_for_side((*node).s2_options.as_ref().unwrap()),
+                )
+            } else {
+                if (*node).stats.is_none() {
+                    let k1 = (*node).s1_options.as_ref().unwrap().len();
+                    let k2 = (*node).s2_options.as_ref().unwrap().len();
+                    (*node).stats = Some(Box::new(NodeStats::new(sel, k1, k2)));
+                }
+                let st = (*node).stats.as_mut().unwrap();
+                (st.s1.select(rng), st.s2.select(rng))
+            };
+            let key = (node as usize, s1_mc_index, s2_mc_index);
+            match children.get_mut(&key) {
+                Some(child_vector) => {
+                    let child_vec_ptr = child_vector as *mut Box<[Node]>;
+                    let chosen_child = (*node).sample_node(child_vec_ptr, rng);
+                    state.apply_instructions(&(*chosen_child).instructions.instruction_list);
+                    node = chosen_child;
+                    depth += 1;
+                }
+                None => {
+                    // the node this iteration expands sits `depth + 1` plies below the root
+                    leaf_eval.note_depth(depth + 1);
+                    return (node, s1_mc_index, s2_mc_index);
+                }
+            }
         }
     }
 
@@ -162,31 +245,44 @@ impl Node {
         new_node_ptr
     }
 
+    /// Adds `score` to this node and every ancestor, undoing the instructions on the way up.
+    /// Iterative (see `selection`).
     pub unsafe fn backpropagate(&mut self, score: f32, state: &mut State) {
-        self.times_visited += 1;
-        if self.root {
-            return;
+        let mut node: *mut Node = self;
+        loop {
+            (*node).times_visited += 1;
+            (*node).total_score += score;
+            if (*node).root {
+                return;
+            }
+            let parent = (*node).parent;
+            let s1_choice = (*node).s1_choice as usize;
+            let s2_choice = (*node).s2_choice as usize;
+
+            let parent_s1_movenode = &mut (*parent).s1_options.as_mut().unwrap()[s1_choice];
+            parent_s1_movenode.total_score += score;
+            parent_s1_movenode.visits += 1;
+            if let Some(stats) = (*parent).stats.as_mut() {
+                stats.s1.update(s1_choice, score);
+            }
+
+            let parent_s2_movenode = &mut (*parent).s2_options.as_mut().unwrap()[s2_choice];
+            parent_s2_movenode.total_score += 1.0 - score;
+            parent_s2_movenode.visits += 1;
+            if let Some(stats) = (*parent).stats.as_mut() {
+                stats.s2.update(s2_choice, 1.0 - score);
+            }
+
+            state.reverse_instructions(&(*node).instructions.instruction_list);
+            node = parent;
         }
-
-        let parent_s1_movenode =
-            &mut (*self.parent).s1_options.as_mut().unwrap()[self.s1_choice as usize];
-        parent_s1_movenode.total_score += score;
-        parent_s1_movenode.visits += 1;
-
-        let parent_s2_movenode =
-            &mut (*self.parent).s2_options.as_mut().unwrap()[self.s2_choice as usize];
-        parent_s2_movenode.total_score += 1.0 - score;
-        parent_s2_movenode.visits += 1;
-
-        state.reverse_instructions(&self.instructions.instruction_list);
-        (*self.parent).backpropagate(score, state);
     }
 
     pub fn rollout(&mut self, state: &mut State, root_eval: &f32, leaf_eval: &mut LeafEval) -> f32 {
         let battle_is_over = state.battle_is_over();
         if battle_is_over == 0.0 {
             let eval = leaf_eval.value(state);
-            leaf_eval.score(eval, *root_eval)
+            leaf_eval.score_state(state, eval, *root_eval)
         } else {
             if battle_is_over == -1.0 {
                 0.0
@@ -202,6 +298,8 @@ pub struct MoveNode {
     pub move_choice: MoveChoice,
     pub total_score: f32,
     pub visits: u32,
+    /// policy prior of this option (PUCT); -1 when the side has no prior
+    pub prior: f32,
 }
 
 impl MoveNode {
@@ -224,6 +322,8 @@ pub struct MctsSideResult {
     pub move_choice: MoveChoice,
     pub total_score: f32,
     pub visits: u32,
+    /// share of the root's average strategy (Exp3 / RM); the visit share under ucb1
+    pub avg_strategy: f32,
 }
 
 impl MctsSideResult {
@@ -236,10 +336,61 @@ impl MctsSideResult {
     }
 }
 
+/// One cell of the root's joint-action matrix: option indices into `MctsResult::s1` /
+/// `s2`, the number of iterations that went through the cell (summed over its chance
+/// outcomes) and the mean rollout score there, from side one's view in [0, 1].
+#[derive(Clone, Debug)]
+pub struct JointCell {
+    pub s1: usize,
+    pub s2: usize,
+    pub visits: u32,
+    pub mean: f32,
+}
+
 pub struct MctsResult {
     pub s1: Vec<MctsSideResult>,
     pub s2: Vec<MctsSideResult>,
     pub iteration_count: u32,
+    /// Deepest / average (over iterations) ply of the node an iteration expanded
+    /// (1 = a child of the root). Single-threaded search only; 0 otherwise.
+    pub depth_max: u32,
+    pub depth_mean: f32,
+    /// Root joint matrix (only cells that were expanded); `Some` only when requested.
+    pub joint: Option<Vec<JointCell>>,
+    /// Sampled interior search nodes (bead rnm); `Some` only when requested.
+    pub nodes: Option<Vec<ExportedNode>>,
+    /// Absolute P(side one wins) the evaluator gives the root (always filled).
+    pub root_value: f32,
+    /// Absolute P(side one wins) the search assigns the root: the root's mean score (the same
+    /// number as the sum of `s1` scores over the iterations) converted by
+    /// `LeafEval::absolute_logit`.
+    pub root_search_value: f32,
+}
+
+/// Which interior nodes `perform_mcts_export` returns: up to `max_nodes` nodes (not the root)
+/// with at least `min_visits` visits, sampled without replacement with probability
+/// proportional to their visit count (weighted reservoir sampling), one entry per distinct
+/// position.
+#[derive(Clone, Debug)]
+pub struct ExportConfig {
+    pub max_nodes: usize,
+    pub min_visits: u32,
+}
+
+/// One exported interior node: the position after `depth` joint turns of the search tree.
+#[derive(Clone, Debug)]
+pub struct ExportedNode {
+    /// `State::serialize` of the node's position (side one is still the root's side one)
+    pub state: String,
+    pub visits: u32,
+    /// Search value of the node: the mean backed-up leaf score of its visits, converted to an
+    /// absolute P(side one wins) (the scores are relative to the root evaluation; see
+    /// `LeafEval::absolute_logit`).
+    pub value: f32,
+    /// The evaluator's own absolute P(side one wins) at this position (no search); the gap
+    /// `value - static_value` is what the search added.
+    pub static_value: f32,
+    pub depth: u32,
 }
 
 fn mcts_iteration(
@@ -249,8 +400,10 @@ fn mcts_iteration(
     children: &mut HashMap<(usize, usize, usize), Box<[Node]>>,
     rng: &mut impl Rng,
     leaf_eval: &mut LeafEval,
+    sel: &SelectionConfig,
 ) {
-    let (mut new_node, s1_move, s2_move) = unsafe { root_node.selection(state, children, rng) };
+    let (mut new_node, s1_move, s2_move) =
+        unsafe { root_node.selection(state, children, rng, sel, leaf_eval) };
     new_node = unsafe { (*new_node).expand(state, s1_move, s2_move, children, rng) };
     let rollout_result = unsafe { (*new_node).rollout(state, root_eval, leaf_eval) };
     unsafe { (*new_node).backpropagate(rollout_result, state) }
@@ -268,12 +421,13 @@ fn run_mcts_loop(
     children: &mut HashMap<(usize, usize, usize), Box<[Node]>>,
     limit: SearchLimit,
     leaf_eval: &mut LeafEval,
+    sel: &SelectionConfig,
 ) {
     let mut rng = rng();
     let start_time = std::time::Instant::now();
     loop {
         for _ in 0..1000 {
-            mcts_iteration(root_node, state, root_eval, children, &mut rng, leaf_eval);
+            mcts_iteration(root_node, state, root_eval, children, &mut rng, leaf_eval, sel);
         }
         if root_node.times_visited >= 10_000_000 {
             break;
@@ -320,12 +474,94 @@ pub fn perform_mcts_with(
     max_iterations: u32,
     evaluator: Option<&Evaluator>,
 ) -> MctsResult {
+    perform_mcts_selecting(
+        state,
+        side_one_options,
+        side_two_options,
+        max_time,
+        max_iterations,
+        evaluator,
+        &SelectionConfig::default(),
+    )
+}
+
+/// Like `perform_mcts_with`, with a runtime selection mode (ucb1 / exp3 / rm).
+/// `SelectionConfig::default()` is exactly the stock decoupled-UCB1 search.
+pub fn perform_mcts_selecting(
+    state: &mut State,
+    side_one_options: Vec<MoveChoice>,
+    side_two_options: Vec<MoveChoice>,
+    max_time: Duration,
+    max_iterations: u32,
+    evaluator: Option<&Evaluator>,
+    sel: &SelectionConfig,
+) -> MctsResult {
+    perform_mcts_joint(
+        state,
+        side_one_options,
+        side_two_options,
+        max_time,
+        max_iterations,
+        evaluator,
+        sel,
+        false,
+    )
+}
+
+/// Like `perform_mcts_selecting`; with `want_joint` the result also carries the root's
+/// joint-action matrix (`MctsResult::joint`), read off the root's chance children.
+pub fn perform_mcts_joint(
+    state: &mut State,
+    side_one_options: Vec<MoveChoice>,
+    side_two_options: Vec<MoveChoice>,
+    max_time: Duration,
+    max_iterations: u32,
+    evaluator: Option<&Evaluator>,
+    sel: &SelectionConfig,
+    want_joint: bool,
+) -> MctsResult {
+    perform_mcts_export(
+        state,
+        side_one_options,
+        side_two_options,
+        max_time,
+        max_iterations,
+        evaluator,
+        sel,
+        want_joint,
+        None,
+    )
+}
+
+/// Like `perform_mcts_joint`; with `export` the result also carries sampled interior nodes
+/// (`MctsResult::nodes`). `None` is exactly `perform_mcts_joint`.
+pub fn perform_mcts_export(
+    state: &mut State,
+    side_one_options: Vec<MoveChoice>,
+    side_two_options: Vec<MoveChoice>,
+    max_time: Duration,
+    max_iterations: u32,
+    evaluator: Option<&Evaluator>,
+    sel: &SelectionConfig,
+    want_joint: bool,
+    export: Option<&ExportConfig>,
+) -> MctsResult {
     let mut leaf_eval = LeafEval::new(evaluator);
     let mut root_node = Node::new();
     unsafe {
         root_node.populate(side_one_options, side_two_options);
     }
     root_node.root = true;
+    if let Some(pc) = sel.prior.as_ref() {
+        fill_priors(
+            pc,
+            state,
+            root_node.s1_options.as_mut().unwrap(),
+            root_node.s2_options.as_mut().unwrap(),
+            true,
+            &mut leaf_eval.prior_scratch,
+        );
+    }
     let mut children: HashMap<(usize, usize, usize), Box<[Node]>> = HashMap::new();
 
     let root_eval = leaf_eval.value(state);
@@ -341,33 +577,185 @@ pub fn perform_mcts_with(
         &mut children,
         search_limit,
         &mut leaf_eval,
+        sel,
     );
 
-    let result = MctsResult {
-        s1: root_node
-            .s1_options
-            .as_ref()
-            .unwrap()
+    let side_results = |options: &[MoveNode], stats: Option<&SideStats>| -> Vec<MctsSideResult> {
+        let total_visits: f32 = options.iter().map(|v| v.visits as f32).sum();
+        let strategy: Vec<f32> = match stats {
+            Some(st) => {
+                let a = st.avg_strategy();
+                let t: f64 = a.iter().sum();
+                a.iter()
+                    .map(|x| if t > 0.0 { (x / t) as f32 } else { 0.0 })
+                    .collect()
+            }
+            None => options
+                .iter()
+                .map(|v| {
+                    if total_visits > 0.0 {
+                        v.visits as f32 / total_visits
+                    } else {
+                        0.0
+                    }
+                })
+                .collect(),
+        };
+        options
             .iter()
-            .map(|v| MctsSideResult {
+            .zip(strategy)
+            .map(|(v, avg_strategy)| MctsSideResult {
                 move_choice: v.move_choice.clone(),
                 total_score: v.total_score,
                 visits: v.visits,
+                avg_strategy,
             })
-            .collect(),
-        s2: root_node
-            .s2_options
-            .as_ref()
-            .unwrap()
-            .iter()
-            .map(|v| MctsSideResult {
-                move_choice: v.move_choice.clone(),
-                total_score: v.total_score,
-                visits: v.visits,
-            })
-            .collect(),
-        iteration_count: root_node.times_visited,
+            .collect()
     };
 
-    result
+    let joint = if want_joint {
+        let root_ptr = &root_node as *const Node as usize;
+        let mut cells: Vec<JointCell> = children
+            .iter()
+            .filter(|((ptr, _, _), _)| *ptr == root_ptr)
+            .map(|((_, i, j), nodes)| {
+                let visits: u32 = nodes.iter().map(|n| n.times_visited).sum();
+                let total: f32 = nodes.iter().map(|n| n.total_score).sum();
+                JointCell {
+                    s1: *i,
+                    s2: *j,
+                    visits,
+                    mean: if visits > 0 { total / visits as f32 } else { 0.0 },
+                }
+            })
+            .collect();
+        cells.sort_by_key(|c| (c.s1, c.s2));
+        Some(cells)
+    } else {
+        None
+    };
+
+    let nodes = match export {
+        Some(cfg) if cfg.max_nodes > 0 => Some(export_interior_nodes(
+            &root_node, &children, state, &mut leaf_eval, root_eval, cfg,
+        )),
+        _ => None,
+    };
+    let root_value = logistic(leaf_eval.abs_logit_of_raw(root_eval));
+    let root_search_value = if root_node.times_visited > 0 {
+        let mean = root_node.total_score / root_node.times_visited as f32;
+        logistic(leaf_eval.absolute_logit(root_eval, mean))
+    } else {
+        root_value
+    };
+
+    MctsResult {
+        joint,
+        nodes,
+        root_value,
+        root_search_value,
+        s1: side_results(root_node.s1_options.as_ref().unwrap(), root_node.stats.as_ref().map(|n| &n.s1)),
+        s2: side_results(root_node.s2_options.as_ref().unwrap(), root_node.stats.as_ref().map(|n| &n.s2)),
+        iteration_count: root_node.times_visited,
+        depth_max: leaf_eval.depth_max,
+        depth_mean: if root_node.times_visited > 0 {
+            (leaf_eval.depth_sum as f64 / root_node.times_visited as f64) as f32
+        } else {
+            0.0
+        },
+    }
 }
+
+fn logistic(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+/// Weighted reservoir sample (Efraimidis-Spirakis, weight = visits) of the search tree's
+/// interior nodes, each serialised with the position it stands for. Walks the tree
+/// iteratively (the tree can be a chain tens of thousands deep) applying and reversing each
+/// node's instructions on `state`, which is back at the root position on return. A node's
+/// children never have more visits than it has, so subtrees below `min_visits` are skipped.
+fn export_interior_nodes(
+    root: &Node,
+    children: &HashMap<(usize, usize, usize), Box<[Node]>>,
+    state: &mut State,
+    leaf_eval: &mut LeafEval,
+    root_raw: f32,
+    cfg: &ExportConfig,
+) -> Vec<ExportedNode> {
+    let mut by_parent: HashMap<usize, Vec<&Box<[Node]>>> = HashMap::new();
+    for ((ptr, _, _), group) in children.iter() {
+        by_parent.entry(*ptr).or_default().push(group);
+    }
+    enum Step {
+        Enter(*const Node, u32),
+        Exit(*const Node),
+    }
+    let mut rng = rng();
+    // (key, node); key = ln(u) / visits, the K largest keys are kept
+    let mut kept: Vec<(f64, ExportedNode)> = Vec::new();
+    let mut stack: Vec<Step> = vec![Step::Enter(root as *const Node, 0)];
+    while let Some(step) = stack.pop() {
+        match step {
+            Step::Exit(node) => unsafe {
+                state.reverse_instructions(&(*node).instructions.instruction_list);
+            },
+            Step::Enter(node, depth) => {
+                let node_ref: &Node = unsafe { &*node };
+                if depth > 0 {
+                    if node_ref.times_visited < cfg.min_visits {
+                        continue;
+                    }
+                    state.apply_instructions(&node_ref.instructions.instruction_list);
+                    stack.push(Step::Exit(node));
+                    if state.battle_is_over() == 0.0 {
+                        let u: f64 = rng.random_range(f64::MIN_POSITIVE..1.0);
+                        let key = u.ln() / node_ref.times_visited as f64;
+                        let worth = kept.len() < cfg.max_nodes
+                            || kept.iter().map(|(k, _)| *k).fold(f64::INFINITY, f64::min) < key;
+                        if worth {
+                            let mean = node_ref.total_score / node_ref.times_visited as f32;
+                            let raw = leaf_eval.value(state);
+                            let entry = ExportedNode {
+                                state: state.serialize(),
+                                visits: node_ref.times_visited,
+                                value: logistic(leaf_eval.absolute_logit(root_raw, mean)),
+                                static_value: logistic(leaf_eval.abs_logit_of_raw(raw)),
+                                depth,
+                            };
+                            if let Some(dup) = kept.iter().position(|(_, n)| n.state == entry.state) {
+                                // the same position reached by another path (or a chain of
+                                // no-op turns): keep one copy, the better visited one
+                                if entry.visits > kept[dup].1.visits {
+                                    kept[dup] = (key, entry);
+                                }
+                            } else if kept.len() < cfg.max_nodes {
+                                kept.push((key, entry));
+                            } else {
+                                let (idx, _) = kept
+                                    .iter()
+                                    .enumerate()
+                                    .min_by(|a, b| a.1 .0.partial_cmp(&b.1 .0).unwrap())
+                                    .unwrap();
+                                kept[idx] = (key, entry);
+                            }
+                        }
+                    }
+                }
+                if let Some(groups) = by_parent.get(&(node as usize)) {
+                    for group in groups {
+                        for child in group.iter() {
+                            stack.push(Step::Enter(child as *const Node, depth + 1));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    kept.sort_by(|a, b| b.1.visits.cmp(&a.1.visits));
+    kept.into_iter().map(|(_, n)| n).collect()
+}
+
+#[cfg(test)]
+#[path = "mcts_prior_tests.rs"]
+mod prior_tests;

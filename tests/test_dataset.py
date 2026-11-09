@@ -66,6 +66,20 @@ def test_loader_targets_are_signed_for_both_sides(tmp_path, state_string):
     assert by["w", 2, "world"].policy is None
 
 
+def test_prefer_truth_uses_truth_else_worlds(tmp_path, state_string):
+    _write(tmp_path, state_string, recorder.RESULT_WIN, "has_truth")
+    rec = recorder.GameRecorder(tmp_path)
+    rec.start_game("no_truth", "u")
+    rec.add_decision("no_truth", "u", {
+        "turn": 1, "worlds": [fake_world(state_string), fake_world(state_string)],
+        "policy": {"a": 1.0}, "chosen": "a",
+    })
+    rec.end_game("no_truth", "u", recorder.RESULT_WIN, turns=2)
+    samples = list(dataset.iter_samples(tmp_path, worlds="fallback", truth=True))
+    kinds = sorted((s.battle_tag, s.kind) for s in samples); print(kinds)
+    assert kinds == [("has_truth", "truth"), ("no_truth", "world"), ("no_truth", "world")]
+
+
 def test_default_triples_are_side_one_and_bad_states_are_counted(tmp_path, state_string):
     _write(tmp_path, state_string, recorder.RESULT_WIN, "w")
     write_fake_game(recorder.GameRecorder(tmp_path), tag="bad")  # "S1": engine cannot parse
@@ -76,3 +90,122 @@ def test_default_triples_are_side_one_and_bad_states_are_counted(tmp_path, state
     assert len(features) == pe.FEATURE_LENGTH and value == 1.0 and policy
     assert stats.bad_states == 3 and stats.games == 2
     assert dataset.collect_statistics(tmp_path)["decisions"] == 2
+
+
+def _write_q(tmp_path, state, worlds, result=recorder.RESULT_WIN, tag="q"):
+    rec = recorder.GameRecorder(tmp_path)
+    rec.start_game(tag, "u")
+    rec.add_decision(tag, "u", {
+        "turn": 1, "worlds": [recorder.world_record(state, w) for w in worlds],
+        "policy": {"a": 1.0}, "chosen": "a", "truth": {"state": state}, "truth_status": "ok",
+    })
+    rec.end_game(tag, "u", result, turns=2)
+
+
+def test_search_value_decision_mean_world_and_side_flip(tmp_path, state_string):
+    worlds = [
+        (100, [("a", 100, 70.0)]),  # q = 0.7
+        (50, [("a", 50, 10.0)]),    # q = 0.2
+        (0, []),                    # zero visits: ignored
+    ]
+    _write_q(tmp_path, state_string, worlds)
+    dec = list(dataset.iter_samples(tmp_path, sides=(1, 2)))
+    assert len(dec) == (3 + 1) * 2
+    one = [s for s in dec if s.side == 1]
+    two = [s for s in dec if s.side == 2]
+    assert all(abs(s.search_value - 0.45) < 1e-9 for s in one)  # mean(0.7, 0.2)
+    assert all(abs(s.search_value - 0.55) < 1e-9 for s in two)
+    assert [s.kind for s in one] == ["world"] * 3 + ["truth"]
+    wor = [s for s in dataset.iter_samples(tmp_path, q_source="world")]
+    assert [None if s.search_value is None else round(s.search_value, 6) for s in wor] == [
+        0.7, 0.2, None, 0.45]  # zero-visit world has no q of its own; truth keeps the mean
+    with pytest.raises(ValueError):
+        list(dataset.iter_samples(tmp_path, q_source="bogus"))
+
+
+def test_search_value_none_when_no_world_has_visits(tmp_path, state_string):
+    _write_q(tmp_path, state_string, [(0, [])])
+    assert all(s.search_value is None for s in dataset.iter_samples(tmp_path))
+    assert dataset.decision_search_value({"worlds": [{"avg_score": None, "total_visits": 5}]}) is None
+    assert dataset.decision_search_value({}) is None
+
+
+def test_absolute_search_value_pure_function():
+    import math
+    # relative score 0.5 (no search improvement): q_abs is sigmoid(scale * eval)
+    assert abs(dataset.absolute_search_value(0.0, 0.5) - 0.5) < 1e-12
+    assert abs(dataset.absolute_search_value(80.0, 0.5) - 1 / (1 + math.exp(-1.0))) < 1e-9
+    # eval and search improvement add in logit space
+    q = dataset.absolute_search_value(-80.0, 1 / (1 + math.exp(-1.0)))
+    assert abs(q - 0.5) < 1e-9
+    # clipping keeps 0/1 scores finite
+    assert 0.0 < dataset.absolute_search_value(0.0, 0.0) < dataset.absolute_search_value(0.0, 1.0) < 1.0
+
+
+def test_search_value_abs_in_samples(tmp_path, state_string):
+    _write_q(tmp_path, state_string, [(100, [("a", 100, 70.0)])])
+    ev = pe.evaluate(pe.State.from_string(state_string))
+    expect = dataset.absolute_search_value(ev, 0.7)
+    s1, s2 = [list(dataset.iter_samples(tmp_path, sides=(1, 2), truth=False))[i] for i in (0, 1)]
+    assert abs(s1.search_value_abs - expect) < 1e-9 and abs(s2.search_value_abs - (1 - expect)) < 1e-9
+    assert s1.stock_eval == ev
+    truth = [s for s in dataset.iter_samples(tmp_path) if s.kind == "truth"][0]
+    assert abs(truth.search_value_abs - expect) < 1e-9
+
+
+# --- bootstrapped (TD / n-step) targets (589.21) ---------------------------------------
+
+import numpy as np  # noqa: E402
+
+
+def _brute_td(q, z, lam):
+    T = len(q)
+    out = []
+    for t in range(T):
+        g = sum((1 - lam) * lam ** (n - 1) * q[t + n] for n in range(1, T - t))
+        out.append(g + lam ** (T - t - 1) * z)
+    return np.array(out)
+
+
+def test_td_recursion_matches_brute_force():
+    rng = np.random.default_rng(0)
+    for _ in range(20):
+        T = int(rng.integers(1, 12))
+        q, z, lam = rng.random(T), float(rng.choice([0.0, 0.5, 1.0])), float(rng.random())
+        np.testing.assert_allclose(
+            dataset.td_lambda_returns(q, z, lam), _brute_td(q, z, lam), atol=1e-12)
+
+
+def test_td_limits_and_nstep():
+    q = np.array([0.2, 0.4, 0.6, 0.8])
+    np.testing.assert_allclose(dataset.td_lambda_returns(q, 1.0, 1.0), 1.0)
+    np.testing.assert_allclose(dataset.td_lambda_returns(q, 0.0, 0.0), [0.4, 0.6, 0.8, 0.0])
+    np.testing.assert_allclose(dataset.nstep_returns(q, 1.0, 1), [0.4, 0.6, 0.8, 1.0])
+    np.testing.assert_allclose(dataset.nstep_returns(q, 1.0, 3), [0.8, 1.0, 1.0, 1.0])
+    np.testing.assert_allclose(dataset.nstep_returns(q, 0.5, 0 + 2), [0.6, 0.8, 0.5, 0.5])
+
+
+def test_gap_falls_back_to_next_available_q_or_z():
+    nan = float("nan")
+    q = np.array([0.2, nan, nan, 0.8, nan])
+    np.testing.assert_allclose(dataset.nstep_returns(q, 1.0, 1), [0.8, 0.8, 0.8, 1.0, 1.0])
+    np.testing.assert_allclose(dataset.td_lambda_returns(q, 1.0, 0.0), [0.8, 0.8, 0.8, 1.0, 1.0])
+    _, st = dataset.bootstrapped_targets(["a"] * 5, range(5), q, [1.0] * 5, "td")
+    assert st == {"gaps": 3, "decisions": 5}
+
+
+def test_grouping_shares_target_across_world_and_truth_samples():
+    # two recordings, shuffled sample order; decision 1 of game "a" has 3 samples
+    gid = ["b", "a", "a", "a", "a", "b", "a"]
+    didx = [0, 1, 1, 0, 1, 1, 2]
+    dq = {("a", 0): 0.3, ("a", 1): 0.5, ("a", 2): 0.9, ("b", 0): 0.1, ("b", 1): 0.2}
+    q = [dq[(g, d)] for g, d in zip(gid, didx)]
+    z = [0.0 if g == "b" else 1.0 for g in gid]
+    out, st = dataset.bootstrapped_targets(gid, didx, q, z, "nstep", n=1)
+    expect = {("a", 0): 0.5, ("a", 1): 0.9, ("a", 2): 1.0, ("b", 0): 0.2, ("b", 1): 0.0}
+    for g, d, o in zip(gid, didx, out):
+        assert o == pytest.approx(expect[(g, d)])
+    out, _ = dataset.bootstrapped_targets(gid, didx, q, z, "nstep", n=1, mu=0.5)
+    for g, d, o in zip(gid, didx, out):
+        assert o == pytest.approx(0.5 * expect[(g, d)] + 0.5 * dq[(g, d)])
+    assert st["decisions"] == 5

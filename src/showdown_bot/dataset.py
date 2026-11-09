@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import random
 import sys
 from collections import Counter
 from collections.abc import Iterable, Iterator, Sequence
@@ -23,12 +24,37 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from showdown_bot import recorder
 
 VALUE_BY_RESULT = {recorder.RESULT_WIN: 1.0, recorder.RESULT_TIE: 0.5, recorder.RESULT_LOSS: 0.0}
 
 KIND_WORLD = "world"
 KIND_TRUTH = "truth"
+KIND_NODE = "node"  # a sampled interior search node (bead rnm); see ``nodes`` below
+
+NODE_MODES = ("off", "on", "only")
+
+Q_SOURCES = ("decision", "world")
+Q_KINDS = ("relative", "absolute")
+Q_EVAL_SCALE = 0.0125  # the stock MCTS score is sigmoid(0.0125 * (e_leaf - e_root))
+
+
+def state_row(poke_engine, state, side: int, feature_version: int | None = None) -> list[float]:
+    """One training/eval input row of ``state`` for ``side``.
+
+    Versions 1-3: ``poke_engine.state_features``. Versions 4 and 5: the dense features followed by the
+    ``IDENTITY_LENGTH`` (84) identity indices (``state_identity``) as floats, so the whole row
+    travels through the one feature matrix; the model splits it again (``train.EmbedMLP``).
+    Indices are < 2048, exactly representable even in float16.
+    """
+    if feature_version in (None, 1):
+        return poke_engine.state_features(state, side)
+    row = poke_engine.state_features(state, side, feature_version)
+    if feature_version in (4, 5):
+        row = list(row) + [float(i) for i in poke_engine.state_identity(state, side)]
+    return row
 
 
 @dataclass
@@ -41,6 +67,32 @@ class Sample:
     battle_tag: str
     turn: int | None
     state: str | None = None  # the engine State string the features were computed from
+    # Search-based value estimate in [0, 1] from this sample's side's view (MCTS root
+    # avg_score; side two gets 1 - q). None when no searched world had visits.
+    search_value: float | None = None
+    # Absolute version: the recorded avg_score is relative to the root evaluation, so
+    # q_abs = sigmoid(scale * evaluate(state) + logit(avg_score)) (see absolute_search_value).
+    search_value_abs: float | None = None
+    stock_eval: float | None = None  # poke_engine.evaluate(state), side one's view, not flipped for side two
+    # Position in the recording: ``game_id`` identifies one recording file (one side's
+    # view of one battle), ``decision_idx`` the decision's order in it (0-based, counting
+    # every stored decision). ``decision_q_abs`` / ``decision_q`` are the decision-level
+    # search values (side one's view, never flipped; truth-state absolute q when the
+    # decision has a truth state, else the mean over worlds) shared by all samples of the
+    # decision; used for bootstrapped (TD / n-step) targets.
+    game_id: str = ""
+    decision_idx: int = 0
+    decision_q_abs: float | None = None
+    decision_q: float | None = None
+    # kind "node" only: visits of the interior node, joint turns below the searched root, and
+    # the evaluator's own absolute value there (``search_value_abs`` is the search's)
+    node_visits: int = 0
+    node_depth: int = 0
+    node_static: float | None = None
+    # the recording's last stored state (truth if it has one, else the first world): the best
+    # available stand-in for the end of the game, used for auxiliary targets (auxtargets.py)
+    final_state: str | None = None
+    result: str | None = None  # the recording player's result ("win" / "loss" / "tie")
 
     def as_tuple(self) -> tuple[list[float], float, dict[str, float] | None]:
         return self.features, self.value, self.policy
@@ -60,19 +112,161 @@ def value_target(result: str, side: int = 1) -> float:
     return value if side == 1 else 1.0 - value
 
 
+def _valid_score(world: dict[str, Any]) -> float | None:
+    """A world's ``avg_score`` unless it had no visits or no score recorded."""
+    score = world.get("avg_score")
+    if score is None or not world.get("total_visits"):
+        return None
+    return float(score)
+
+
+def absolute_search_value(
+    stock_eval: float, avg_score: float, scale: float = Q_EVAL_SCALE
+) -> float:
+    """Absolute win probability from a root-relative search score.
+
+    ``avg_score`` is ``sigmoid(scale * (e_leaf - e_root))`` averaged, so adding back
+    the root's own evaluation gives ``sigmoid(scale * e_root + logit(avg_score))``.
+    ``stock_eval`` is ``poke_engine.evaluate`` (side one's view).
+    """
+    p = min(max(avg_score, 1e-4), 1 - 1e-4)
+    z = scale * stock_eval + math.log(p / (1 - p))
+    return 1.0 / (1.0 + math.exp(-z))
+
+
+# poke_engine.Evaluator per weights path, loaded once per process (leaf scale is applied here)
+_ANCHOR_EVALUATORS: dict[str, Any] = {}
+
+
+def _anchor_evaluator(path: str) -> Any:
+    ev = _ANCHOR_EVALUATORS.get(path)
+    if ev is None:
+        import poke_engine
+
+        try:
+            ev = poke_engine.Evaluator.load(path)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(
+                f"cannot load the evaluator {path!r} that anchors this recording's search scores "
+                f"({exc}); pass --q-evaluator PATH [--q-leaf-scale S] (or 'stock') to override"
+            ) from exc
+        _ANCHOR_EVALUATORS[path] = ev
+    return ev
+
+
+def recording_anchor(
+    header: dict[str, Any], q_evaluator: str | None = None, q_leaf_scale: float | None = None
+) -> tuple[str | None, float]:
+    """``(evaluator path or None for stock, leaf scale)`` the recording's search used.
+
+    Read from the game header's ``config`` (``evaluator``, ``evaluator_scale``), which is the
+    recording player's own search config. ``q_evaluator`` / ``q_leaf_scale`` override it
+    (``q_evaluator="stock"`` forces the stock anchor). An evaluator ensemble (``evaluator2``)
+    cannot be reconstructed without exported values, so it raises unless overridden.
+    """
+    cfg = header.get("config") or {}
+    if q_evaluator is not None:
+        path = None if q_evaluator.lower() == "stock" else q_evaluator
+        scale = q_leaf_scale if q_leaf_scale is not None else (
+            float(cfg.get("evaluator_scale") or 1.0) if cfg.get("evaluator") == path else 1.0)
+        return path, float(scale)
+    path = cfg.get("evaluator")
+    if not path:
+        return None, 1.0
+    if cfg.get("evaluator2"):
+        raise ValueError(
+            f"{header.get('battle_tag')}: recorded with an evaluator ensemble (evaluator2); the "
+            "per-world evaluator is not stored, pass --q-evaluator to force one")
+    scale = q_leaf_scale if q_leaf_scale is not None else cfg.get("evaluator_scale") or 1.0
+    return str(path), float(scale)
+
+
+def learned_absolute_search_value(evaluator: Any, state: Any, avg_score: float, scale: float) -> float:
+    """Exact absolute P(side one wins) at a search root run with a learned evaluator.
+
+    The engine's leaf score is ``sigmoid(k * (z_leaf - z_root))`` (relative evaluators), so the
+    mean score ``m`` inverts to ``z_root + logit(m) / k`` with ``z_root = evaluator.logit(root)``
+    (includes the stock term of a residual net) and ``k`` the leaf scale; absolute (non-relative)
+    evaluators use ``logit(m) / k``. Mirrors ``LeafEval::absolute_logit`` in ``engine/src/mcts.rs``.
+    """
+    p = min(max(avg_score, 1e-4), 1 - 1e-4)
+    z = math.log(p / (1 - p)) / scale
+    if evaluator.relative_to_root:
+        z += float(evaluator.logit(state))
+    return 1.0 / (1.0 + math.exp(-z))
+
+
+def decision_search_value(decision: dict[str, Any]) -> float | None:
+    """Mean ``avg_score`` over the decision's usable worlds (side one's view), or None."""
+    scores = [q for q in map(_valid_score, decision.get("worlds", ())) if q is not None]
+    return sum(scores) / len(scores) if scores else None
+
+
 def iter_samples(
     root: str | Path,
     *,
     sides: Sequence[int] = (1,),
-    worlds: bool = True,
+    worlds: bool | str = True,
     truth: bool = True,
     stats: LoadStats | None = None,
+    q_source: str = "decision",
+    q_eval_scale: float = Q_EVAL_SCALE,
+    with_stock_eval: bool = False,
+    feature_version: int | None = None,
+    max_per_game: int = 0,
+    seed: int = 0,
+    files: Sequence[Path] | None = None,
+    nodes: str = "off",
+    node_min_visits: int = 0,
+    nodes_per_world: int = 0,
+    q_evaluator: str | None = None,
+    q_leaf_scale: float | None = None,
+    use_exported_q: bool = True,
 ) -> Iterator[Sample]:
-    """Yield one ``Sample`` per stored state (every searched world, plus truth)."""
+    """Yield one ``Sample`` per stored state (every searched world, plus truth).
+
+    ``max_per_game=K > 0`` keeps at most K decisions per game record, chosen uniformly
+    without replacement among the decisions that have a state under the ``worlds`` /
+    ``truth`` filter, by an RNG seeded with ``seed`` and the record's file name (so it is
+    reproducible and independent of the other records). It is applied before any
+    parsing or feature extraction, so memory and time drop with it. ``decision_idx``
+    stays the decision's index in the full record.
+
+    ``worlds="fallback"`` includes a decision's worlds only when it has no truth
+    state (with ``truth=True`` this means "prefer truth").
+
+    ``Sample.search_value`` is the search's value estimate q: the decision's mean
+    world ``avg_score`` (``q_source="decision"``, also used for truth states), or
+    for world samples that world's own ``avg_score`` (``q_source="world"``, falling
+    back to None if that world has no usable score; truth stays the decision mean).
+
+    ``nodes`` (bead rnm): ``off`` ignores the interior nodes some recordings carry
+    (``worlds[i]["nodes"]``, written by searches run with ``export_nodes``); ``on`` also
+    yields one ``kind="node"`` sample per exported node with at least ``node_min_visits``
+    visits; ``only`` yields just those. A node sample's ``search_value_abs`` is the exported
+    absolute search value (already anchored to the evaluator the search used, so
+    ``q_eval_scale`` does not apply), ``search_value`` equals it, and ``node_visits`` /
+    ``node_depth`` / ``node_static`` carry the weighting information for the trainer.
+    ``nodes_per_world`` > 0 keeps only that many of a world's eligible nodes (a uniform
+    random subset, reproducible from ``seed``, the file name and the decision index).
+
+    Absolute search values (``search_value_abs``): a world's exported ``search_value`` when
+    present (``use_exported_q``); otherwise reconstructed from ``avg_score`` with the
+    evaluator the recording used (``recording_anchor``: the header config's ``evaluator`` /
+    ``evaluator_scale``, overridable with ``q_evaluator`` / ``q_leaf_scale``), exactly as the
+    engine does (``learned_absolute_search_value``). Only recordings made with the stock
+    evaluator use ``sigmoid(q_eval_scale * evaluate(state) + logit(avg_score))``.
+    """
+    if q_source not in Q_SOURCES:
+        raise ValueError(f"q_source must be one of {Q_SOURCES}")
+    if nodes not in NODE_MODES:
+        raise ValueError(f"nodes must be one of {NODE_MODES}")
     import poke_engine
 
+    # None = the engine's default feature version (old engines have no ``version`` argument)
     stats = stats if stats is not None else LoadStats()
-    for path in recorder.iter_game_files(root):
+    # ``files`` restricts the walk to those game files (used by the parallel loader)
+    for path in (recorder.iter_game_files(root) if files is None else files):
         try:
             game = recorder.read_game(path)
         except (OSError, ValueError, EOFError) as exc:
@@ -86,24 +280,87 @@ def iter_samples(
         stats.games += 1
         stats.results[result] += 1
         tag = game["header"].get("battle_tag", "")
-        for decision in game["decisions"]:
+        anchor_path, anchor_scale = recording_anchor(game["header"], q_evaluator, q_leaf_scale)
+        anchor_ev = None if anchor_path is None else _anchor_evaluator(anchor_path)
+        final_state = None
+        for d_ in reversed(game["decisions"]):
+            final_state = (d_.get("truth") or {}).get("state") or (
+                d_["worlds"][0]["state"] if d_.get("worlds") else None)
+            if final_state:
+                break
+        keep: set[int] | None = None
+        if max_per_game > 0:
+            eligible = [
+                i for i, d in enumerate(game["decisions"])
+                if (worlds and (worlds != "fallback" or not d.get("truth")) and d.get("worlds"))
+                or (truth and d.get("truth"))
+            ]
+            if len(eligible) > max_per_game:
+                keep = set(random.Random(f"{seed}:{path.name}").sample(eligible, max_per_game))
+        for decision_idx, decision in enumerate(game["decisions"]):
+            if keep is not None and decision_idx not in keep:
+                continue
             policy = decision.get("policy") or None
-            states: list[tuple[str, str]] = []
-            if worlds:
-                states += [(KIND_WORLD, w["state"]) for w in decision.get("worlds", ())]
+            q_mean = decision_search_value(decision)
+            parsed: dict[str, Any] = {}
+
+            def parse(string: str):
+                if string not in parsed:
+                    try:
+                        parsed[string] = poke_engine.State.from_string(string)
+                    except (KeyboardInterrupt, SystemExit):
+                        raise
+                    except BaseException:  # includes pyo3 PanicException
+                        parsed[string] = None
+                return parsed[string]
+
+            # absolute q per usable world (needs the parsed world state)
+            world_abs: list[float | None] = []
+            for w in decision.get("worlds", ()):
+                score, st = _valid_score(w), parse(w["state"])
+                exported = w.get("search_value") if use_exported_q else None  # absolute root value
+                world_abs.append(
+                    None if score is None or st is None
+                    else float(exported) if exported is not None
+                    else absolute_search_value(poke_engine.evaluate(st), score, q_eval_scale)
+                    if anchor_ev is None
+                    else learned_absolute_search_value(anchor_ev, st, score, anchor_scale)
+                )
+            valid_abs = [v for v in world_abs if v is not None]
+            abs_mean = sum(valid_abs) / len(valid_abs) if valid_abs else None
+            states: list[tuple[str, str, float | None, float | None]] = []
+            if worlds and (worlds != "fallback" or not decision.get("truth")):
+                for w, wa in zip(decision.get("worlds", ()), world_abs):
+                    own = q_source == "world"
+                    states.append((
+                        KIND_WORLD, w["state"], _valid_score(w) if own else q_mean,
+                        wa if own else abs_mean,
+                    ))
             if truth and decision.get("truth"):
-                states.append((KIND_TRUTH, decision["truth"]["state"]))
-            for kind, state_string in states:
-                try:
-                    state = poke_engine.State.from_string(state_string)
-                except (KeyboardInterrupt, SystemExit):
-                    raise
-                except BaseException:  # includes pyo3 PanicException (not an Exception)
+                tstring = decision["truth"]["state"]
+                tstate = parse(tstring)
+                t_abs = (
+                    None if tstate is None or q_mean is None
+                    else abs_mean if anchor_ev is not None or (use_exported_q and all(
+                        w.get("search_value") is not None for w in decision["worlds"]))
+                    else absolute_search_value(poke_engine.evaluate(tstate), q_mean, q_eval_scale)
+                )
+                states.append((KIND_TRUTH, tstring, q_mean, t_abs))
+            if nodes == "only":
+                states = []
+            # decision-level absolute q: the truth state's if there is one, else the world mean
+            dec_abs = abs_mean
+            if truth and decision.get("truth") and states and states[-1][0] == KIND_TRUTH                     and states[-1][3] is not None:
+                dec_abs = states[-1][3]
+            for kind, state_string, q, q_abs in states:
+                state = parse(state_string)
+                if state is None:
                     stats.bad_states += 1
                     continue
+                stock_eval = float(poke_engine.evaluate(state))  # always filled (absolute q needs it)
                 for side in sides:
                     yield Sample(
-                        features=poke_engine.state_features(state, side),
+                        features=state_row(poke_engine, state, side, feature_version),
                         value=value_target(result, side),
                         policy=policy if side == 1 else None,
                         kind=kind,
@@ -111,7 +368,137 @@ def iter_samples(
                         battle_tag=tag,
                         turn=decision.get("turn"),
                         state=state_string,
+                        search_value=None if q is None else (q if side == 1 else 1.0 - q),
+                        stock_eval=stock_eval,
+                        game_id=str(path),
+                        decision_idx=decision_idx,
+                        decision_q_abs=dec_abs,
+                        decision_q=q_mean,
+                        final_state=final_state,
+                        result=result,
+                        search_value_abs=(
+                            None if q_abs is None else (q_abs if side == 1 else 1.0 - q_abs)
+                        ),
                     )
+            if nodes != "off":
+                for wi, w in enumerate(decision.get("worlds", ())):
+                    eligible = [nd for nd in (w.get("nodes") or ()) if nd[1] >= node_min_visits]
+                    if nodes_per_world and len(eligible) > nodes_per_world:
+                        eligible = random.Random(f"{seed}:{path.name}:{decision_idx}:{wi}").sample(
+                            eligible, nodes_per_world)
+                    for node in eligible:
+                        n_state, n_visits, n_value, n_static, n_depth = node
+                        n_parsed = parse(n_state)
+                        if n_parsed is None:
+                            stats.bad_states += 1
+                            continue
+                        for side in sides:
+                            yield Sample(
+                                features=state_row(poke_engine, n_parsed, side, feature_version),
+                                value=value_target(result, side),
+                                policy=None,
+                                kind=KIND_NODE,
+                                side=side,
+                                battle_tag=tag,
+                                turn=decision.get("turn"),
+                                state=n_state,
+                                search_value=n_value if side == 1 else 1.0 - n_value,
+                                stock_eval=float(poke_engine.evaluate(n_parsed)),
+                                game_id=str(path),
+                                decision_idx=decision_idx,
+                                search_value_abs=n_value if side == 1 else 1.0 - n_value,
+                                final_state=final_state,
+                                result=result,
+                                node_visits=int(n_visits),
+                                node_depth=int(n_depth),
+                                node_static=(None if n_static is None else
+                                             (n_static if side == 1 else 1.0 - n_static)),
+                            )
+
+
+def _fill_gaps(q: np.ndarray, z: float) -> tuple[np.ndarray, int]:
+    """Replace NaN entries of a decision chain by the next available q, or ``z`` if none."""
+    out = q.astype(np.float64).copy()
+    nxt = z
+    n_gap = 0
+    for t in range(len(out) - 1, -1, -1):
+        if np.isnan(out[t]):
+            out[t] = nxt
+            n_gap += 1
+        else:
+            nxt = out[t]
+    return out, n_gap
+
+
+def td_lambda_returns(q: Sequence[float], z: float, lam: float) -> np.ndarray:
+    """lambda-returns of one recording's decision chain (backward recursion).
+
+    ``q[t]`` is decision t's search value (NaN = missing), t = 0..T-1, and the step
+    after the last decision is the outcome ``z``: ``G[T-1] = z``,
+    ``G[t] = (1-lam) * q[t+1] + lam * G[t+1]``, i.e. the usual
+    ``(1-lam) * sum_n lam^(n-1) q[t+n] + lam^(T-t-1) z``. ``lam=1`` gives ``z``,
+    ``lam=0`` gives ``q[t+1]`` (``z`` for the last decision). Missing q is a gap:
+    it is replaced by the next available q (or z) before the recursion.
+    """
+    qf, _ = _fill_gaps(np.asarray(q, dtype=np.float64), z)
+    g = np.empty_like(qf)
+    if len(qf) == 0:
+        return g
+    g[-1] = z
+    for t in range(len(qf) - 2, -1, -1):
+        g[t] = (1.0 - lam) * qf[t + 1] + lam * g[t + 1]
+    return g
+
+
+def nstep_returns(q: Sequence[float], z: float, n: int) -> np.ndarray:
+    """``G[t] = q[t+n]`` if ``t+n < T`` else ``z`` (gaps filled as in ``td_lambda_returns``)."""
+    qf, _ = _fill_gaps(np.asarray(q, dtype=np.float64), z)
+    T = len(qf)
+    idx = np.arange(T) + n
+    return np.where(idx < T, qf[np.minimum(idx, max(T - 1, 0))] if T else qf, z)
+
+
+def bootstrapped_targets(
+    game_ids: Sequence[str],
+    decision_idx: Sequence[int],
+    decision_q: Sequence[float],
+    z: Sequence[float],
+    mode: str,
+    lam: float = 0.7,
+    n: int = 1,
+    mu: float = 0.0,
+) -> tuple[np.ndarray, dict[str, int]]:
+    """Per-sample TD / n-step targets looking ahead within each recording.
+
+    Samples are grouped by ``game_id`` and ordered by ``decision_idx``; all samples of
+    a decision (world and truth) share its ``decision_q`` (NaN = missing) and get the
+    same target. ``mode`` is ``td`` (lambda-return, ``lam``) or ``nstep`` (``n``);
+    ``mu`` blends the decision's own q: ``(1-mu) * G + mu * q_t`` (own q missing -> G).
+    ``z`` is the outcome per sample (constant within a recording). Returns
+    ``(targets float32, stats)`` with ``stats['gaps']`` missing-q decisions and
+    ``stats['decisions']`` total decisions.
+    """
+    if mode not in ("td", "nstep"):
+        raise ValueError(f"unknown bootstrap mode {mode!r}")
+    gid = np.asarray(game_ids)
+    didx = np.asarray(decision_idx, dtype=np.int64)
+    q = np.asarray(decision_q, dtype=np.float64)
+    zz = np.asarray(z, dtype=np.float64)
+    out = np.empty(len(gid), dtype=np.float32)
+    stats = {"gaps": 0, "decisions": 0}
+    order = np.lexsort((didx, gid))
+    bounds = np.flatnonzero(np.r_[True, gid[order][1:] != gid[order][:-1], True])
+    for a, b in zip(bounds[:-1], bounds[1:]):
+        rows = order[a:b]
+        decs, first, inv = np.unique(didx[rows], return_index=True, return_inverse=True)
+        qd, zg = q[rows][first], float(zz[rows][0])
+        stats["decisions"] += len(decs)
+        stats["gaps"] += int(np.isnan(qd).sum())
+        g = td_lambda_returns(qd, zg, lam) if mode == "td" else nstep_returns(qd, zg, n)
+        if mu:
+            g = np.where(np.isnan(qd), g, (1 - mu) * g + mu * np.nan_to_num(qd))
+        out[rows] = g[inv.ravel()]
+    return out, stats
 
 
 def iter_triples(
@@ -230,3 +617,4 @@ def main(argv: Iterable[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

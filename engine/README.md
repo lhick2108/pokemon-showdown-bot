@@ -60,6 +60,32 @@ engine's item, ability and move ids: the only unknown ids were `lightclay`
 1 species) and `scopelens` (9 sets, weight 173, 1 species). No unknown
 abilities or moves.
 
+### Mechanics fixes (`0.0.48+sdb.22`, 589.68.4)
+
+Found by `scripts/engine_diff.py` (engine vs the real Showdown simulator, 200 seeds, see
+`docs/engine-diff-report.md`): turns where no engine branch reproduces the simulator went from 8.3% to 5.5% (PP
+excluded), and from 85% to 5.8% with PP included. Tests: `src/genx/sdb22_tests*.inc.rs` (included in the
+`generate_instructions` test module) plus `tests/test_battle_mechanics.rs`.
+
+| Area | Change |
+| --- | --- |
+| End of turn (`add_end_of_turn_instructions`) | Reordered to Showdown's `onResidualOrder`: weather damage + weather abilities (Solar Power, Dry Skin, Rain Dish, Ice Body), Future Sight, Wish, Grassy Terrain heal (not on the terrain's last turn), Hydration / Shed Skin, **Leftovers / Black Sludge (before** Leech Seed, poison / toxic / Poison Heal and burn), Salt Cure / bind, Yawn, Perish, orbs / Speed Boost / forme checks. New `item_residual_heal`, `ability_weather_residual`, `ability_status_cure_residual`. Black Sludge (non-Poison) and Solar Power damage were clamped to the missing HP instead of the current HP. |
+| Heal Block, Throat Chop | New `VolatileStatusDurations.healblock` / `.throatchop` (turns remaining; Heal Block 5, Psychic Noise 2, Persistent 7; Throat Chop 2). They tick in the residual step and end the volatile. Heal Block blocks Leftovers, Black Sludge, Grassy Terrain, Wish, Leech Seed's heal, Poison Heal, Ice Body / Rain Dish / Dry Skin and removes heal moves from the choices; Throat Chop blocks sound moves. Psychic Noise and Throat Chop are now 100% secondaries (Protect, Substitute, Covert Cloak and Sheer Force stop them). |
+| PP | `Move.max_pp` (0 = unknown). With `max_pp > 0` every move decrements PP (clamped at 0, Pressure = 2), not when the user is asleep / fully paralysed / flinched or on the 2nd turn of a charge / locked move, but also on a failed Protect and by a sleeping Sleep Talk user. With `max_pp == 0` the old "only below 10" behaviour is kept (this is what hand-built states and old records get). Leppa Berry restores `min(10, max_pp - pp)`. Cost: about 6% MCTS iterations/s with tracking on (`scripts/engine_bench_pp.py`). |
+| Moves / abilities / items | Take Heart (+1 SpA/SpD, cures status); Sheer Force suppresses Life Orb recoil (`Choice.sheer_force_applied`); a KO with Giga Impact / Hyper Beam keeps `mustrecharge` (the faint follow-up `(switch, none)` no longer consumes MUSTRECHARGE / TRUANT of the waiting side); Protean / Libero compare the whole type list (Water/Dark + Water move -> pure Water, once per switch-in via TYPECHANGE); Protosynthesis / Quark Drive activate when sun / Electric Terrain starts with the mon already out (`ability_field_change_activation`, after each half-turn); Disguise is not busted by an immune hit; Electromorphosis / Wind Power give Charge and Charge is used up by the next Electric move; Seismic Toss / Night Shade / Super Fang / Endeavor / Final Gambit no longer go through Protect. |
+
+**State format.** Everything is backward compatible: `Move` serializes as `ID;disabled;pp` and appends `;max_pp` only
+when it is known; `VolatileStatusDurations` stays `confusion;encore;lockedmove;slowstart;taunt;yawn` and appends
+`;healblock;throatchop` only when one is non-zero. Old strings (including the state strings in `data/selfplay`
+records) still parse; a `HEALBLOCK` / `THROATCHOP` volatile with duration 0 (old strings, the live bot) is read as a
+fresh 5 / 2 turns. A new wheel's strings are readable by older wheels as long as no max PP / Heal Block timer is
+set. Python: `Move(id, pp, disabled, max_pp=0)`, `VolatileStatusDurations(..., healblock=0, throatchop=0)`;
+`src/showdown_bot/engine_state.py` passes `max_pp` only when `engine_state.TRACK_PP` /
+`SHOWDOWN_ENGINE_TRACK_PP=1` is set (self-play, the diff harness).
+
+Not done yet (plans in `docs/engine-diff-report.md`): Harvest, forme changes (Terapagos, Mimikyu-Busted, Eiscue,
+Morpeko), Slow Start, Cursed Body, Unburden, Synchronize, a Struggle choice.
+
 With `evaluator=None` (the default) the search is the stock algorithm: the same
 `evaluate()` and the same `sigmoid(0.0125 * (eval - root_eval))` formula (the
 only difference is one `Option` branch per leaf).
@@ -76,6 +102,25 @@ result = pe.monte_carlo_tree_search(state, duration_ms=1000, evaluator=ev)
 pe.state_features(state)                             # list[float], len FEATURE_LENGTH, side-one view
 pe.state_features(state, side=2)                     # side-two view
 ```
+
+### Weights file format
+
+Little endian: `"PEVN"`, `u32 format`, `u32 feature_version`, `u32 kind`
+(1 linear, 2 mlp), `u32 n_in`, `u32 n_hidden`, then the f32 weights (linear:
+`w[n_in], b`; mlp: `W1[n_hidden][n_in], b1, w2, b2`).
+
+**Format 2 (residual evaluators)** inserts two fields after `n_hidden`:
+`u32 flags` (bit0 = residual) and `f32 stock_coef`. A residual evaluator's logit
+is `stock_coef * evaluate(state) + net(features)` (the net's bias included);
+`stock_coef = a * 0.0125`, the multiplier on the raw stock evaluation points.
+**Format 3 (feature version 4, embedding tables)** is written only for nets with
+learned identity embeddings; see `docs/features-v4.md` (`write_mlp_embed`,
+`Evaluator.embed_dims`, `state_identity`, `identity_vocab*`). Formats 1 and 2 are
+unchanged and still load.
+Format 1 files load unchanged (not residual). Plain evaluators are still
+written as format 1, so older tooling keeps working; only a residual file needs
+a v2-aware reader. `write_linear` / `write_mlp` take `stock_coef` (default 0.0 =
+plain format 1); `Evaluator.residual` and `Evaluator.stock_coef` report it.
 
 `w1` follows the `torch.nn.Linear(FEATURE_LENGTH, hidden).weight` layout, so a
 trained model exports with `write_mlp(path, l1.weight, l1.bias, l2.weight, l2.bias)`

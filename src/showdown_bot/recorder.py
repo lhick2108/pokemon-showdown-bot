@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import math
 import os
 import re
 import threading
@@ -51,12 +52,12 @@ def result_from_battle(battle: Any) -> str:
 
 
 def world_record(
-    state: str, outcome: tuple[int, list[tuple[str, int, float]]]
+    state: str, outcome: tuple, nash: dict[str, Any] | None = None
 ) -> dict[str, Any]:
     """One searched world: its State string and the MCTS root statistics."""
-    total, options = outcome
+    total, options = outcome[0], outcome[1]
     score_sum = sum(score for _, _, score in options)
-    return {
+    record = {
         "state": state,
         "total_visits": int(total),
         "avg_score": (score_sum / total) if total else None,
@@ -65,6 +66,19 @@ def world_record(
             for choice, visits, score in options
         ],
     }
+    if len(outcome) > 2 and outcome[2] is not None:  # exp3 / rm: average-strategy share
+        for move, share in zip(record["moves"], outcome[2]):
+            move["strategy"] = float(share)
+    if nash is not None:  # Nash mode: our equilibrium strategy and the game value
+        record["nash"] = nash
+    value = getattr(outcome, "search_value", None)  # absolute root value (every recorded search)
+    if value is not None and math.isfinite(value):
+        record["search_value"] = round(float(value), 5)
+    nodes = getattr(outcome, "nodes", None)
+    if nodes is not None:  # interior-node export (bead rnm): [state, visits, value, static, depth]
+        record["nodes"] = [[s, int(v), round(float(val), 5), round(float(st), 5), int(d)]
+                           for s, v, val, st, d in nodes]
+    return record
 
 
 class GameRecorder:
@@ -95,6 +109,8 @@ class GameRecorder:
         battle_format: str | None = None,
         config: dict[str, Any] | None = None,
         player: str = "search",
+        teams: dict[str, Any] | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> None:
         header = {
             "type": "game",
@@ -108,6 +124,10 @@ class GameRecorder:
             "config": config or {},
             "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         }
+        if teams:  # fixed-team duels (showdown_bot.teams): mode, team pair id, team ids
+            header["teams"] = teams
+        if extra:  # e.g. {"source": "fork", ...} (scripts/fork_augment.py)
+            header.update(extra)
         with self._lock:
             self._games[(battle_tag, username)] = [header]
 
@@ -192,7 +212,10 @@ def iter_game_files(root: str | os.PathLike[str]) -> Iterator[Path]:
     if root.is_file():
         yield root
         return
-    yield from sorted(root.rglob("*.jsonl.gz"))
+    for path in sorted(root.rglob("*.jsonl.gz")):
+        if "policy" in path.relative_to(root).parts[:-1]:
+            continue  # human-replay policy rows (scripts/human_replays.py), not game records
+        yield path
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +260,13 @@ def build_truth_state(battle: Any, other: Any) -> str | None:
     entries = []
     for identifier, bmon in other.team.items():
         seen = battle.opponent_team.get(identifier) or by_species.get(to_id(bmon.species))
-        tera = getattr(bmon.tera_type, "name", None) or bmon.tera_type
+        # An own Pokemon that has not Terastallized has no ``tera_type`` in poke-env; its
+        # real type is only in the request it was built from.
+        tera = (
+            (getattr(bmon, "_last_request", None) or {}).get("teraType")
+            or getattr(bmon.tera_type, "name", None)
+            or bmon.tera_type
+        )
         sampled = SampledSet(
             species=bmon.species,
             level=int(bmon.level or 100),

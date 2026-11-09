@@ -18,6 +18,9 @@ impl PokemonName {
     pub fn base_stats(&self) -> (i16, i16, i16, i16, i16, i16) {
         match self {
             PokemonName::MINIOR => (60, 100, 60, 100, 60, 120),
+            PokemonName::TERAPAGOS => (90, 65, 85, 65, 85, 60),
+            PokemonName::TERAPAGOSTERASTAL => (95, 95, 110, 105, 110, 85),
+            PokemonName::TERAPAGOSSTELLAR => (160, 105, 110, 130, 110, 85),
             PokemonName::MINIORMETEOR => (60, 60, 100, 60, 100, 60),
             PokemonName::WISHIWASHI => (45, 20, 20, 25, 25, 40),
             PokemonName::WISHIWASHISCHOOL => (45, 140, 130, 140, 135, 30),
@@ -25,6 +28,14 @@ impl PokemonName {
             PokemonName::PALAFINHERO => (100, 160, 97, 106, 87, 100),
             PokemonName::EISCUE => (75, 80, 110, 65, 90, 50),
             PokemonName::EISCUENOICE => (75, 80, 70, 65, 50, 130),
+            PokemonName::OGERPON => (80, 120, 84, 60, 96, 110),
+            PokemonName::OGERPONWELLSPRING => (80, 120, 84, 60, 96, 110),
+            PokemonName::OGERPONHEARTHFLAME => (80, 120, 84, 60, 96, 110),
+            PokemonName::OGERPONCORNERSTONE => (80, 120, 84, 60, 96, 110),
+            PokemonName::OGERPONTEALTERA => (80, 120, 84, 60, 96, 110),
+            PokemonName::OGERPONWELLSPRINGTERA => (80, 120, 84, 60, 96, 110),
+            PokemonName::OGERPONHEARTHFLAMETERA => (80, 120, 84, 60, 96, 110),
+            PokemonName::OGERPONCORNERSTONETERA => (80, 120, 84, 60, 96, 110),
 
             // megas
             PokemonName::VENUSAURMEGA => (80, 100, 123, 122, 120, 80),

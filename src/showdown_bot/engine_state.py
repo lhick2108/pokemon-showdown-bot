@@ -37,8 +37,10 @@ track the value). Every one of these is silently approximated or dropped:
   neutral natures, so this is exact for randbats).
 * Substitute HP (poke-env does not track it): a present substitute is given a
   quarter of max HP.
-* Sleep counter is the number of turns observed asleep. Rest's 2-turn timer
-  (``rest_turns``) is not distinguished from ordinary sleep.
+* Sleep counter is the number of ``cant|slp`` turns observed (``showdown_bot.sleep``,
+  fed from the raw protocol; poke-env's own counter over-counts Sleep Talk turns);
+  Rest's fixed 2-turn sleep is passed as ``rest_turns`` (3 minus turns lost). Early
+  Bird's double decrement and the sleep clause are not modelled.
 * Volatile durations: Confusion/Encore/Taunt/Lockedmove use poke-env's observed
   turn counters (clamped to the engine's valid range); Yawn is set from presence
   only; Slow Start is derived as 5 minus observed turns.
@@ -56,7 +58,10 @@ track the value). Every one of these is silently approximated or dropped:
 * Pledge/G-Max side conditions: engine has none.
 * Formes: Pokemon are given the id of their current poke-env forme (ours) or of
   the sampled randbats species (opponent). Mid-battle forme changes of the
-  opponent (e.g. Mimikyu-Busted) are not reflected.
+  opponent that change base stats or the engine's forme logic (Palafin-Hero,
+  Ogerpon-*-Tera, Mimikyu-Busted, ...; see ``_OPPONENT_FORMES``) are reflected:
+  the engine id and base stats are those of the poke-env current forme, the
+  set (level, EVs, IVs, moves, item) stays the sampled one.
 * Mega/Z/Dynamax: not part of Gen 9 randbats.
 * Illusion: the opponent model's own handling decides which set a disguised
   Pokemon gets; this module does not second-guess it.
@@ -67,6 +72,7 @@ track the value). Every one of these is silently approximated or dropped:
 from __future__ import annotations
 
 import logging
+import os
 import math
 import random
 from collections.abc import Mapping, Sequence
@@ -84,6 +90,7 @@ from poke_env.battle.weather import Weather
 from poke_env.data import GenData
 from poke_env.player.battle_order import BattleOrder, SingleBattleOrder
 
+from showdown_bot import sleep as sleep_module
 from showdown_bot.sets import RandbatsData, SampledSet, SetTracker, to_id
 
 logger = logging.getLogger(__name__)
@@ -422,6 +429,68 @@ class TeamSampler:
         return SetTracker(self.data, species_id).sample(rng)
 
 
+# Persistent in-battle formes: current poke-env forme id -> the sampled randbats
+# species ids it can grow out of. A revealed opponent in one of these formes is
+# given the forme's engine id and base stats instead of the sampled species'.
+_OPPONENT_FORMES: dict[str, frozenset[str]] = {
+    "palafinhero": frozenset({"palafin"}),
+    "mimikyubusted": frozenset({"mimikyu"}),
+    "miniormeteor": frozenset({"minior"}),
+    "aegislashblade": frozenset({"aegislash"}),
+    "meloettapirouette": frozenset({"meloetta"}),
+    "cramorantgulping": frozenset({"cramorant"}),
+    "cramorantgorging": frozenset({"cramorant"}),
+    "eiscuenoice": frozenset({"eiscue"}),
+    "morpekohangry": frozenset({"morpeko"}),
+    "terapagosterastal": frozenset({"terapagos"}),
+    "terapagosstellar": frozenset({"terapagos", "terapagosterastal"}),
+    "wishiwashischool": frozenset({"wishiwashi"}),
+    "ogerpontealtera": frozenset({"ogerpon"}),
+    "ogerponwellspringtera": frozenset({"ogerponwellspring"}),
+    "ogerponhearthflametera": frozenset({"ogerponhearthflame"}),
+    "ogerponcornerstonetera": frozenset({"ogerponcornerstone"}),
+}
+
+# The ability a masked Ogerpon holds once it has Terastallized into its -Tera forme.
+_OGERPON_TERA_ABILITIES = {
+    "ogerpontealtera": "embodyaspectteal",
+    "ogerponwellspringtera": "embodyaspectwellspring",
+    "ogerponhearthflametera": "embodyaspecthearthflame",
+    "ogerponcornerstonetera": "embodyaspectcornerstone",
+}
+
+
+def opponent_forme_id(slot: "OpponentSlot") -> str:
+    """Engine species id of a revealed opponent's *current* forme (else the sampled species).
+
+    poke-env keeps ``species`` at the switch-in forme through ``-formechange`` /
+    ``detailschange`` (only a re-switch with new details rewrites it) but does update
+    ``base_stats``, so the forme is recognised from either: the species id when it is a
+    known forme of the sampled species, a terastallized Ogerpon, or a base-stat vector
+    that matches exactly one such forme and not the sampled species.
+    """
+    mon = slot.mon
+    if mon is None or slot.disguised:
+        return slot.species_id
+    sampled = slot.species_id
+    current = to_id(getattr(mon, "species", "") or "")
+    if current != sampled and sampled in _OPPONENT_FORMES.get(current, ()):
+        if dex_entry(current) is not None:
+            return current
+    candidates = [f for f, bases in _OPPONENT_FORMES.items() if sampled in bases and dex_entry(f)]
+    if getattr(mon, "is_terastallized", False):
+        for forme in candidates:
+            if forme in _OGERPON_TERA_ABILITIES:
+                return forme
+    base = dex_entry(sampled)
+    stats = getattr(mon, "base_stats", None)
+    if base is not None and stats and dict(stats) != dict(base["baseStats"]):
+        for forme in candidates:
+            if dict(dex_entry(forme)["baseStats"]) == dict(stats):
+                return forme
+    return sampled
+
+
 @dataclass
 class OpponentSlot:
     """One opposing team member in a sampled world."""
@@ -429,6 +498,9 @@ class OpponentSlot:
     species_id: str
     sampled: SampledSet
     mon: Any | None = None  # poke-env Pokemon if this slot has been revealed
+    # A Zoroark wearing ``mon``'s Illusion: ``mon`` carries the HP/status/boosts
+    # but its species, types and set are the Zoroark's (task 589.9).
+    disguised: bool = False
 
 
 def sample_opponent_team(
@@ -438,11 +510,23 @@ def sample_opponent_team(
     rng: random.Random,
     *,
     team_size: int = TEAM_SIZE,
+    illusion: Any | None = None,
+    illusion_rng: random.Random | None = None,
+    quantiles: Mapping[str, float] | None = None,
 ) -> list[OpponentSlot]:
     """Build one determinized opponent team for ``battle``.
 
     The active Pokemon (if any) comes first, then the other revealed Pokemon in
     battle order, then sampled unrevealed slots up to ``team_size``.
+
+    ``illusion`` (an ``IllusionEstimate``) makes the world sample the active
+    Pokemon as a disguised Zoroark with the estimated probability, drawn from
+    ``illusion_rng`` (a separate stream, so the world sampling is unchanged
+    whenever the probability is zero): see ``_apply_illusion``.
+
+    ``quantiles`` (stratified world sampling) maps a revealed Pokemon's identifier to a
+    pre-drawn quantile ``u`` in [0, 1); that Pokemon's set is then the ``u``-quantile of its
+    posterior instead of an i.i.d. draw (see ``stratified_quantiles``).
     """
     revealed = list(battle.opponent_team.items())
     active = battle.opponent_active_pokemon
@@ -455,11 +539,16 @@ def sample_opponent_team(
             if slot is None:
                 continue
         else:
-            sampled = tracker.sample(rng)
+            u = quantiles.get(str(identifier)) if quantiles else None
+            sampled = tracker.sample(rng) if u is None else tracker.sample(rng, u)
             slot = OpponentSlot(to_id(sampled.species), sampled, mon)
         slots.append(slot)
+    if illusion is not None and illusion_rng is not None and slots:
+        _apply_illusion(slots, active, illusion, sampler, illusion_rng)
     team = [info for info in (sampler.info(s.species_id) for s in slots) if info]
-    while len(slots) < team_size:
+    for _ in range(4 * team_size):  # each pass adds a slot or stops; the cap is a safety net
+        if len(slots) >= team_size:
+            break
         species_id = sampler.sample_species(team, rng, team_size=team_size)
         if species_id is None:
             break
@@ -469,6 +558,87 @@ def sample_opponent_team(
         if info:
             team.append(info)
     return slots
+
+
+def stratified_quantiles(
+    identifiers: Sequence[str], n_worlds: int, rng: random.Random
+) -> list[dict[str, float]]:
+    """Per-world quantiles for low-variance (systematic) sampling of each identifier's set.
+
+    For every identifier the grid ``(offset + k) / n_worlds`` (one uniform offset) is shuffled
+    over the worlds, so each world's marginal is still the posterior but the ``n_worlds``
+    draws cover it evenly: a 53/47 split gives 2/2 (not 3/1 or 4/0), 75/25 gives 3/1.
+    Shuffles are independent across identifiers, so teams stay decorrelated.
+    """
+    out: list[dict[str, float]] = [{} for _ in range(n_worlds)]
+    for identifier in identifiers:
+        offset = rng.random()
+        grid = [((offset + k) / n_worlds) % 1.0 for k in range(n_worlds)]
+        rng.shuffle(grid)
+        for world, u in zip(out, grid):
+            world[identifier] = u
+    return out
+
+
+def sampled_set_key(slot: OpponentSlot) -> tuple:
+    """``inference.set_key`` of the set a world gave ``slot`` (to find its belief weight)."""
+    sampled = slot.sampled
+    return (
+        slot.species_id,
+        int(sampled.level),
+        to_id(sampled.item) if sampled.item else "",
+        to_id(sampled.ability),
+        to_id(sampled.tera_type),
+        tuple(to_id(m) for m in sampled.moves),
+    )
+
+
+def _apply_illusion(
+    slots: list[OpponentSlot],
+    active: Any,
+    illusion: Any,
+    sampler: TeamSampler,
+    illusion_rng: random.Random,
+) -> bool:
+    """With the estimated probability make ``slots[0]`` a disguised Zoroark.
+
+    The roll walks the per-form probabilities cumulatively (they sum to at
+    most one, forms are exclusive by Species Clause). The Zoroark takes over
+    the active ``mon`` (its HP, status, boosts and volatile state are real);
+    the shown species becomes a full-health unrevealed bench member, the
+    Pokemon the Zoroark is copying. A revealed living Zoroark is reused as the
+    active one. Returns whether the world was converted.
+    """
+    probabilities = getattr(illusion, "probabilities", {})
+    if not probabilities or slots[0].mon is not active or active is None:
+        return False
+    roll = illusion_rng.random()
+    chosen = None
+    cumulative = 0.0
+    for form, probability in probabilities.items():
+        cumulative += probability
+        if probability > 0 and roll < cumulative:
+            chosen = form
+            break
+    if chosen is None:
+        return False
+    shown = slots[0]
+    existing = next(
+        (i for i, slot in enumerate(slots) if slot.species_id == chosen and i > 0), None
+    )
+    if existing is not None:
+        zoroark = slots.pop(existing)
+        zoroark = OpponentSlot(zoroark.species_id, zoroark.sampled, active, True)
+    else:
+        tracker = getattr(illusion, "trackers", {}).get(chosen)
+        sampled = (
+            tracker.sample(illusion_rng) if tracker is not None
+            else sampler.sample_set(chosen, illusion_rng)
+        )
+        zoroark = OpponentSlot(chosen, sampled, active, True)
+    slots[0] = zoroark
+    slots.append(OpponentSlot(shown.species_id, shown.sampled, None))
+    return True
 
 
 def _slot_without_tracker(mon: Any, sampler: TeamSampler, rng: random.Random) -> OpponentSlot | None:
@@ -608,7 +778,24 @@ def _clamp8(value: int) -> int:
     return max(-128, min(127, int(value)))
 
 
-def _engine_move(move_id: str, pp: int, disabled: bool = False) -> pe.Move:
+try:  # engine >= 0.0.48+sdb.22: Move.max_pp enables full PP tracking in the search
+    pe.Move(id="tackle", max_pp=8)
+    _ENGINE_HAS_MAX_PP = True
+except TypeError:
+    _ENGINE_HAS_MAX_PP = False
+
+# Full PP tracking costs ~6-8% MCTS iterations/s (one DecrementPP per move) and only matters over
+# whole games (self-play stall loops, Leppa), not over a live search horizon of a few turns. So the
+# live bot keeps the engine's cheap "track PP below 10" mode; self-play / the differential test
+# turn it on with SHOWDOWN_ENGINE_TRACK_PP=1 or `engine_state.TRACK_PP = True`.
+TRACK_PP = os.environ.get("SHOWDOWN_ENGINE_TRACK_PP", "").strip().lower() in ("1", "true", "yes")
+
+
+def _engine_move(move_id: str, pp: int, disabled: bool = False, max_pp: int | None = None) -> pe.Move:
+    if _ENGINE_HAS_MAX_PP and TRACK_PP:
+        cap = _clamp8(max_pp if max_pp else _max_pp(move_id))
+        # the engine caps PP restores at max_pp; never let the observed PP exceed it
+        return pe.Move(id=to_id(move_id), pp=_clamp8(pp), disabled=disabled, max_pp=max(cap, _clamp8(pp), 1))
     return pe.Move(id=to_id(move_id), pp=_clamp8(pp), disabled=disabled)
 
 
@@ -705,7 +892,7 @@ def _own_moves(battle: Any, mon: Any, is_active: bool) -> list[pe.Move]:
             if pp is None:
                 known = mon.moves.get(move_id)
                 pp = known.current_pp if known is not None else _max_pp(move_id)
-            out.append(_engine_move(move_id, pp, bool(entry.get("disabled", False))))
+            out.append(_engine_move(move_id, pp, bool(entry.get("disabled", False)), entry.get("maxpp")))
         return out[:4]
     for move_id, move in list(mon.moves.items())[:4]:
         out.append(_engine_move(move_id, move.current_pp))
@@ -723,12 +910,71 @@ def _sleep_turns(mon: Any, status: str) -> int:
     return max(0, min(_MAX_SLEEP_TURNS, int(mon.status_counter or 0)))
 
 
+def _sleep_fields(battle: Any, mon: Any, status: str) -> tuple[int, int]:
+    """``(sleep_turns, rest_turns)`` for a sleeping Pokemon.
+
+    Uses the protocol-level ``showdown_bot.sleep`` records when the battle has them
+    (Rest's two fixed turns vs 1-3 random turns, turns actually lost). poke-env's own
+    counter also ticks on Sleep Talk's ``move`` events and cannot tell Rest from sleep,
+    so it is only the fallback when no record exists (e.g. hand-driven test battles).
+    """
+    if status != "sleep":
+        return 0, 0
+    tracker = sleep_module.for_battle(getattr(battle, "battle_tag", "") or "")
+    if tracker is not None:
+        for team in (battle.team, battle.opponent_team):
+            for ident, candidate in team.items():
+                if candidate is mon:
+                    record = tracker.record(ident)
+                    if record is not None:
+                        return record.engine_fields()
+    return _sleep_turns(mon, status), 0
+
+
 def _status_of(mon: Any) -> str:
     status = mon.status
     return _STATUS_IDS.get(status, "none") if status is not None else "none"
 
 
-def _volatiles_for(mon: Any) -> tuple[set[str], dict[str, int]]:
+# Charge moves that skip the charge turn in a weather: poke-env still leaves
+# ``preparing_move`` set because the protocol shows ``|-prepare|`` then the damage.
+_INSTANT_CHARGE_WEATHER = {
+    "solarbeam": ("sun", "harshsun"), "solarblade": ("sun", "harshsun"),
+    "electroshot": ("rain", "heavyrain"),
+}
+
+
+def charge_is_instant(battle: Any, mon: Any, move_id: str, *, is_ours: bool) -> bool:
+    """True when ``mon``'s ``preparing_move`` already executed (no charge turn pending).
+
+    Our own side: the request is authoritative. A really charging Pokemon is locked into
+    the one move, so a request offering several moves means the move fired at once (Solar
+    Beam in sun, Electro Shot in rain; a consumed Power Herb is cleared by poke-env's
+    ``end_item``). Otherwise (opponent, or no request) infer from the weather, unless
+    the Pokemon holds a Utility Umbrella.
+    """
+    if is_ours and battle is not None and mon is not None and getattr(mon, "active", False):
+        active = (getattr(battle, "last_request", None) or {}).get("active") or [{}]
+        moves = (active[0] or {}).get("moves") or ()
+        if len(moves) > 1:
+            return True
+        if len(moves) == 1:
+            return False
+    # A visible Power Herb consumption (``|-enditem|..|Power Herb``) leaves the item empty; poke-env
+    # only clears ``preparing_move`` for the id spelling "powerherb", not the logged "Power Herb".
+    if getattr(mon, "item", "unknown_item") in (None, ""):
+        return True
+    weathers = _INSTANT_CHARGE_WEATHER.get(move_id)
+    if not weathers or battle is None:
+        return False
+    if to_id(getattr(mon, "item", "") or "") == "utilityumbrella":
+        return False
+    return any(_WEATHER_IDS.get(w) in weathers for w in getattr(battle, "weather", {}) or {})
+
+
+def _volatiles_for(
+    mon: Any, battle: Any = None, *, is_ours: bool = False
+) -> tuple[set[str], dict[str, int]]:
     """Engine volatile ids and duration counters for an active Pokemon."""
     volatiles: set[str] = set()
     durations = {"confusion": 0, "encore": 0, "lockedmove": 0, "slowstart": 0, "taunt": 0, "yawn": 0}
@@ -752,8 +998,9 @@ def _volatiles_for(mon: Any) -> tuple[set[str], dict[str, int]]:
             durations["yawn"] = 1 if counter >= 1 else 0
     preparing = getattr(mon, "preparing_move", None)
     if preparing is not None:
-        charging = _CHARGING_VOLATILES.get(to_id(getattr(preparing, "id", preparing)))
-        if charging:
+        preparing_id = to_id(getattr(preparing, "id", preparing))
+        charging = _CHARGING_VOLATILES.get(preparing_id)
+        if charging and not charge_is_instant(battle, mon, preparing_id, is_ours=is_ours):
             volatiles.add(charging)
     return volatiles, durations
 
@@ -788,6 +1035,7 @@ def _own_pokemon(battle: Any, mon: Any, is_active: bool) -> tuple[pe.Pokemon, li
     tera_name = request.get("teraType") or getattr(mon.tera_type, "name", None)
     tera_type = to_id(tera_name) or "typeless"
     status = _status_of(mon)
+    sleep_turns, rest_turns = _sleep_fields(battle, mon, status)
     moves = _own_moves(battle, mon, is_active)
     weight = float(entry["weightkg"]) if entry else 0.0
     pokemon = pe.Pokemon(
@@ -806,7 +1054,8 @@ def _own_pokemon(battle: Any, mon: Any, is_active: bool) -> tuple[pe.Pokemon, li
         special_defense=int(stats["spd"] or 100),
         speed=int(stats["spe"] or 100),
         status=status,
-        sleep_turns=_sleep_turns(mon, status),
+        sleep_turns=sleep_turns,
+        rest_turns=rest_turns,
         weight_kg=weight,
         terastallized=bool(mon.is_terastallized or request.get("terastallized")),
         tera_type=tera_type,
@@ -815,17 +1064,49 @@ def _own_pokemon(battle: Any, mon: Any, is_active: bool) -> tuple[pe.Pokemon, li
     return pokemon, moves
 
 
+_CHOICE_ITEMS = frozenset({"choiceband", "choicespecs", "choicescarf"})
+
+
+def _locked_move(mon: Any | None, item_id: str, move_ids: Sequence[str]) -> str | None:
+    """The only move a locked-in opposing Pokemon can use, else ``None``.
+
+    The engine does not restrict a side's moves for a Choice item or a locked move
+    (Outrage, Thrash, ...): it relies on the state marking the other moves disabled,
+    which our own side gets from the request. The opponent has no request, so a world
+    that gives the active Pokemon a Choice item must lock it onto the move it last used
+    (Foul Play's ``Battler.lock_moves``); otherwise the search lets it pick any move.
+    poke-env clears a Pokemon's last-used flag when it switches out, so a set flag
+    means the move was used during the current stay.
+    """
+    if mon is None or mon.fainted:
+        return None
+    last = next(
+        (to_id(move_id) for move_id, move in mon.moves.items() if getattr(move, "_is_last_used", False)),
+        None,
+    )
+    if last is None or last not in move_ids or last in ("trick", "switcheroo"):
+        return None
+    if item_id in _CHOICE_ITEMS or Effect.LOCKED_MOVE in mon.effects:
+        return last
+    return None
+
+
 def _opponent_pokemon(slot: OpponentSlot, battle: Any) -> tuple[pe.Pokemon, list[pe.Move], Any | None]:
     sampled = slot.sampled
     mon = slot.mon
-    entry = dex_entry(slot.species_id)
+    forme_id = opponent_forme_id(slot)
+    entry = dex_entry(forme_id)
     level = int(sampled.level)
     move_ids = [to_id(m) for m in sampled.moves][:4]
-    ability = to_id(sampled.ability)
+    ability = _OGERPON_TERA_ABILITIES.get(forme_id) or to_id(sampled.ability)
     item = to_id(sampled.item)
     if mon is not None:
         if mon.item is None or mon.item == "":
             item = ""
+        elif mon.item != "unknown_item" and to_id(mon.item) != item:
+            # Revealed item differs from the world's (Trick / Switcheroo / Thief gave it a new
+            # one): trust the log, otherwise a stale Choice item keeps the lock.
+            item = to_id(mon.item)
         if mon.is_terastallized and mon.tera_type is not None:
             tera_type = _type_id(mon.tera_type)
         else:
@@ -835,7 +1116,7 @@ def _opponent_pokemon(slot: OpponentSlot, battle: Any) -> tuple[pe.Pokemon, list
     if entry is not None:
         evs, ivs = randbats_evs_ivs(slot.species_id, level, move_ids, ability, item)
         stats = compute_stats(entry["baseStats"], level, evs, ivs)
-        types = _types_pair(mon.base_types) if mon is not None else _types_pair(
+        types = _types_pair(mon.base_types) if mon is not None and not slot.disguised else _types_pair(
             [t.lower() for t in entry["types"]]
         )
         weight = float(entry["weightkg"])
@@ -848,13 +1129,26 @@ def _opponent_pokemon(slot: OpponentSlot, battle: Any) -> tuple[pe.Pokemon, list
     hp = max_hp
     status = "none"
     sleep_turns = 0
+    rest_turns = 0
     if mon is not None:
         if mon.fainted:
             hp = 0
         else:
             hp = max(1, int(round(max_hp * float(mon.current_hp_fraction)))) if mon.current_hp else 0
         status = _status_of(mon)
-        sleep_turns = _sleep_turns(mon, status)
+        sleep_turns, rest_turns = _sleep_fields(battle, mon, status)
+    locked_to = _locked_move(mon, item, move_ids)
+    # Harvest regrows the berry it ate (engine ``Pokemon.last_item``, sdb.28). The world's item is
+    # the set's berry; an empty revealed item means it was eaten (or, rarely, knocked off).
+    extra: dict[str, Any] = {}
+    sampled_item = to_id(sampled.item)
+    if (
+        _ENGINE_LAST_ITEM
+        and ability == "harvest"
+        and not item
+        and sampled_item.endswith("berry")
+    ):
+        extra["last_item"] = sampled_item
     moves: list[pe.Move] = []
     for move_id in move_ids:
         pp = _max_pp(move_id)
@@ -862,9 +1156,9 @@ def _opponent_pokemon(slot: OpponentSlot, battle: Any) -> tuple[pe.Pokemon, list
             known = mon.moves.get(move_id)
             if known is not None:
                 pp = known.current_pp
-        moves.append(_engine_move(move_id, pp))
+        moves.append(_engine_move(move_id, pp, disabled=locked_to is not None and move_id != locked_to))
     pokemon = pe.Pokemon(
-        id=slot.species_id,
+        id=forme_id,
         level=level,
         types=types,
         base_types=types,
@@ -881,12 +1175,170 @@ def _opponent_pokemon(slot: OpponentSlot, battle: Any) -> tuple[pe.Pokemon, list
         speed=stats["spe"],
         status=status,
         sleep_turns=sleep_turns,
+        rest_turns=rest_turns,
         weight_kg=weight,
         terastallized=bool(mon is not None and mon.is_terastallized),
         tera_type=tera_type,
         moves=moves,
+        **extra,
     )
     return pokemon, moves, mon
+
+
+def _engine_sdb_level() -> int:
+    """The ``N`` of the installed engine's ``0.0.48+sdb.N`` version (0 if unknown)."""
+    try:
+        from importlib.metadata import version
+
+        text = version("poke_engine")
+    except Exception:
+        return 0
+    if "+sdb." not in text:
+        return 0
+    try:
+        return int(text.rsplit("+sdb.", 1)[1].split(".")[0])
+    except ValueError:
+        return 0
+
+
+def _engine_supports_transform() -> bool:
+    """Whether the installed engine knows the ``transformed`` volatile / Imposter.
+
+    Added in ``0.0.48+sdb.3``; older builds panic on an unknown volatile name.
+    """
+    return _engine_sdb_level() >= 3
+
+
+_ENGINE_TRANSFORMS = _engine_supports_transform()
+#: ``0.0.48+sdb.4``: Encore honours ``failencore`` last moves, Sleep Talk is exact (589.35).
+_ENGINE_SLEEP_FIXES = _engine_sdb_level() >= 4
+#: ``0.0.48+sdb.5``: Defog lowers evasion (Defiant/Competitive) and keeps the user's screens,
+#: Safety Goggles block powder, Sticky Web counts as a foe drop (589.39). Pending Wish is
+#: passed through ``Side.wish`` (any build).
+_ENGINE_FAIL_FIXES = _engine_sdb_level() >= 5
+#: ``0.0.48+sdb.28``: ``Pokemon.last_item`` (Harvest) and forme fields.
+_ENGINE_LAST_ITEM = _engine_sdb_level() >= 28
+
+
+def _rebuild_pokemon(pokemon: pe.Pokemon, **changes: Any) -> pe.Pokemon:
+    """Copy of an engine Pokemon (attributes are read-only) with ``changes`` applied."""
+    kwargs: dict[str, Any] = dict(
+        id=pokemon.id, level=pokemon.level, types=pokemon.types,
+        base_types=pokemon.base_types, hp=pokemon.hp, maxhp=pokemon.maxhp,
+        ability=pokemon.ability, base_ability=pokemon.base_ability, item=pokemon.item,
+        nature=pokemon.nature, evs=pokemon.evs, attack=pokemon.attack,
+        defense=pokemon.defense, special_attack=pokemon.special_attack,
+        special_defense=pokemon.special_defense, speed=pokemon.speed,
+        status=pokemon.status, rest_turns=pokemon.rest_turns,
+        sleep_turns=pokemon.sleep_turns, weight_kg=pokemon.weight_kg,
+        mega_evolved=pokemon.mega_evolved, terastallized=pokemon.terastallized,
+        tera_type=pokemon.tera_type, moves=list(pokemon.moves),
+    )
+    last_item = getattr(pokemon, "last_item", None)
+    if last_item and last_item != "none":
+        kwargs["last_item"] = last_item
+    kwargs.update(changes)
+    return pe.Pokemon(**kwargs)
+
+
+def _transform_target_stats(
+    mon: Any, foe_entries: Sequence[tuple[pe.Pokemon, list[pe.Move], Any | None]]
+) -> tuple[int, int, int, int, int] | None:
+    """atk/def/spa/spd/spe a Transformed Pokemon copied, as the engine sees the target.
+
+    Showdown copies the target's actual stats (``transformInto``), not stats rebuilt
+    from the target species at the user's own level. poke-env keeps only the target's
+    species base stats, so find the foe whose species matches (the active one first);
+    fall back to the formula at the user's level.
+    """
+    base_stats = getattr(mon, "_temporary_base_stats", None)
+    if not base_stats:
+        return None
+    for pokemon, _moves, _mon in foe_entries:
+        entry = dex_entry(to_id(pokemon.id))
+        if entry is not None and dict(entry["baseStats"]) == dict(base_stats):
+            return (
+                pokemon.attack, pokemon.defense, pokemon.special_attack,
+                pokemon.special_defense, pokemon.speed,
+            )
+    stats = compute_stats(base_stats, int(mon.level or 100))
+    return (stats["atk"], stats["def"], stats["spa"], stats["spd"], stats["spe"])
+
+
+def _apply_transform(
+    entries: list[tuple[pe.Pokemon, list[pe.Move], Any | None]],
+    foe_entries: Sequence[tuple[pe.Pokemon, list[pe.Move], Any | None]],
+    *,
+    is_ours: bool,
+) -> None:
+    """Make an already-Transformed active Pokemon carry its copied kit (in place).
+
+    A Ditto that has used Transform / Imposter (protocol ``-transform``) keeps its
+    own species id, but its stats (except HP), moves (5 PP each), ability, weight and
+    types are the target's. Our side's request already lists the copied moves and the
+    right ability, but its ``stats`` are the base species' (Ditto's), and the opponent
+    side is otherwise built from the sampled randbats set (Ditto's lone Transform).
+    Boosts are copied by poke-env itself.
+    """
+    if not entries:
+        return
+    pokemon, moves, mon = entries[0]
+    if mon is None or mon.fainted or not getattr(mon, "transformed", False):
+        return
+    changes: dict[str, Any] = {}
+    stats = _transform_target_stats(mon, foe_entries)
+    if stats is not None:
+        changes.update(
+            attack=stats[0], defense=stats[1], special_attack=stats[2],
+            special_defense=stats[3], speed=stats[4],
+        )
+    weight = getattr(mon, "weight", None)
+    if weight:
+        changes["weight_kg"] = float(weight)
+    changes["types"] = changes["base_types"] = _types_pair(mon.base_types)
+    if not is_ours:
+        ability = to_id(mon.ability)
+        if ability:
+            changes["ability"] = ability
+            changes["base_ability"] = pokemon.base_ability
+        copied = [
+            _engine_move(move_id, min(5, move.current_pp), max_pp=5)
+            for move_id, move in list(mon.moves.items())[:4]
+        ]
+        if copied:
+            changes["moves"] = copied
+            moves = copied
+    entries[0] = (_rebuild_pokemon(pokemon, **changes), moves, mon)
+
+
+def _pending_wish(
+    battle: Any,
+    ordered: Sequence[tuple[pe.Pokemon, list[pe.Move], Any | None]],
+    is_ours: bool,
+) -> tuple[int, int] | None:
+    """The engine's ``wish=(turns, heal)`` for a Wish used last turn, else ``None``.
+
+    poke-env has no Wish bookkeeping, so :class:`sleep.SleepTracker` reads the protocol:
+    a Wish used during turn N-1 heals at the end of turn N and a second Wish before then
+    fails (589.39; the engine refuses to re-arm a pending Wish).
+    """
+    role = str(getattr(battle, "player_role", "") or "")
+    if role not in ("p1", "p2"):
+        return None
+    tracker = sleep_module.for_battle(getattr(battle, "battle_tag", "") or "")
+    if tracker is None:
+        return None
+    side = role if is_ours else ("p2" if role == "p1" else "p1")
+    wisher = tracker.wish_pending(side, int(battle.turn))
+    if wisher is None or not ordered:
+        return None
+    name = to_id(wisher.split(": ", 1)[-1])
+    maxhp = ordered[0][0].maxhp
+    for entry in ordered:
+        if to_id(entry[0].id) == name or (entry[2] is not None and to_id(entry[2].species) == name):
+            maxhp = entry[0].maxhp
+            break
+    return 1, max(1, maxhp // 2)
 
 
 def _make_side(
@@ -903,7 +1355,11 @@ def _make_side(
     toxic_count = 0
     protect_counter = 0
     if active_mon is not None and not active_mon.fainted:
-        volatiles, durations = _volatiles_for(active_mon)
+        volatiles, durations = _volatiles_for(active_mon, battle, is_ours=is_ours)
+        if _ENGINE_TRANSFORMS and getattr(active_mon, "transformed", False):
+            # Imposter / Transform already happened: it must not re-copy, and
+            # nothing may copy-from a transformed Pokemon (Showdown's rules).
+            volatiles.add("transformed")
         kwargs["volatile_statuses"] = volatiles
         kwargs["volatile_status_durations"] = pe.VolatileStatusDurations(**durations)
         if "substitute" in volatiles:
@@ -930,6 +1386,9 @@ def _make_side(
         )
         kwargs["force_trapped"] = bool(battle.trapped)
     side_conditions = _side_conditions(conditions, battle.turn, toxic_count, protect_counter)
+    wish = _pending_wish(battle, ordered, is_ours)
+    if wish is not None:
+        kwargs["wish"] = wish
     return pe.Side(
         pokemon=pokemon,
         side_conditions=side_conditions,
@@ -952,13 +1411,19 @@ def build_state(
     for mon in ours_sorted[:TEAM_SIZE]:
         pokemon, moves = _own_pokemon(battle, mon, mon is our_active)
         our_entries.append((pokemon, moves, mon))
-    side_one = _make_side(
-        our_entries, our_active, battle, battle.side_conditions, is_ours=True
-    )
 
     # --- opponent (sampled) ---
     opp_active = battle.opponent_active_pokemon
     opp_entries = [_opponent_pokemon(slot, battle) for slot in opponent_team[:TEAM_SIZE]]
+
+    # A Ditto that already transformed copies stats it does not have in the request /
+    # sampled set; resolve each side against the other's (pre-transform) entries.
+    opp_before = list(opp_entries)
+    _apply_transform(opp_entries, our_entries, is_ours=False)
+    _apply_transform(our_entries, opp_before, is_ours=True)
+    side_one = _make_side(
+        our_entries, our_active, battle, battle.side_conditions, is_ours=True
+    )
     opp_active_mon = None
     if opp_entries:
         opp_active_mon = opp_entries[0][2] if opp_entries[0][2] is opp_active else None
@@ -966,7 +1431,12 @@ def build_state(
         opp_entries, opp_active_mon, battle, battle.opponent_side_conditions, is_ours=False
     )
 
-    # --- field ---
+    raw_state = pe.State(side_one=side_one, side_two=side_two, **field_kwargs(battle))
+    return _normalise_state(raw_state, our_entries)
+
+
+def field_kwargs(battle: Any) -> dict[str, Any]:
+    """Weather / terrain / Trick Room keyword arguments of ``pe.State``."""
     weather_id, weather_turns = "none", 0
     for weather, start_turn in battle.weather.items():
         mapped = _WEATHER_IDS.get(weather)
@@ -986,9 +1456,7 @@ def build_state(
             trick_room = True
             trick_room_turns = _remaining_turns(start_turn, battle.turn, 5)
 
-    raw_state = pe.State(
-        side_one=side_one,
-        side_two=side_two,
+    return dict(
         weather=weather_id,
         weather_turns_remaining=weather_turns,
         terrain=terrain_id,
@@ -996,6 +1464,9 @@ def build_state(
         trick_room=trick_room,
         trick_room_turns_remaining=trick_room_turns,
     )
+
+
+def _normalise_state(raw_state: Any, our_entries: Sequence[Any]) -> BuiltState:
     # Round trip through the engine's own serialisation: this validates every
     # id (unknown species/moves/abilities/items decay to "none") and gives us
     # the engine-normalised names used by ``choice_to_order``.

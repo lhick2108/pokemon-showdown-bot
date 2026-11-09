@@ -21,8 +21,14 @@ from poke_env.player import (
     RandomPlayer,
     SimpleHeuristicsPlayer,
 )
-from poke_env.ps_client import AccountConfiguration, LocalhostServerConfiguration
+from poke_env.ps_client import (
+    AccountConfiguration, LocalhostServerConfiguration, ServerConfiguration,
+)
 
+from showdown_bot.players.human import HumanPolicyPlayer
+from showdown_bot.players.netsearch import NetSearchPlayer
+from showdown_bot.players.tokenpolicy import TokenPolicyPlayer
+from showdown_bot.players.humansearch import HumanSearchPlayer
 from showdown_bot.players.search import SearchNetPlayer, SearchPlayer
 
 
@@ -36,6 +42,14 @@ PLAYER_REGISTRY: dict[str, type[Player]] = {
     # "search" in the same process would load it too; use scripts/duel.py for
     # search-net vs search (per-player config).
     "search-net": SearchNetPlayer,
+    # No-search bot that samples the human action-policy model (spec keys: model, pick, elo, temp).
+    "human": HumanPolicyPlayer,
+    # Search bot whose final move is blended with the human model (search keys + model, w, pick, blend, temp, elo).
+    "humansearch": HumanSearchPlayer,
+    # No-search bot that plays the token transformer's policy head (spec keys: model, device, temp, pick).
+    "token-policy": TokenPolicyPlayer,
+    # Net-guided search with the token transformer (keys: model, device, worlds, time_ms, max_evals, batch, c_puct, depth, fpu, vavg, scrub, mode).
+    "net-search": NetSearchPlayer,
 }
 
 # "foulplay" is a special opponent name: it is not a poke-env Player subclass.
@@ -501,6 +515,15 @@ async def _wait_for_foulplay_ready(
                 f"{timeout:g} seconds. See {log_path} for details."
             )
         await asyncio.sleep(0.2)
+
+
+def local_server(port: int = 8000) -> ServerConfiguration:
+    """Local Showdown server on ``port`` (poke-env's localhost config for 8000)."""
+    if port == 8000:
+        return LocalhostServerConfiguration
+    return ServerConfiguration(
+        f"ws://localhost:{port}/showdown/websocket", LocalhostServerConfiguration.authentication_url
+    )
 
 
 def split_games(n: int, instances: int) -> list[int]:

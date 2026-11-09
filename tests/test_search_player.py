@@ -75,6 +75,13 @@ def test_aggregate_policy_averages_visit_shares_per_world():
     assert aggregate_policy([(0, [])]) == {}
 
 
+def test_aggregate_policy_uses_average_strategy_when_present():
+    world_a = (100, [("a", 75, 0.0), ("b", 25, 0.0)], [0.2, 0.8])
+    world_b = (400, [("a", 100, 0.0), ("b", 300, 0.0)], [0.4, 0.6])
+    policy = aggregate_policy([world_a, world_b])
+    assert policy["a"] == pytest.approx(0.3) and policy["b"] == pytest.approx(0.7)
+
+
 def test_argmax_selection_is_deterministic():
     policy = {"a": 0.5, "b": 0.3, "c": 0.2}
     rng = random.Random(0)
@@ -236,7 +243,7 @@ def test_no_evaluator_passes_none_to_worker(data):
     p, calls, pool = _spy_player(data, config=SearchConfig(search_time_ms=20))
     asyncio.run(p.choose_move(_battle()))
     pool.shutdown()
-    assert calls and all(args[-1] is None for args in calls)
+    assert calls and all(args[3] is None for args in calls)
     assert p.config.evaluator is None
 
 
@@ -248,7 +255,7 @@ def test_evaluator_path_reaches_worker(data, pev_path):
     pool.shutdown()
     assert order.message in _legal(_battle())
     assert p.stats.fallbacks == 0 and p.stats.world_errors == 0
-    assert calls and all(args[-1] == str(pev_path.resolve()) for args in calls)
+    assert calls and all(args[3] == str(pev_path.resolve()) for args in calls)
 
 
 def test_evaluator_env_var_and_search_net_requirement(data, pev_path, monkeypatch):
@@ -288,3 +295,213 @@ def test_worker_loads_evaluator_once_per_process(tmp_path):
         for _ in range(4):
             pool.submit(_worker.search_world, state, 10, 1, str(pev_path)).result()
         assert pool.submit(_worker.evaluator_loads).result() == 1
+
+
+def test_evaluator_scale_config_env_and_worker(data, pev_path, monkeypatch):
+    assert SearchConfig().evaluator_scale == 1.0
+    monkeypatch.setenv("SHOWDOWN_SEARCH_EVALUATOR_SCALE", "2.5")
+    assert SearchConfig.from_env().evaluator_scale == 2.5
+    for bad in ("0", "-1", "nan", "inf", "abc"):
+        monkeypatch.setenv("SHOWDOWN_SEARCH_EVALUATOR_SCALE", bad)
+        assert SearchConfig.from_env().evaluator_scale == 1.0
+    monkeypatch.delenv("SHOWDOWN_SEARCH_EVALUATOR_SCALE")
+    p, calls, pool = _spy_player(
+        data, config=SearchConfig(search_time_ms=20), evaluator=pev_path, evaluator_scale=3.0
+    )
+    asyncio.run(p.choose_move(_battle()))
+    pool.shutdown()
+    assert p.stats.fallbacks == 0 and p.stats.world_errors == 0
+    assert calls and all(args[4] == 3.0 for args in calls)
+    with pytest.raises(ValueError):
+        _spy_player(data, evaluator=pev_path, evaluator_scale=0.0)
+
+
+def test_worker_evaluator_cache_keys_on_scale(tmp_path):
+    from showdown_bot.players import _worker
+
+    path = tmp_path / "scaled.pev"
+    pe.write_linear(str(path), [0.0] * pe.FEATURE_LENGTH, 0.0)
+    a = _worker.get_evaluator(str(path), 1.0)
+    assert _worker.get_evaluator(str(path), 1.0) is a
+    b = _worker.get_evaluator(str(path), 2.0)
+    assert b is not a and b.leaf_scale == 2.0 and a.leaf_scale == 1.0
+
+
+def test_selection_config_env_and_validation(data, monkeypatch):
+    assert SearchConfig().selection == "ucb1" and SearchConfig().selection_gamma == 0.1
+    monkeypatch.setenv("SHOWDOWN_SEARCH_SELECTION", "RM")
+    monkeypatch.setenv("SHOWDOWN_SEARCH_SELECTION_GAMMA", "0.25")
+    cfg = SearchConfig.from_env()
+    assert (cfg.selection, cfg.selection_gamma) == ("rm", 0.25)
+    monkeypatch.setenv("SHOWDOWN_SEARCH_SELECTION", "bogus")
+    monkeypatch.setenv("SHOWDOWN_SEARCH_SELECTION_GAMMA", "2")
+    cfg = SearchConfig.from_env()
+    assert (cfg.selection, cfg.selection_gamma) == ("ucb1", 0.1)
+    with pytest.raises(ValueError):
+        _spy_player(data, selection="bogus")
+    with pytest.raises(ValueError):
+        _spy_player(data, selection="exp3", selection_gamma=0.0)
+    with pytest.raises(ValueError):
+        _spy_player(data, config=SearchConfig(threads=2), selection="rm")
+
+
+@pytest.mark.parametrize("mode", ["exp3", "rm"])
+def test_selection_reaches_worker_and_policy_uses_strategy(data, mode):
+    p, calls, pool = _spy_player(
+        data, config=SearchConfig(search_time_ms=30), selection=mode, selection_gamma=0.2
+    )
+    order = asyncio.run(p.choose_move(_battle()))
+    pool.shutdown()
+    assert order.message in _legal(_battle())
+    assert p.stats.fallbacks == 0 and p.stats.world_errors == 0
+    assert calls and all(args[5:7] == (mode, 0.2) for args in calls)
+    assert sum(p.last_policy.values()) == pytest.approx(1.0, abs=1e-3)
+
+
+def test_worker_ucb1_result_shape_unchanged_and_strategy_appended():
+    from showdown_bot.players import _worker
+    from test_engine import make_state
+
+    s = str(make_state().to_string())
+    base = _worker.search_world(s, 20, 1)
+    assert len(base) == 2
+    ex = _worker.search_world(s, 20, 1, None, 1.0, "exp3", 0.1)
+    assert len(ex) == 3 and len(ex[2]) == len(ex[1])
+    assert sum(ex[2]) == pytest.approx(1.0, abs=1e-3)
+
+
+# --- Nash mode (589.24) ----------------------------------------------------------
+
+NASH = search_module.NASH
+
+
+def _world(total, options, k2, cells):
+    return (total, [(c, 100, 50.0) for c in options], None, (k2, cells))
+
+
+def _full(rows, visits=500):
+    return [(i, j, visits, v) for i, row in enumerate(rows) for j, v in enumerate(row)]
+
+
+def test_nash_config_env_and_validation(data, monkeypatch):
+    for name in list(__import__("os").environ):
+        if name.startswith("SHOWDOWN_SEARCH_"):
+            monkeypatch.delenv(name)
+    cfg = SearchConfig()
+    assert (cfg.nash_pseudocount, cfg.nash_floor) == (5.0, 0.03)
+    monkeypatch.setenv("SHOWDOWN_SEARCH_MODE", "Nash")
+    monkeypatch.setenv("SHOWDOWN_SEARCH_NASH_PSEUDOCOUNT", "2.5")
+    monkeypatch.setenv("SHOWDOWN_SEARCH_NASH_FLOOR", "0.1")
+    cfg = SearchConfig.from_env()
+    assert (cfg.mode, cfg.nash_pseudocount, cfg.nash_floor) == (NASH, 2.5, 0.1)
+    monkeypatch.setenv("SHOWDOWN_SEARCH_NASH_PSEUDOCOUNT", "-1")
+    monkeypatch.setenv("SHOWDOWN_SEARCH_NASH_FLOOR", "1.5")
+    cfg = SearchConfig.from_env()
+    assert (cfg.nash_pseudocount, cfg.nash_floor) == (5.0, 0.03)
+    with pytest.raises(ValueError):
+        _spy_player(data, mode="bogus")
+    with pytest.raises(ValueError):
+        _spy_player(data, mode="nash", config=SearchConfig(threads=2))
+    with pytest.raises(ValueError):
+        _spy_player(data, mode="nash", nash_floor=1.0)
+    with pytest.raises(ValueError):
+        _spy_player(data, mode="nash", nash_pseudocount=-1.0)
+    assert _spy_player(data, mode="nash")[0].config.mode == NASH
+
+
+def test_select_choice_nash_samples_the_whole_policy():
+    rng = random.Random(0)
+    policy = {"a": 0.5, "b": 0.3, "c": 0.2}
+    counts = Counter(select_choice(policy, NASH, rng) for _ in range(3000))
+    assert set(counts) == {"a", "b", "c"}  # unlike mixed, c (< 75% of best) is played
+    assert counts["a"] / 3000 == pytest.approx(0.5, abs=0.05)
+
+
+def test_aggregate_nash_uses_each_worlds_own_option_set_and_visit_weights():
+    # World A (1000 visits, 2 opponent options): closecombat strictly dominates.
+    a = _world(1000, ["closecombat", "headlongrush"], 2, _full([[0.9, 0.8], [0.2, 0.1]]))
+    # World B (3000 visits, 3 opponent options): headlongrush strictly dominates.
+    b = _world(
+        3000, ["closecombat", "headlongrush"], 3, _full([[0.1, 0.2, 0.3], [0.9, 0.8, 0.7]])
+    )
+    policy, records = search_module.aggregate_nash([a, b], pseudocount=0.0, floor=0.0)
+    assert policy == pytest.approx({"closecombat": 0.25, "headlongrush": 0.75})
+    assert [r["value"] for r in records] == pytest.approx([0.8, 0.7])
+    assert all(r["exploitability"] < 1e-9 for r in records)
+    floored, _ = search_module.aggregate_nash([a, b], pseudocount=0.0, floor=0.3)
+    assert floored == pytest.approx({"headlongrush": 1.0})
+    # worlds without a joint matrix are skipped; none at all -> empty policy
+    plain = (500, [("closecombat", 500, 250.0)])
+    assert search_module.aggregate_nash([plain], 5.0)[0] == {}
+    mixed_in, recs = search_module.aggregate_nash([plain, a], 0.0)
+    assert mixed_in == pytest.approx({"closecombat": 1.0, "headlongrush": 0.0}) and recs[0] is None
+
+
+def test_nash_mode_player_plays_the_aggregated_strategy(data):
+    p = SearchPlayer(
+        battle_format="gen9randombattle", start_listening=False, log_level=50, data=data,
+        config=SearchConfig(search_time_ms=20, mode=NASH, nash_pseudocount=0.0, nash_floor=0.0),
+        seed=3,
+    )
+    game_b = [[0.9, 0.2, 0.5], [0.1, 0.8, 0.5]]
+
+    async def fake_run(state_strings, time_ms):
+        # matching pennies in world A, a different 3-column game in world B
+        return [
+            _world(2000, ["closecombat", "headlongrush"], 2, _full([[1.0, 0.0], [0.0, 1.0]])),
+            _world(2000, ["closecombat", "headlongrush"], 3, _full(game_b)),
+        ]
+
+    p._run_worlds = fake_run
+    battle = _battle()
+    counts = Counter()
+    for _ in range(200):
+        counts[asyncio.run(p.choose_move(battle)).message] += 1
+    assert p.stats.fallbacks == 0
+    assert all(m in _legal(battle) for m in counts)
+    assert set(p.last_policy) == {"closecombat", "headlongrush"}
+    assert sum(p.last_policy.values()) == pytest.approx(1.0)
+    from showdown_bot.nash import solve_matrix_game
+
+    b = solve_matrix_game(game_b).row[0]
+    assert p.last_policy["closecombat"] == pytest.approx((0.5 + b) / 2)
+    assert len(counts) >= 2  # genuinely mixed play, not argmax
+
+
+def test_nash_mode_reaches_worker_and_returns_a_joint_matrix(data):
+    p, calls, pool = _spy_player(
+        data, config=SearchConfig(search_time_ms=30), mode="nash", nash_pseudocount=3.0
+    )
+    order = asyncio.run(p.choose_move(_battle()))
+    pool.shutdown()
+    assert order.message in _legal(_battle())
+    assert p.stats.fallbacks == 0 and p.stats.world_errors == 0
+    assert calls and all(args[7] is True for args in calls)
+    assert sum(p.last_policy.values()) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_worker_joint_result_shape():
+    from showdown_bot.players import _worker
+    from test_engine import make_state
+
+    s = str(make_state().to_string())
+    for selection in ("ucb1", "rm"):
+        res = _worker.search_world(s, 20, 1, None, 1.0, selection, 0.1, True)
+        assert len(res) == 4
+        total, options, strategies, (k2, cells) = res
+        assert (strategies is None) == (selection == "ucb1")
+        assert k2 >= 1 and cells and all(len(c) == 4 for c in cells)
+        assert max(i for i, *_ in cells) < len(options)
+    assert len(_worker.search_world(s, 20, 1)) == 2  # default path unchanged
+
+
+def test_world_record_stores_nash_strategy_and_value():
+    from showdown_bot import recorder as recorder_module
+
+    outcome = _world(2000, ["closecombat", "headlongrush"], 2, _full([[1.0, 0.0], [0.0, 1.0]]))
+    solved = search_module.aggregate_nash([outcome], 0.0)[1][0]
+    record = recorder_module.world_record("S", outcome, solved)
+    assert record["nash"]["value"] == pytest.approx(0.5)
+    assert record["nash"]["strategy"] == pytest.approx({"closecombat": 0.5, "headlongrush": 0.5})
+    assert "strategy" not in record["moves"][0]  # ucb1 world: no average strategy
+    assert "nash" not in recorder_module.world_record("S", outcome)

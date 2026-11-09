@@ -44,3 +44,11 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if item.get_closest_marker("network"):
             item.add_marker(skip_network)
+
+
+@pytest.fixture(autouse=True)
+def _no_randbats_age_refresh(monkeypatch):
+    """Fixture caches are never re-downloaded by the 24 h max-age check in tests."""
+    from showdown_bot import sets
+
+    monkeypatch.setattr(sets, "MAX_CACHE_AGE_SECONDS", None)
