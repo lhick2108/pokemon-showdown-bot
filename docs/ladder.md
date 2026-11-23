@@ -5,12 +5,11 @@
 
 ## Account and credentials
 
-1. Register an account on play.pokemonshowdown.com whose name clearly says it is a
-   bot (e.g. `LewisBot-bot`; "bot" in the name). Do not impersonate a human.
+1. Register an account on play.pokemonshowdown.com.
 2. Create `.env` in the repo root (already gitignored; never commit it):
 
    ```
-   SHOWDOWN_USERNAME=LewisBot-bot
+   SHOWDOWN_USERNAME=your-account
    SHOWDOWN_PASSWORD=your-password
    ```
 
@@ -52,7 +51,6 @@ a running battle to the new connection and it is played out.
 ## Politeness rules
 
 - One game at a time (`--max-concurrent 1`); no farming loops, no parallel accounts.
-- The account name says it is a bot.
 - Play a modest number of games per session and keep an eye on the first ones.
 - Do not spam the login server: reconnects back off, and failures stop after
   `--max-reconnects`.
@@ -94,8 +92,7 @@ The bot stays logged in on the public server and plays whoever challenges it, in
   rejected (`/reject USER`). Each challenge is answered once. No chat messages are sent.
   (poke-env's own `accept_challenges` silently drops other formats and never rejects,
   so challenge mode answers challenges itself.)
-- Politeness: one battle at a time, the account name says it is a bot, no greeting or
-  chat spam.
+- Politeness: one battle at a time, no greeting or chat spam.
 - Stopping: reach `--games`, hit `--idle-timeout`, or Ctrl-C (a running battle is
   forfeited and logged, the summary is still written).
 - Local check (needs the local server): `python scripts/challenge_dryrun.py` starts the

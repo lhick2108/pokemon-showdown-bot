@@ -11,16 +11,13 @@ from __future__ import annotations
 
 import logging
 import random
-from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
 from poke_env.player.battle_order import BattleOrder
 
-from showdown_bot import history_tokens
 from showdown_bot import token_policy as tp
 from showdown_bot import tokens
-from showdown_bot.sets import _real_battle_tag
 from showdown_bot.players.search import SearchPlayer, _opp_facts
 
 logger = logging.getLogger(__name__)
@@ -58,52 +55,6 @@ class TokenPolicyPlayer(SearchPlayer):
         self.token_errors = 0
         self.last_states: list[str] = []
         self.hist_mode = int(hist)
-        self._histories: "OrderedDict[str, history_tokens.BattleHistory]" = OrderedDict()
-        self._vocab: tokens.Vocab | None = None
-
-    # ------------------------------------------------------------------ live history
-    def _history(self, tag: str, create: bool = True) -> "history_tokens.BattleHistory | None":
-        h = self._histories.get(tag)
-        if h is None and create:
-            if self._vocab is None:
-                self._vocab = tokens.Vocab()
-            h = self._histories[tag] = history_tokens.BattleHistory(self._vocab)
-            while len(self._histories) > 8:
-                self._histories.popitem(last=False)
-        return h
-
-    def _tracks_events(self) -> bool:
-        """Subclasses that need the event bookkeeping (history, side-two scrub) override."""
-        return self.hist_mode > 0
-
-    async def _handle_battle_message(self, split_messages: list[list[str]]) -> Any:
-        if self._tracks_events():
-            try:
-                tag = _real_battle_tag(split_messages)
-                if tag is not None:
-                    battle = getattr(self, "_battles", {}).get(tag)
-                    self._history(tag).observe(split_messages[1:], getattr(battle, "player_role", None))
-            except Exception:  # bookkeeping must never break the battle loop
-                logger.debug("history tracking failed", exc_info=True)
-        return await super()._handle_battle_message(split_messages)
-
-    def _live_hist(self, battle: Any, state0: str, reveal: Any) -> Any:
-        """The 16 history rows of this decision ``(hist_cat, hist_cont)`` (registers the decision)."""
-        import poke_engine
-
-        cat, cont, _names = poke_engine.state_tokens_str(state0, 1, reveal, False)
-        bufs = tokens.split_buffers(cat, cont, tokens.layout())
-        return self._history(battle.battle_tag).begin(int(battle.turn), bufs)
-
-    def _hist_done(self, battle: Any, choice: str | None) -> None:
-        h = self._history(battle.battle_tag, create=False)
-        if h is not None:
-            h.chosen(choice)
-
-    def _hist_abandon(self, battle: Any) -> None:
-        h = self._history(battle.battle_tag, create=False)
-        if h is not None:
-            h.abandon()
 
     async def _choose(self, battle: Any) -> BattleOrder | None:
         legal = battle.valid_orders

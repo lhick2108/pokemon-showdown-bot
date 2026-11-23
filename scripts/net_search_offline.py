@@ -85,6 +85,9 @@ def main() -> None:
     ap.add_argument("--scrub2", type=int, default=0)
     ap.add_argument("--tokthreads", type=int, default=1)
     ap.add_argument("--raw-hist", type=int, default=0)
+    ap.add_argument("--stats", type=int, default=0, help="1: side-one statistics shared per information set (sdb.31)")
+    ap.add_argument("--select", type=int, default=0, help="1: regret-matching selection (sdb.31)")
+    ap.add_argument("--cut", type=float, default=0.0, help="> 0: opponent search cut-off threshold (sdb.31)")
     ap.add_argument("--out-json")
     args = ap.parse_args()
 
@@ -105,6 +108,7 @@ def main() -> None:
         tp, worlds=args.worlds, time_ms=args.time_ms, max_evals=args.max_evals, batch=args.batch,
         c_puct=args.c_puct, depth=args.depth, fpu=args.fpu, vavg=bool(args.vavg), scrub=bool(args.scrub), pipe=args.pipe, views=args.views,
         fast=bool(args.fast), fp16res=bool(args.fp16res), hist=args.hist, scrub2=bool(args.scrub2), tokthreads=args.tokthreads,
+        stats=args.stats, select=args.select, cut=args.cut,
     )
     T = np.stack([r["T"] for r in rows])
     L = np.stack([r["L"] for r in rows])
@@ -112,6 +116,7 @@ def main() -> None:
     NS = np.zeros((n, N_ACT), np.float32)
     evals, batches, wall, coll, fwd, feed, tree, tokm = [], [], [], [], [], [], [], []
     maxd, depthn = [], []
+    nodes, isets, cuts = [], [], []
     for w in range(args.warmup):  # CUDA / cudnn warm-up, not counted
         wr = rows[w % n]
         searcher.search(wr["worlds"] * 2, tokens.reveal_rows(wr["opp_facts"]), time_ms=300,
@@ -137,6 +142,7 @@ def main() -> None:
         evals.append(d.evals); batches.append(d.batches); wall.append(d.wall_ms)
         coll.append(d.collect_ms); fwd.append(d.forward_ms); feed.append(d.feed_ms)
         tree.append(d.stats["tree_ms"]); tokm.append(d.stats["tokenise_ms"]); maxd.append(d.stats["max_depth"])
+        nodes.append(d.stats.get("nodes", 0)); isets.append(d.stats.get("info_sets", 0)); cuts.append(d.stats.get("cut_nodes", 0))
         if (i + 1) % 50 == 0:
             print(f"  {i + 1}/{n} ({time.time() - t0:.0f}s) ns top1 so far "
                   f"{np.mean(NS[:i + 1].argmax(-1) == T[:i + 1].argmax(-1)):.3f}", file=sys.stderr)
@@ -168,6 +174,7 @@ def main() -> None:
             "collect_ms": float(np.mean(coll)), "rust_tree_ms": float(np.mean(tree)),
             "tokenise_ms": float(np.mean(tokm)), "forward_ms": float(np.mean(fwd)), "feed_ms": float(np.mean(feed)),
             "max_depth_mean": float(np.mean(maxd)),
+            "nodes": float(np.mean(nodes)), "info_sets": float(np.mean(isets)), "cut_nodes": float(np.mean(cuts)),
         },
     }
     print(json.dumps(res, indent=1))

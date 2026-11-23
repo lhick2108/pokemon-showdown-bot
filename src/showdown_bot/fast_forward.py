@@ -44,8 +44,16 @@ class _W:
     """fp16 copies of a Linear's parameters."""
 
     def __init__(self, lin: torch.nn.Linear, dtype: torch.dtype) -> None:
+        self.lin = lin
         self.w = lin.weight.detach().to(dtype).contiguous()
         self.b = None if lin.bias is None else lin.bias.detach().to(dtype).contiguous()
+
+    def sync(self) -> None:
+        """Copies the Linear's current parameters into the fp16 copies, in place (captured graphs see them)."""
+        if self.w.data_ptr() != self.lin.weight.data_ptr():
+            self.w.copy_(self.lin.weight.detach())
+        if self.b is not None and self.b.data_ptr() != self.lin.bias.data_ptr():
+            self.b.copy_(self.lin.bias.detach())
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         return F.linear(x.to(self.w.dtype), self.w, self.b)
@@ -97,6 +105,7 @@ class FastForward:
             name: _W(getattr(n, name), dt)
             for name in ("l_mon", "l_known", "l_side", "l_glob", "l_pair", "l_hist", "l_act")
         }
+        self._lns: list[tuple[torch.nn.LayerNorm, torch.Tensor, torch.Tensor]] = []
         self.blocks = [
             {"qkv": _W(b.qkv, dt), "proj": _W(b.proj, dt), "fc1": _W(b.fc1, dt), "fc2": _W(b.fc2, dt),
              "n1": self._ln(b.n1), "n2": self._ln(b.n2), "heads": b.heads}
@@ -113,6 +122,7 @@ class FastForward:
         if use_hist:
             rem_pos += list(range(T_HIST, T_HIST + N_HIST))
         pos = n.e_pos.weight.detach()
+        self._head_pos, self._rem_pos = head_pos, rem_pos
         self.pos_head = pos[head_pos].to(self.dev)
         self.pos_rem = pos[rem_pos].to(self.dev)
         self.n_rem = len(rem_pos)
@@ -134,7 +144,33 @@ class FastForward:
 
     def _ln(self, ln: torch.nn.LayerNorm):
         w, b, eps, d = ln.weight.detach().to(self.rt), ln.bias.detach().to(self.rt), ln.eps, ln.normalized_shape
+        self._lns.append((ln, w, b))
         return lambda x: F.layer_norm(x.to(self.rt), d, w, b, eps)
+
+    @torch.no_grad()
+    def sync(self) -> None:
+        """Re-reads the net's weights into this object's own copies IN PLACE, so the captured CUDA graphs (which
+        hold the copies' addresses) compute the updated net: no re-capture, no new memory. The embeddings are read
+        from the net directly and need nothing. Call between searches, after an optimiser step (search_train)."""
+        with self._lock:
+            if self.cuda:
+                torch.cuda.synchronize()
+            for w in self.lin.values():
+                w.sync()
+            for blk in self.blocks:
+                for k in ("qkv", "proj", "fc1", "fc2"):
+                    blk[k].sync()
+            for ws in self.heads.values():
+                for w in ws:
+                    w.sync()
+            for ln, w, b in self._lns:
+                if w.data_ptr() != ln.weight.data_ptr():
+                    w.copy_(ln.weight.detach())
+                if b.data_ptr() != ln.bias.data_ptr():
+                    b.copy_(ln.bias.detach())
+            pos = self.net.e_pos.weight.detach()
+            self.pos_head.copy_(pos[self._head_pos])
+            self.pos_rem.copy_(pos[self._rem_pos])
 
     # ------------------------------------------------------------------ buffers
     def _bufs(self, rows: int) -> dict:

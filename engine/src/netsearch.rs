@@ -32,7 +32,7 @@ use crate::state::{Pokemon, Side, SideReference, State};
 use crate::tokens::{self, Revealed, CAT_LEN, CONT_LEN, C_MON, O_MON_CAT, O_MON_CONT};
 use rand::prelude::*;
 use rand::rngs::StdRng;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
 const NONE: u32 = u32::MAX;
@@ -57,11 +57,22 @@ pub struct Params {
     pub hist: u8,
     /// worker threads for tokenising the leaves of a batch (1 = in the calling thread)
     pub threads: u8,
+    /// statistics side one selects its options with (sdb.31): 0 = the node's own (one tree per world),
+    /// 1 = shared by every node, of any world, at the same depth whose side-one view is the same
+    /// information set ([`view_key`]: the scrubbed tokens, continuous values in tenths)
+    pub stats: u8,
+    /// selection rule: 0 = PUCT (argmax of `Q + c P sqrt(N) / (1 + n)`), 1 = regret matching (an option is
+    /// SAMPLED with weight `max(Q - V, 0) + c P / sqrt(N)`)
+    pub select: u8,
+    /// > 0: below an action of side one that side two could not expect (a switch to a Pokemon it has not
+    /// seen, or an action its view predicted with probability < `cut`), side two no longer searches: it
+    /// samples its prior
+    pub cut: f32,
 }
 
 impl Default for Params {
     fn default() -> Params {
-        Params { c_puct: 2.0, fpu: 0.0, depth: 4, eps: 0.01, views: 2, hist: 0, threads: 1 }
+        Params { c_puct: 2.0, fpu: 0.0, depth: 4, eps: 0.01, views: 2, hist: 0, threads: 1, stats: 0, select: 0, cut: 0.0 }
     }
 }
 
@@ -240,6 +251,8 @@ pub struct Opt {
     pub vloss: u32,
     /// sum of backed-up values from this side's view
     pub total: f32,
+    /// side one's options: the probability the OTHER side's view gives this action (1 when not fed)
+    pub pred: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -274,6 +287,25 @@ struct Node {
     chance: Vec<Option<Box<[Outcome]>>>,
     /// summary and history of the node's state (`hist` mode 2, set when its tokens are written)
     info: Option<Box<NodeInfo>>,
+    /// index of the information set whose statistics side one selects with (`stats` = 1), or NONE
+    shared: u32,
+    /// side two samples its prior here (`cut`)
+    cut: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SharedOpt {
+    visits: u32,
+    vloss: u32,
+    total: f32,
+}
+
+/// Side one's statistics of one information set (`stats` = 1): what the per-node counters of every
+/// member node add up to.
+struct Shared {
+    visits: u32,
+    total: f32,
+    opts: Vec<SharedOpt>,
 }
 
 impl Node {
@@ -289,6 +321,8 @@ impl Node {
             s2: Vec::new(),
             chance: Vec::new(),
             info: None,
+            shared: NONE,
+            cut: false,
         }
     }
 }
@@ -318,6 +352,8 @@ struct PendingLeaf {
     parent: Option<(Summary, Hist, ActRow, ActRow)>,
     /// hist mode 2: filled by the token writer
     info: Option<Box<NodeInfo>>,
+    /// `stats` = 1: [`view_key`] of side one's tokens, filled by the token writer
+    key: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -330,6 +366,9 @@ pub struct Stats {
     pub both_none: u64,
     pub max_depth: u16,
     pub nodes: u64,
+    /// information sets with shared statistics / nodes where side two only samples its prior
+    pub info_sets: u64,
+    pub cut_nodes: u64,
     pub tree_ns: u64,
     pub tokenise_ns: u64,
     pub feed_ns: u64,
@@ -355,16 +394,45 @@ pub struct Eval {
     pub policy1: [f32; N_ACTIONS],
     pub policy2: [f32; N_ACTIONS],
     pub value: f32,
+    /// side two's prediction of side one's action from ITS view, over side one's slots (`cut`)
+    pub pred1: Option<[f32; N_ACTIONS]>,
+}
+
+/// Token context of ONE world (sdb.30, self-play search): every world is its own game, with its own reveal
+/// rows for both views and its own root history per view.
+#[derive(Clone, Debug)]
+pub struct WorldCtx {
+    pub reveal1: Vec<Revealed>,
+    pub reveal2: Vec<Revealed>,
+    pub hist1: Hist,
+    pub hist2: Hist,
+    names1: Vec<String>,
+    names2: Vec<String>,
+}
+
+impl WorldCtx {
+    pub fn new(reveal1: Vec<Revealed>, reveal2: Vec<Revealed>, hist1: Hist, hist2: Hist) -> WorldCtx {
+        let names1 = reveal1.iter().map(|x| norm_name(&x.species)).collect();
+        let names2 = reveal2.iter().map(|x| norm_name(&x.species)).collect();
+        WorldCtx { reveal1, reveal2, hist1, hist2, names1, names2 }
+    }
 }
 
 pub struct NetSearch {
     worlds: Vec<World>,
+    /// per-world reveals / root history (overrides `reveal1`, `reveal2`, `root_hist`)
+    per_world: Option<Vec<WorldCtx>>,
     params: Params,
     reveal1: Option<Vec<Revealed>>,
     /// what the opponent has seen of our team, applied to side two's view (None = side two sees all)
     reveal2: Option<Vec<Revealed>>,
     /// normalised species names listed in `reveal1`
     names1: Option<Vec<String>>,
+    /// normalised species names listed in `reveal2`
+    names2: Option<Vec<String>>,
+    /// `stats` = 1: side one's statistics per information set and the index of a key
+    shared: Vec<Shared>,
+    shared_ix: HashMap<u64, u32>,
     /// the root's event rows from side one's view (`hist` > 0)
     root_hist: Hist,
     rng: StdRng,
@@ -377,18 +445,26 @@ pub struct NetSearch {
 /// (the first-play value of an unvisited option is `node_mean - fpu`). A virtual loss counts
 /// as a visit that scored 0.
 pub fn puct_pick(opts: &[Opt], node_visits: u32, node_mean: f32, p: &Params) -> usize {
-    if opts.len() == 1 {
+    puct_by(opts.len(), |i| (opts[i].prior, opts[i].visits, opts[i].vloss, opts[i].total), node_visits, node_mean, p)
+}
+
+/// `(prior, visits, virtual losses, total)` of an option.
+type Stat = (f32, u32, u32, f32);
+
+fn puct_by(n: usize, stat: impl Fn(usize) -> Stat, node_visits: u32, node_mean: f32, p: &Params) -> usize {
+    if n == 1 {
         return 0;
     }
-    let pending: u32 = opts.iter().map(|o| o.vloss).sum();
+    let pending: u32 = (0..n).map(|i| stat(i).2).sum();
     let sqrt_n = ((node_visits + pending).max(1) as f32).sqrt();
     let fpu_q = node_mean - p.fpu;
     let mut best = f32::MIN;
     let mut choice = 0;
-    for (i, o) in opts.iter().enumerate() {
-        let n_eff = o.visits + o.vloss;
-        let q = if n_eff == 0 { fpu_q } else { o.total / n_eff as f32 };
-        let score = q + p.c_puct * o.prior * sqrt_n / (1.0 + n_eff as f32);
+    for i in 0..n {
+        let (prior, visits, vloss, total) = stat(i);
+        let n_eff = visits + vloss;
+        let q = if n_eff == 0 { fpu_q } else { total / n_eff as f32 };
+        let score = q + p.c_puct * prior * sqrt_n / (1.0 + n_eff as f32);
         if score > best {
             best = score;
             choice = i;
@@ -397,13 +473,73 @@ pub fn puct_pick(opts: &[Opt], node_visits: u32, node_mean: f32, p: &Params) -> 
     choice
 }
 
+/// Regret-matching weights (`select` = 1): `max(Q - V, 0) + c_puct P / sqrt(N)`. An option nobody tried has
+/// no regret; a virtual loss counts as a visit that scored 0.
+pub fn rm_weights(n: usize, stat: impl Fn(usize) -> Stat, node_visits: u32, node_mean: f32, p: &Params) -> Vec<f32> {
+    let pending: u32 = (0..n).map(|i| stat(i).2).sum();
+    let explore = p.c_puct / ((node_visits + pending).max(1) as f32).sqrt();
+    (0..n)
+        .map(|i| {
+            let (prior, visits, vloss, total) = stat(i);
+            let n_eff = visits + vloss;
+            let regret = if n_eff == 0 { 0.0 } else { (total / n_eff as f32 - node_mean).max(0.0) };
+            regret + explore * prior
+        })
+        .collect()
+}
+
+/// An index drawn in proportion to the weights (the last positive one on rounding; 0 if none is positive).
+fn sample(w: &[f32], rng: &mut StdRng) -> usize {
+    let total: f32 = w.iter().map(|x| x.max(0.0)).sum();
+    if w.len() <= 1 || !(total > 0.0) || !total.is_finite() {
+        return 0;
+    }
+    let mut th = rng.random_range(0.0..total);
+    let mut last = 0;
+    for (i, x) in w.iter().enumerate() {
+        if *x > 0.0 {
+            last = i;
+            th -= *x;
+            if th <= 0.0 {
+                return i;
+            }
+        }
+    }
+    last
+}
+
+fn select_by(n: usize, stat: impl Fn(usize) -> Stat, node_visits: u32, node_mean: f32, p: &Params, rng: &mut StdRng) -> usize {
+    if n == 1 {
+        0
+    } else if p.select == 1 {
+        sample(&rm_weights(n, stat, node_visits, node_mean, p), rng)
+    } else {
+        puct_by(n, stat, node_visits, node_mean, p)
+    }
+}
+
+/// Key of an information set: the viewer's scrubbed tokens with every continuous value in tenths (hp in
+/// ten buckets), so states that differ only in what the viewer cannot see, or by a damage roll, coincide.
+pub fn view_key(cat: &[i16], cont: &[f32]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &c in cat {
+        h = (h ^ c as u16 as u64).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    for &f in cont {
+        h = (h ^ ((f * 10.0).ceil() as i32 as u32 as u64)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h ^= h >> 31;
+    h = h.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    h ^ (h >> 29)
+}
+
 fn make_opts(side: &crate::state::Side, choices: Vec<MoveChoice>) -> Vec<Opt> {
     let k = choices.len().max(1) as f32;
     choices
         .into_iter()
         .map(|c| {
             let slot = action_slot(side, &c).map(|s| s as u8);
-            Opt { choice: c, slot, prior: 1.0 / k, visits: 0, vloss: 0, total: 0.0 }
+            Opt { choice: c, slot, prior: 1.0 / k, visits: 0, vloss: 0, total: 0.0, pred: 1.0 }
         })
         .collect()
 }
@@ -441,10 +577,14 @@ impl NetSearch {
             .collect();
         NetSearch {
             worlds,
+            per_world: None,
             params,
             names1: reveal1.as_ref().map(|r| r.iter().map(|x| norm_name(&x.species)).collect()),
             reveal1,
             reveal2: None,
+            names2: None,
+            shared: Vec::new(),
+            shared_ix: HashMap::new(),
             root_hist: Hist::default(),
             rng: StdRng::seed_from_u64(seed),
             inflight: VecDeque::new(),
@@ -455,7 +595,20 @@ impl NetSearch {
 
     /// Side two's token view is scrubbed to `rows` (what the opponent knows about our team).
     pub fn set_reveal2(&mut self, rows: Option<Vec<Revealed>>) {
+        self.names2 = rows.as_ref().map(|r| r.iter().map(|x| norm_name(&x.species)).collect());
         self.reveal2 = rows;
+    }
+
+    /// One context per world (self-play: the worlds are different games).
+    pub fn set_world_ctx(&mut self, ctx: Vec<WorldCtx>) {
+        assert_eq!(ctx.len(), self.worlds.len(), "one WorldCtx per world");
+        self.per_world = Some(ctx);
+    }
+
+    /// The root options of world `wi` (both sides).
+    pub fn root_opts(&self, wi: usize) -> (&[Opt], &[Opt]) {
+        let n = &self.worlds[wi].nodes[0];
+        (&n.s1, &n.s2)
     }
 
     /// The root's event history from side one's view (used when `Params::hist` > 0).
@@ -542,6 +695,8 @@ impl NetSearch {
                 reveal1: self.reveal1.as_deref(),
                 reveal2: self.reveal2.as_deref(),
                 root_hist: &self.root_hist,
+                per_world: self.per_world.as_deref(),
+                keyed: self.params.stats == 1,
             };
             let threads = (self.params.threads.clamp(1, 4) as usize).min(n.max(1));
             if threads <= 1 || n < 8 {
@@ -580,6 +735,28 @@ impl NetSearch {
                 }
             }
         }
+        if self.params.stats == 1 {
+            // a node that will be expanded joins the information set of its side-one view (same depth, same options)
+            for l in leaves.iter() {
+                let node = &mut self.worlds[l.world as usize].nodes[l.node as usize];
+                if node.depth >= self.params.depth || node.s1.is_empty() {
+                    continue;
+                }
+                let mut k = l.key ^ (node.depth as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                for o in &node.s1 {
+                    k = (k ^ o.slot.map(|s| s as u64 + 1).unwrap_or(0)).wrapping_mul(0x0000_0100_0000_01b3);
+                }
+                let next = self.shared.len() as u32;
+                let ix = *self.shared_ix.entry(k).or_insert(next);
+                if ix == next {
+                    self.shared.push(Shared { visits: 0, total: 0.0, opts: vec![SharedOpt::default(); node.s1.len()] });
+                    self.stats.info_sets += 1;
+                }
+                if self.shared[ix as usize].opts.len() == node.s1.len() {
+                    node.shared = ix;
+                }
+            }
+        }
         self.stats.tokenise_ns += t1.elapsed().as_nanos() as u64;
         (cat, cont, hcat, hcont)
     }
@@ -604,6 +781,15 @@ impl NetSearch {
             } else {
                 set_priors(&mut node.s1, &ev.policy1, eps);
                 set_priors(&mut node.s2, &ev.policy2, eps);
+                if let Some(pr) = &ev.pred1 {
+                    let at = |o: &Opt| o.slot.map(|s| pr[s as usize]).filter(|x| x.is_finite() && *x > 0.0).unwrap_or(0.0);
+                    let sum: f32 = node.s1.iter().map(at).sum();
+                    if sum > 0.0 {
+                        for o in node.s1.iter_mut() {
+                            o.pred = at(o) / sum;
+                        }
+                    }
+                }
                 node.status = Status::Ready;
             }
             self.stats.evals += 1;
@@ -617,12 +803,27 @@ impl NetSearch {
     /// removes the virtual loss the descent put on the chosen options.
     fn backprop(&mut self, wi: usize, leaf: u32, path: &[Step], value: f32) {
         let nodes = &mut self.worlds[wi].nodes;
+        let shared = &mut self.shared;
         nodes[leaf as usize].visits += 1;
         nodes[leaf as usize].total += value;
+        if nodes[leaf as usize].shared != NONE {
+            let sh = &mut shared[nodes[leaf as usize].shared as usize];
+            sh.visits += 1;
+            sh.total += value;
+        }
         for st in path.iter().rev() {
             let n = &mut nodes[st.node as usize];
             n.visits += 1;
             n.total += value;
+            if n.shared != NONE {
+                let sh = &mut shared[n.shared as usize];
+                sh.visits += 1;
+                sh.total += value;
+                let o = &mut sh.opts[st.a1 as usize];
+                o.visits += 1;
+                o.total += value;
+                o.vloss -= 1;
+            }
             let o1 = &mut n.s1[st.a1 as usize];
             o1.visits += 1;
             o1.total += value;
@@ -638,6 +839,9 @@ impl NetSearch {
         let nodes = &mut self.worlds[wi].nodes;
         for st in path {
             let n = &mut nodes[st.node as usize];
+            if n.shared != NONE {
+                self.shared[n.shared as usize].opts[st.a1 as usize].vloss -= 1;
+            }
             n.s1[st.a1 as usize].vloss -= 1;
             n.s2[st.a2 as usize].vloss -= 1;
         }
@@ -700,14 +904,29 @@ impl NetSearch {
                             .map(|i| (i.summary, i.hist.clone(), own, opp)),
                         _ => None,
                     };
-                    return Some(PendingLeaf { world: wi as u32, node: cur, path, state: Some(state), parent, info: None });
+                    return Some(PendingLeaf { world: wi as u32, node: cur, path, state: Some(state), parent, info: None, key: 0 });
                 }
                 Status::Ready => {
                     let (a1, a2, depth, n2, both_none) = {
                         let node = &self.worlds[wi].nodes[cur as usize];
                         let mean = if node.visits > 0 { node.total / node.visits as f32 } else { node.value };
-                        let a1 = puct_pick(&node.s1, node.visits, mean, &params);
-                        let a2 = puct_pick(&node.s2, node.visits, 1.0 - mean, &params);
+                        let (k1, k2) = (node.s1.len(), node.s2.len());
+                        let a1 = if node.shared != NONE {
+                            let sh = &self.shared[node.shared as usize];
+                            let m = if sh.visits > 0 { sh.total / sh.visits as f32 } else { node.value };
+                            let st = |i: usize| (node.s1[i].prior, sh.opts[i].visits, sh.opts[i].vloss, sh.opts[i].total);
+                            select_by(k1, st, sh.visits, m, &params, &mut self.rng)
+                        } else {
+                            let st = |i: usize| (node.s1[i].prior, node.s1[i].visits, node.s1[i].vloss, node.s1[i].total);
+                            select_by(k1, st, node.visits, mean, &params, &mut self.rng)
+                        };
+                        let a2 = if node.cut {
+                            let w: Vec<f32> = node.s2.iter().map(|o| o.prior).collect();
+                            sample(&w, &mut self.rng)
+                        } else {
+                            let st = |i: usize| (node.s2[i].prior, node.s2[i].visits, node.s2[i].vloss, node.s2[i].total);
+                            select_by(k2, st, node.visits, 1.0 - mean, &params, &mut self.rng)
+                        };
                         let bn = node.s1[a1].choice == MoveChoice::None && node.s2[a2].choice == MoveChoice::None;
                         (a1, a2, node.depth, node.s2.len(), bn)
                     };
@@ -722,12 +941,18 @@ impl NetSearch {
                         let node = &mut self.worlds[wi].nodes[cur as usize];
                         node.s1[a1].vloss += 1;
                         node.s2[a2].vloss += 1;
+                        if node.shared != NONE {
+                            self.shared[node.shared as usize].opts[a1].vloss += 1;
+                        }
                     }
                     path.push(Step { node: cur, a1: a1 as u16, a2: a2 as u16 });
                     let key = a1 * n2 + a2;
                     if params.hist == 2 {
                         let node = &self.worlds[wi].nodes[cur as usize];
-                        let names = self.names1.as_deref();
+                        let names = match &self.per_world {
+                            Some(v) => Some(v[wi].names1.as_slice()),
+                            None => self.names1.as_deref(),
+                        };
                         let hidden_opp = |p: &Pokemon| match names {
                             Some(v) => !v.contains(&norm_name(PokemonName::NAMES[p.id as usize])),
                             None => false,
@@ -741,6 +966,22 @@ impl NetSearch {
                             let node = &self.worlds[wi].nodes[cur as usize];
                             (node.s1[a1].choice.clone(), node.s2[a2].choice.clone())
                         };
+                        // side two stops searching below an action of ours it could not expect
+                        let child_cut = params.cut > 0.0 && {
+                            let node = &self.worlds[wi].nodes[cur as usize];
+                            let names = match &self.per_world {
+                                Some(v) => Some(v[wi].names2.as_slice()),
+                                None => self.names2.as_deref(),
+                            };
+                            let unseen = match (&c1, names) {
+                                (MoveChoice::Switch(p), Some(v)) => {
+                                    let target = &state.side_one.pokemon.pkmn[*p as usize];
+                                    !v.contains(&norm_name(PokemonName::NAMES[target.id as usize]))
+                                }
+                                _ => false,
+                            };
+                            node.cut || unseen || node.s1[a1].pred < params.cut
+                        };
                         let mut list = generate_instructions_from_move_pair(&mut state, &c1, &c2, depth <= 1);
                         if list.is_empty() {
                             list.push(StateInstructions::default());
@@ -749,7 +990,10 @@ impl NetSearch {
                         let mut outs = Vec::with_capacity(list.len());
                         for instr in list.drain(..) {
                             let child = w.nodes.len() as u32;
-                            w.nodes.push(Node::new(cur, depth + 1));
+                            let mut child_node = Node::new(cur, depth + 1);
+                            child_node.cut = child_cut;
+                            self.stats.cut_nodes += child_cut as u64;
+                            w.nodes.push(child_node);
                             self.stats.nodes += 1;
                             outs.push(Outcome { instr, child });
                         }
@@ -829,6 +1073,8 @@ struct TokCtx<'a> {
     reveal1: Option<&'a [Revealed]>,
     reveal2: Option<&'a [Revealed]>,
     root_hist: &'a Hist,
+    per_world: Option<&'a [WorldCtx]>,
+    keyed: bool,
 }
 
 /// Writes the tokens (and event rows) of a chunk of leaves into their slices of the batch buffers.
@@ -837,22 +1083,36 @@ fn fill_chunk(ctx: &TokCtx, leaves: &mut [PendingLeaf], cat: &mut [i16], cont: &
     for (i, leaf) in leaves.iter_mut().enumerate() {
         let state = leaf.state.take().expect("pending leaf without a state");
         let (c, f) = (&mut cat[i * v * CAT_LEN..(i + 1) * v * CAT_LEN], &mut cont[i * v * CONT_LEN..(i + 1) * v * CONT_LEN]);
-        tokens::state_tokens_into(&state, SideReference::SideOne, ctx.reveal1, &mut c[..CAT_LEN], &mut f[..CONT_LEN]);
+        let pw = ctx.per_world.map(|w| &w[leaf.world as usize]);
+        let (r1, r2) = match pw {
+            Some(w) => (Some(w.reveal1.as_slice()), Some(w.reveal2.as_slice())),
+            None => (ctx.reveal1, ctx.reveal2),
+        };
+        let root1 = pw.map(|w| &w.hist1).unwrap_or(ctx.root_hist);
+        tokens::state_tokens_into(&state, SideReference::SideOne, r1, &mut c[..CAT_LEN], &mut f[..CONT_LEN]);
         if v == 2 {
-            tokens::state_tokens_into(&state, SideReference::SideTwo, ctx.reveal2, &mut c[CAT_LEN..], &mut f[CONT_LEN..]);
+            tokens::state_tokens_into(&state, SideReference::SideTwo, r2, &mut c[CAT_LEN..], &mut f[CONT_LEN..]);
+        }
+        if ctx.keyed {
+            leaf.key = view_key(&c[..CAT_LEN], &f[..CONT_LEN]);
         }
         if ctx.hist_mode == 0 {
             continue;
         }
+        // side two's rows: its own root history when the world has one and the leaf still shows the root's rows
+        let own2 = match pw {
+            Some(w) if ctx.hist_mode == 1 || leaf.parent.is_none() => Some(&w.hist2),
+            _ => None,
+        };
         let (hist, info) = if ctx.hist_mode == 2 {
             let summary = Summary::of(&c[..CAT_LEN], &f[..CONT_LEN]);
             let h = match &leaf.parent {
                 Some((ps, ph, own, opp)) => ph.pushed(&turn_rows(ps, &summary, *own, *opp)),
-                None => ctx.root_hist.clone(),
+                None => root1.clone(),
             };
             (h.clone(), Some(Box::new(NodeInfo { summary, hist: h })))
         } else {
-            (ctx.root_hist.clone(), None)
+            (root1.clone(), None)
         };
         leaf.info = info;
         let (hc, hf) = (
@@ -862,7 +1122,10 @@ fn fill_chunk(ctx: &TokCtx, leaves: &mut [PendingLeaf], cat: &mut [i16], cont: &
         hc[..HIST_CAT_LEN].copy_from_slice(&hist.cat);
         hf[..HIST_CONT_LEN].copy_from_slice(&hist.cont);
         if v == 2 {
-            let m = hist.mirrored();
+            let m = match own2 {
+                Some(h) => h.clone(),
+                None => hist.mirrored(),
+            };
             hc[HIST_CAT_LEN..].copy_from_slice(&m.cat);
             hf[HIST_CONT_LEN..].copy_from_slice(&m.cont);
         }
@@ -882,11 +1145,11 @@ mod tests {
     }
 
     fn opt(prior: f32, visits: u32, vloss: u32, total: f32) -> Opt {
-        Opt { choice: MoveChoice::None, slot: None, prior, visits, vloss, total }
+        Opt { choice: MoveChoice::None, slot: None, prior, visits, vloss, total, pred: 1.0 }
     }
 
     fn fake(n: usize, p1: [f32; N_ACTIONS], p2: [f32; N_ACTIONS], v: f32) -> Vec<Eval> {
-        (0..n).map(|_| Eval { policy1: p1, policy2: p2, value: v }).collect()
+        (0..n).map(|_| Eval { policy1: p1, policy2: p2, value: v, pred1: None }).collect()
     }
 
     fn run(ns: &mut NetSearch, batch: usize, rounds: usize, p1: [f32; N_ACTIONS], p2: [f32; N_ACTIONS], v: f32) {
@@ -930,8 +1193,8 @@ mod tests {
     #[test]
     fn priors_normalise_over_legal_options() {
         let mut o = vec![
-            Opt { choice: MoveChoice::None, slot: Some(0), prior: 0.0, visits: 0, vloss: 0, total: 0.0 },
-            Opt { choice: MoveChoice::None, slot: Some(9), prior: 0.0, visits: 0, vloss: 0, total: 0.0 },
+            Opt { choice: MoveChoice::None, slot: Some(0), prior: 0.0, visits: 0, vloss: 0, total: 0.0, pred: 1.0 },
+            Opt { choice: MoveChoice::None, slot: Some(9), prior: 0.0, visits: 0, vloss: 0, total: 0.0, pred: 1.0 },
         ];
         let mut pol = [0f32; N_ACTIONS];
         pol[0] = 0.2;
@@ -1273,5 +1536,222 @@ mod tests {
         let known = &b.cat[CAT_LEN + tokens::O_MON_KNOWN..CAT_LEN + tokens::O_MON_KNOWN + 12 * tokens::KNOWN_W];
         let opp_half = &known[6 * tokens::KNOWN_W..];
         assert!(opp_half[tokens::KNOWN_W..].iter().all(|&k| k == 0), "bench of ours unknown to the opponent");
+    }
+
+    fn uniform() -> [f32; N_ACTIONS] {
+        [1.0; N_ACTIONS]
+    }
+
+    /// every information set's counters are the sums of its member nodes' counters, and no virtual loss is left
+    fn check_shared(ns: &NetSearch) {
+        let mut sums: Vec<Vec<(u32, f32)>> = ns.shared.iter().map(|s| vec![(0, 0.0); s.opts.len()]).collect();
+        let mut visits = vec![0u32; ns.shared.len()];
+        for w in &ns.worlds {
+            for n in &w.nodes {
+                if n.shared == NONE {
+                    continue;
+                }
+                visits[n.shared as usize] += n.visits;
+                for (i, o) in n.s1.iter().enumerate() {
+                    assert_eq!(o.vloss, 0);
+                    sums[n.shared as usize][i].0 += o.visits;
+                    sums[n.shared as usize][i].1 += o.total;
+                }
+            }
+        }
+        for (k, sh) in ns.shared.iter().enumerate() {
+            assert_eq!(sh.visits, visits[k]);
+            for (i, o) in sh.opts.iter().enumerate() {
+                assert_eq!(o.vloss, 0);
+                assert_eq!(o.visits, sums[k][i].0);
+                assert!((o.total - sums[k][i].1).abs() < 1e-2 * (1.0 + o.total.abs()));
+            }
+        }
+    }
+
+    #[test]
+    fn worlds_that_look_the_same_share_side_one_statistics() {
+        let st = states();
+        // two worlds of one battle: they differ only in what side one cannot see (the active's item)
+        let a = st[0].clone();
+        let mut b = st[0].clone();
+        let act = b.side_two.active_index as usize;
+        let other = (act + 1) % 6;
+        let item = b.side_two.pokemon.pkmn[other].item;
+        b.side_two.pokemon.pkmn[act].item = item;
+        let rev = vec![Revealed { species: "x".into(), ..Default::default() }];
+        let p = Params { stats: 1, ..Params::default() };
+        let mut ns = NetSearch::new(vec![a.clone(), b.clone(), a, b], p.clone(), Some(rev.clone()), 31);
+        let c = ns.collect(8);
+        assert_eq!(c.n, 4);
+        assert_eq!(ns.stats.info_sets, 1, "the four roots are one information set");
+        ns.feed(&fake(4, uniform(), uniform(), 0.5)).unwrap();
+        run(&mut ns, 16, 40, uniform(), uniform(), 0.5);
+        check_shared(&ns);
+        let root = &ns.shared[ns.worlds[0].nodes[0].shared as usize];
+        let total: u32 = (0..4).map(|w| ns.root_visits(w)).sum();
+        assert_eq!(root.visits, total);
+        assert!(ns.stats.info_sets > 1 && ns.stats.info_sets < ns.stats.nodes, "interior nodes share too");
+        // different battles do not share a root
+        let mut two = NetSearch::new(vec![st[0].clone(), st[1].clone()], p, Some(rev), 32);
+        two.collect(8);
+        assert_eq!(two.stats.info_sets, 2);
+        // stats = 0 keeps no shared statistics
+        let mut off = NetSearch::new(vec![st[0].clone(); 2], Params::default(), None, 33);
+        run(&mut off, 8, 10, uniform(), uniform(), 0.5);
+        assert!(off.shared.is_empty() && off.stats.info_sets == 0);
+    }
+
+    #[test]
+    fn shared_statistics_spread_a_batch_over_our_options() {
+        // the virtual loss of one world's descent diverts the next world's
+        let st = states();
+        let p = Params { stats: 1, ..Params::default() };
+        let mut ns = NetSearch::new(vec![st[0].clone(); 6], p, Some(Vec::new()), 34);
+        let c = ns.collect(8);
+        ns.feed(&fake(c.n, uniform(), uniform(), 0.5)).unwrap();
+        let c = ns.collect(6);
+        assert_eq!(c.n, 6);
+        let picked: Vec<usize> =
+            (0..6).map(|w| ns.worlds[w].nodes[0].s1.iter().position(|o| o.vloss > 0).unwrap()).collect();
+        let mut distinct = picked.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert!(distinct.len() > 1, "six worlds, one information set: {picked:?}");
+        ns.feed(&fake(6, uniform(), uniform(), 0.5)).unwrap();
+        check_shared(&ns);
+    }
+
+    #[test]
+    fn regret_matching_weights() {
+        let p = Params { c_puct: 2.0, select: 1, ..Params::default() };
+        let opts = [opt(0.5, 10, 0, 7.0), opt(0.3, 10, 0, 4.0), opt(0.2, 0, 0, 0.0)];
+        let st = |i: usize| (opts[i].prior, opts[i].visits, opts[i].vloss, opts[i].total);
+        let w = rm_weights(3, st, 100, 0.5, &p);
+        // explore = 2 / sqrt(100) = 0.2: regret 0.2 + 0.1, 0 + 0.06, 0 + 0.04
+        assert!((w[0] - 0.3).abs() < 1e-6 && (w[1] - 0.06).abs() < 1e-6 && (w[2] - 0.04).abs() < 1e-6, "{w:?}");
+        let mut rng = StdRng::seed_from_u64(1);
+        let mut n = [0u32; 3];
+        for _ in 0..4000 {
+            n[sample(&w, &mut rng)] += 1;
+        }
+        assert!((n[0] as f32 / 4000.0 - 0.75).abs() < 0.03 && n[2] > 0, "{n:?}");
+        assert_eq!(sample(&[0.0, 0.0], &mut rng), 0);
+    }
+
+    #[test]
+    fn regret_matching_search_runs_and_is_deterministic() {
+        let st = states();
+        let p = Params { stats: 1, select: 1, ..Params::default() };
+        let go = |seed: u64| {
+            let mut ns = NetSearch::new(vec![st[2].clone(); 4], p.clone(), Some(Vec::new()), seed);
+            run(&mut ns, 16, 40, uniform(), uniform(), 0.4);
+            check_shared(&ns);
+            assert!(ns.stats.evals > 200);
+            (0..4).map(|w| ns.root(w).0.iter().map(|r| r.1).collect::<Vec<u32>>()).collect::<Vec<_>>()
+        };
+        assert_eq!(go(5), go(5));
+        assert_ne!(go(5), go(6));
+    }
+
+    #[test]
+    fn opponent_search_is_cut_after_an_unexpected_action() {
+        let st = states();
+        let p = Params { cut: 0.65, ..Params::default() };
+        let feed_all = |ns: &mut NetSearch, pred: Option<[f32; N_ACTIONS]>| {
+            for _ in 0..30 {
+                let c = ns.collect(16);
+                if c.n == 0 {
+                    break;
+                }
+                let ev: Vec<Eval> =
+                    (0..c.n).map(|_| Eval { policy1: uniform(), policy2: uniform(), value: 0.5, pred1: pred }).collect();
+                ns.feed(&ev).unwrap();
+            }
+        };
+        // nothing fed, the opponent sees our whole team: nothing is unexpected
+        let mut none = NetSearch::new(vec![st[0].clone()], p.clone(), None, 41);
+        feed_all(&mut none, None);
+        assert_eq!(none.stats.cut_nodes, 0);
+        // a uniform prediction over several options is below 0.65 for each: everything below the root is cut
+        let mut all = NetSearch::new(vec![st[0].clone()], p.clone(), None, 41);
+        feed_all(&mut all, Some(uniform()));
+        assert!(all.stats.cut_nodes > 0);
+        let w = &all.worlds[0];
+        assert!(!w.nodes[0].cut);
+        if w.nodes[0].s1.len() > 1 {
+            assert!(w.nodes.iter().skip(1).all(|n| n.cut));
+        }
+        // the opponent has seen none of our bench: only switches are unexpected
+        let mut sw = NetSearch::new(vec![st[0].clone()], p, None, 41);
+        sw.set_reveal2(Some(Vec::new()));
+        feed_all(&mut sw, None);
+        let w = &sw.worlds[0];
+        let root = &w.nodes[0];
+        for (i, o) in root.s1.iter().enumerate() {
+            for a2 in 0..root.s2.len() {
+                if let Some(outs) = &root.chance[i * root.s2.len() + a2] {
+                    let is_switch = matches!(o.choice, MoveChoice::Switch(_));
+                    assert!(outs.iter().all(|x| w.nodes[x.child as usize].cut == is_switch));
+                }
+            }
+        }
+        assert!(sw.stats.cut_nodes > 0);
+    }
+
+    /// Self-play of the selection rule on a one-shot matrix game (side one's payoff, in [0, 1]): each side's
+    /// visit shares and how much a best response gains against them (0 at an equilibrium).
+    fn matrix_selfplay(pay: &[&[f32]], p: &Params, iters: u32, seed: u64) -> (Vec<f32>, Vec<f32>, f32) {
+        let (k1, k2) = (pay.len(), pay[0].len());
+        let mut s1 = vec![(0u32, 0.0f64); k1];
+        let mut s2 = vec![(0u32, 0.0f64); k2];
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut total = 0.0f64;
+        for n in 0..iters {
+            let mean = if n > 0 { (total / n as f64) as f32 } else { 0.5 };
+            let a1 = select_by(k1, |i| (1.0 / k1 as f32, s1[i].0, 0, s1[i].1 as f32), n, mean, p, &mut rng);
+            let a2 = select_by(k2, |i| (1.0 / k2 as f32, s2[i].0, 0, s2[i].1 as f32), n, 1.0 - mean, p, &mut rng);
+            let v = pay[a1][a2] as f64;
+            total += v;
+            s1[a1].0 += 1;
+            s1[a1].1 += v;
+            s2[a2].0 += 1;
+            s2[a2].1 += 1.0 - v;
+        }
+        let x1: Vec<f32> = s1.iter().map(|s| s.0 as f32 / iters as f32).collect();
+        let x2: Vec<f32> = s2.iter().map(|s| s.0 as f32 / iters as f32).collect();
+        let best1 = (0..k1).map(|a| (0..k2).map(|b| pay[a][b] * x2[b]).sum::<f32>()).fold(f32::MIN, f32::max);
+        let best2 = (0..k2).map(|b| (0..k1).map(|a| pay[a][b] * x1[a]).sum::<f32>()).fold(f32::MAX, f32::min);
+        (x1, x2, best1 - best2)
+    }
+
+    /// Not an assertion: prints how each selection rule behaves on two matrix games with a known mixed answer.
+    /// `cargo test --lib matrix_game_report -- --nocapture --ignored`
+    #[test]
+    #[ignore]
+    fn matrix_game_report() {
+        // asymmetric matching pennies: equilibrium (1/3, 2/3) for both sides, value 1/3
+        let pennies: [&[f32]; 2] = [&[1.0, 0.0], &[0.0, 0.5]];
+        // rock-paper-scissors where rock beating scissors pays double (0.5 = draw): equilibrium (1/4, 1/2, 1/4)
+        let rps: [&[f32]; 3] = [&[0.5, 0.25, 1.0], &[0.75, 0.5, 0.25], &[0.0, 0.75, 0.5]];
+        // one option dominates: the answer is pure (option 0 for side one)
+        let pure: [&[f32]; 3] = [&[0.7, 0.6, 0.65], &[0.5, 0.4, 0.6], &[0.3, 0.55, 0.2]];
+        for (name, g) in [("pennies", &pennies[..]), ("rps2", &rps[..]), ("pure", &pure[..])] {
+            for select in [0u8, 1] {
+                for c in [0.5f32, 1.0, 2.0, 4.0] {
+                    for iters in [100u32, 1000, 10000, 100000] {
+                        let p = Params { c_puct: c, select, ..Params::default() };
+                        let mut gap = 0.0;
+                        let mut x = (Vec::new(), Vec::new());
+                        for seed in 0..8 {
+                            let (x1, x2, g1) = matrix_selfplay(g, &p, iters, seed);
+                            gap += g1 / 8.0;
+                            x = (x1, x2);
+                        }
+                        println!("{name} select={select} c={c} n={iters} gap={gap:.3} x1={:.2?} x2={:.2?}", x.0, x.1);
+                    }
+                }
+            }
+        }
     }
 }

@@ -244,3 +244,97 @@ python -m showdown_bot.league --bots "cand=NEW,base=net-search:model=models\tok-
 python -m showdown_bot.league --bots "cand=NEW,best=search-net:scale=1.5:c_puct=2:prior=models\prior-gen56-h32.ppol:mode=argmax:time_ms=1000:worlds=4:evaluator=models\gen7-res-root-mlp16.pev" --sprt 0,21 --search-workers 18 --game-timeout 3600 --concurrency 1 --out data/league/sprt-ns25-vs-best --seed 1
 ```
 (substitute the NEW spec text for `NEW`.)
+
+## Level one: information-set statistics, regret matching, opponent cut-off (engine sdb.31, bead 589.68.8)
+
+### Why the first version kept one tree per world
+
+The sdb.24 search was written from a second-hand description of Jaxcalibur ("pUCT, 4 plies, 20,480 rollouts,
+32 worlds"). That description does not say how statistics are stored, so the search reused what the CPU MCTS
+(`mcts.rs`) already did: one tree per sampled world, root visits summed in Python (PIMC). It was also the simplest
+design to batch, test and compare with the CPU search. The author's own write-up (jaxcalibur.github.io, read
+2026-11-12) describes something different:
+
+* statistics live in a table keyed by a hash of the state; at nodes where the bot acts the hash covers only what
+  the bot has seen of the opponent (HP in 10 buckets), so all worlds share one set of statistics per information set;
+  at the opponent's nodes the hash also covers the world;
+* an edge is sampled with weight `max(Q(s,a) - V(s), 0) + c_puct / sqrt(N(s)) * P(s,a)` (regret matching), not
+  chosen by the PUCT argmax;
+* the opponent's search stops below a "surprising" action of the bot (a switch to an unrevealed Pokemon, or a move
+  its view predicted below 65%); from there it plays its prior.
+
+One tree per world has two known costs. Each of the 32 trees sees 1/32 of the budget (312 evaluations at 10k), so
+deep statistics are thin. And each tree picks our action knowing that world's hidden sets, the "strategy fusion"
+error of PIMC: plans that depend on knowing the set look better than they are.
+
+### What sdb.31 adds (all off by default; with all three off the search is bit-identical to sdb.30)
+
+| Key | Values | Effect |
+| --- | --- | --- |
+| `stats` | 0, 1 | 1: side one selects with statistics shared by every node, in any world, at the same depth whose side-one view is the same information set. The key (`view_key`) hashes the scrubbed side-one tokens the net sees, continuous values in tenths (HP in 10 buckets), plus depth and legal slots. Side two keeps per-node (per-world) statistics. |
+| `select` | 0, 1 | 1: both sides sample an option with weight `max(Q - V, 0) + c_puct * P / sqrt(N)`; an untried option has no regret, a virtual loss counts as a visit that scored 0. |
+| `cut` | 0..1 | > 0: below an action of ours that side two could not expect (a switch to a Pokemon missing from `reveal2`, or an action its view predicted below `cut`), side two samples its prior and no longer searches. The prediction is the `opp_slot` head of side two's view (`feed(..., pred1)`), so it needs `views=2`. |
+
+Per-node counters are still kept, so `root()`, `root_arrays()` and the Python aggregation are unchanged: the
+per-world root visits add up to the shared root's visits. `stats()` reports `info_sets` and `cut_nodes`.
+
+Differences from the write-up, to keep in mind when reading results: nodes are joined only at the same depth; the
+key is the token view the net gets (so a Pokemon revealed inside the tree but not at the root stays hidden, as in
+"Limitations"); chance outcomes stay per world; the write-up's "surprising" rule is read from one sentence and may
+differ in detail.
+
+### First numbers (40 recorded decisions, 4,000 evaluations, ppo7 u3000 net, GPU shared with other jobs)
+
+| stats / select / cut | nodes | information sets | cut nodes | top-1 vs recorded search |
+| --- | --- | --- | --- | --- |
+| 0 / 0 / 0 (sdb.30) | 7,186 | 0 | 0 | 0.575 |
+| 1 / 0 / 0 | 7,248 | 330 | 0 | 0.550 |
+| 1 / 1 / 0 | 7,333 | 427 | 0 | 0.575 |
+| 1 / 1 / 0.65 | 7,354 | 426 | 7,246 | 0.575 |
+
+This is a smoke test, not a strength test (n = 40; one decision is 2.5 points). Two things it does show: sharing
+is heavy (a few hundred information sets for about 7,000 nodes), and `cut=0.65` cuts almost every node below the
+root, because side two's view rarely gives any action of ours 65%.
+
+### Tests
+
+Rust (`cargo test --release --lib netsearch`, 23 pass): worlds that differ only in hidden opponent facts share one
+root; different battles do not; shared counters equal the sums of their member nodes and no virtual loss is left;
+regret-matching weights and sampling; determinism per seed; cut nodes after an unseen switch or a low prediction.
+
+Strength (`runs/l1_chain.sh`, local server, both sides 10,000 evaluations, 200 games each, SPRT 0 / +21):
+`l1s` (stats=1), `l1r` (stats=1, select=1), `l1c` (stats=1, select=1, cut=0.65), each against the sdb.30 search.
+Results (2026-11-12; both arms stopped short of 200 games when the local server was shut down by a low-memory
+guard; no SPRT verdict):
+
+| arm | games | score | Elo (95%) | LLR |
+| --- | --- | --- | --- | --- |
+| `l1s` stats=1 | 173 | 100-73 | +57.1 [+12.0, +104.2] | 1.87 |
+| `l1r` stats=1:select=1 | 155 | 85-70 | +31.7 [-20.3, +85.1] | 0.63 |
+
+Different seeds, so different team draws: the gap between the arms is not evidence by itself. The intervals were
+looked at many times during the runs. `l1c` (cut) was not played.
+
+Regret-matching checks: `matrix_game_report` (netsearch.rs, ignored test) shows select=1 reaching the mixed
+equilibrium of two matrix games where PUCT does not (gap at 10,000 visits, c_puct 2: 0.020 v 0.086 and 0.016 v
+0.167) but concentrating more slowly on a pure answer (76% v 91% on the best option); c_puct 0.5 was better for it
+in all three from 1,000 visits. Offline (`runs/rm_checks.sh`, 300 decisions, 4,000 evals, stats=1): top-1 0.553
+(select=0, c 2), 0.557 (select=1, c 2), 0.557 (select=1, c 1); the c 0.5 and 16,000-eval runs did not complete.
+
+Decision: stats=1 adopted for net-search (probable gain of a few tens of Elo); select and cut stay off. Not yet
+tested against gen7 (net-search was -157 before).
+
+### Cut-off threshold sweep (`runs/cut_sweep.sh`, 100 recorded decisions, 4,000 evaluations, stats=1, select=1)
+
+| cut | nodes | cut nodes | share cut | top-1 vs recorded search |
+| --- | --- | --- | --- | --- |
+| 0.65 | 7,361 | 7,227 | 98% | 0.56 |
+| 0.4 | 7,362 | 6,989 | 95% | 0.56 |
+| 0.2 | 7,356 | 5,652 | 77% | 0.56 |
+| 0.1 | 7,351 | 4,216 | 57% | 0.56 |
+| 0.05 | 7,352 | 3,391 | 46% | 0.56 |
+| 0.02 | 7,360 | 2,631 | 36% | 0.56 |
+
+Raw policy top-1 is 0.55. The summary numbers are the same at every threshold, so this measure cannot pick one;
+a cut node passes its flag to everything below it, which is why even 0.02 cuts a third of the tree. The `l1c` arm
+keeps 0.65 (the write-up's figure); a lower value such as 0.2 is a follow-up only if `l1c` loses to `l1r`.

@@ -66,12 +66,102 @@ def _parser() -> argparse.ArgumentParser:
                         "(default: the player's own pool, 1 worker = worlds one after another)")
     p.add_argument("--save-replays", action="store_true",
                    help="ask the server to save each replay (/savereplay); default off")
+    p.add_argument("--timer-after", type=bench._positive_seconds, default=None, metavar="SEC",
+                   help="turn the battle timer on this many seconds into each game (default: never)")
+    p.add_argument("--block-bots", action="store_true",
+                   help="send /blockbots before each search: opt out of being matched with registered ladder bots "
+                        "(games against them are not saved to a non-bot account's rating)")
+    p.add_argument("--avoid", default="", metavar="USER[,USER]",
+                   help="search only while each of these accounts cannot be matched with us: offline, in a battle, or "
+                        "our own last opponent with no battle since (the server never rematches the previous opponent). "
+                        "Read from a separate guest connection; the search is cancelled when one comes free. "
+                        "One game at a time only")
+    p.add_argument("--avoid-max-wait", type=bench._positive_seconds, default=180,
+                   help="search anyway after waiting this long for the --avoid accounts")
+    p.add_argument("--forfeit-avoided", action="store_true",
+                   help="forfeit at once a ladder battle whose opponent is one of the --avoid accounts")
     p.add_argument("--env-file", type=Path, default=REPO / ".env")
     p.add_argument("--game-timeout", type=bench._positive_seconds, default=1800,
                    help="forfeit a battle still running after this many seconds (last resort)")
     p.add_argument("--connect-timeout", type=bench._positive_seconds, default=30)
     p.add_argument("--max-reconnects", type=int, default=5)
     return p
+
+
+def _uid(name):
+    return "".join(c for c in str(name).lower() if c.isalnum())
+
+
+class AvoidWatch:
+    """Guest connection asking the public server which --avoid accounts could be matched with us right now."""
+
+    def __init__(self, users):
+        self.users = [u for u in users if u]
+        self.ws = None
+        self.lock = asyncio.Lock()
+        self.safe = {}  # account id -> time we finished a game against it (it cannot be rematched until it plays another)
+
+    def mark_played(self, name):
+        # seen on the ladder 2026-11-23: after one game against someone else the avoided account is matched with us again
+        self.safe.clear()
+        for u in self.users:
+            if _uid(u) == _uid(name):
+                self.safe[_uid(u)] = time.monotonic()
+                print(f"avoid: {u} was our last opponent, no rematch before our next game against someone else", flush=True)
+
+    async def free(self):
+        """Avoided accounts that are online, in no (public) battle and not rematch-blocked; [] when the check fails."""
+        import websockets
+        out = []
+        async with self.lock:
+            try:
+                if self.ws is None:
+                    self.ws = await websockets.connect("wss://sim3.psim.us/showdown/websocket",
+                                                       user_agent_header="showdown-bot-setup")
+                for u in self.users:
+                    await self.ws.send(f"|/cmd userdetails {u}")
+                    for _ in range(60):
+                        m = str(await asyncio.wait_for(self.ws.recv(), 10))
+                        if m.startswith("|queryresponse|userdetails|"):
+                            rooms = json.loads(m.split("|", 3)[3]).get("rooms")
+                            if isinstance(rooms, dict):
+                                if any("battle-" in k for k in rooms):
+                                    # it is playing someone: the rematch block ends (skip our own game's lingering room)
+                                    if time.monotonic() - self.safe.get(_uid(u), -1e9) > 30:
+                                        self.safe.pop(_uid(u), None)
+                                elif _uid(u) not in self.safe:
+                                    out.append(u)
+                            break
+            except Exception:
+                logger.warning("avoid check failed", exc_info=True)
+                try:
+                    if self.ws is not None:
+                        await self.ws.close()
+                except Exception:
+                    pass
+                self.ws = None
+                return []
+        return out
+
+    async def run(self):
+        """Keep watching between searches too, so a battle an avoided account plays during our own game is seen."""
+        while True:
+            await asyncio.sleep(6)
+            await self.free()
+
+    async def wait_busy(self, max_wait):
+        t0 = time.monotonic(); said = False
+        while time.monotonic() - t0 < max_wait:
+            f = await self.free()
+            if not f:
+                if said:
+                    print(f"avoid: clear after {time.monotonic() - t0:.0f}s", flush=True)
+                return True
+            if not said:
+                print(f"avoid: waiting, free to match: {','.join(f)}", flush=True); said = True
+            await asyncio.sleep(3)
+        print(f"avoid: still free after {max_wait:.0f}s, searching anyway", flush=True)
+        return False
 
 
 class Run:
@@ -87,7 +177,10 @@ class Run:
         self.challenge_events: list[dict] = []
         if args.accept_challenges:
             allow = [u for u in (args.allow or "").split(",") if u.strip()] or None
-            self.policy = ladder.ChallengePolicy("gen9randombattle", allow)
+            self.policy = ladder.ChallengePolicy(
+                "gen9randombattle", allow, max_games=args.max_concurrent,
+                busy_message=(f"I'm a bot and I'm at my limit of {args.max_concurrent} games right now. "
+                              "Please challenge me again in a few minutes.") if args.max_concurrent > 1 else None)
         if args.dry_run:
             self.server = LocalhostServerConfiguration
         else:
@@ -146,7 +239,7 @@ class Run:
             cls = ladder_ab.with_arm_switch(cls, self.controller)
         cls = ladder.with_ladder_hooks(
             cls, move_cap_s=self.args.move_cap, on_finish=self.on_finish, on_rating=self.on_rating,
-            save_server_replay=self.args.save_replays,
+            save_server_replay=self.args.save_replays, timer_after_s=self.args.timer_after,
         )
         if self.policy is not None:
             cls = ladder.with_challenge_policy(cls, self.policy, self.on_challenge)
@@ -228,18 +321,22 @@ class Run:
                   + (f" from {', '.join(sorted(self.policy.allow))}" if self.policy.allow else "")
                   + "; Ctrl-C to stop", flush=True)
             reconnects = 0
-            busy_since = None
+            since: dict[str, float] = {}  # battle tag -> when we first saw it running
             while len(self.games) < args.games:
                 await asyncio.sleep(1.0)
                 running = await self.unfinished(player)
+                now = time.monotonic()
+                since = {t: since.get(t, now) for t in running}
                 if running:
-                    busy_since = busy_since or time.monotonic()
                     self.policy.touch()  # a running battle is not idle
-                    if time.monotonic() - busy_since > args.game_timeout:
-                        await self.forfeit(player)
-                        busy_since = None
-                else:
-                    busy_since = None
+                    for t, t0 in since.items():
+                        if now - t0 > args.game_timeout:  # only the battle that ran too long, not the others
+                            print(f"WARNING: forfeiting {t} (over the game timeout)", flush=True)
+                            try:
+                                await player.ps_client.send_message("/forfeit", t)
+                            except Exception:
+                                logger.exception("forfeit failed for %s", t)
+                            since[t] = now
                 if (args.idle_timeout is not None and not running
                         and self.policy.idle_seconds() > args.idle_timeout * 60):
                     print(f"idle for {args.idle_timeout:g} min without challenges: stopping",
@@ -281,6 +378,15 @@ class Run:
             )
             await bench._wait_for_player_logins([opponent], args.connect_timeout)
             opp_task = asyncio.create_task(opponent.ladder(args.games + 2))
+            self._dry_extra = []  # one more local opponent per extra simultaneous game (--max-concurrent)
+            for _ in range(args.max_concurrent - 1):
+                o2 = cls(
+                    battle_format="gen9randombattle", max_concurrent_battles=1,
+                    account_configuration=AccountConfiguration("ldo" + secrets.token_hex(4), None),
+                    server_configuration=LocalhostServerConfiguration, log_level=logging.ERROR,
+                )
+                await bench._wait_for_player_logins([o2], args.connect_timeout)
+                self._dry_extra.append((o2, asyncio.create_task(o2.ladder(args.games + 2))))
         try:
             await bench._wait_for_player_logins([player], args.connect_timeout)
             print(f"Logged in as {player.username} on "
@@ -288,6 +394,10 @@ class Run:
                   f"bot {self.spec.label if not self.arms else 'A/B ' + ' vs '.join(self.controller.arms)}"
                   f"; move cap {args.move_cap:g}s", flush=True)
             reconnects = 0
+            watch = AvoidWatch(args.avoid.split(",")) if args.avoid and args.max_concurrent == 1 else None
+            watch_task = asyncio.create_task(watch.run()) if watch is not None else None
+            avoid_ids = {_uid(u) for u in args.avoid.split(",") if u}
+            forfeited: set = set()
             while len(self.games) < args.games:
                 remaining = args.games - len(self.games)
                 chunk = 1 if args.max_concurrent == 1 else remaining
@@ -295,11 +405,68 @@ class Run:
                     # arm of the next battle, fixed before the search starts
                     # (kept across a reconnect until a battle actually uses it)
                     self.controller.prepare_next()
+                if args.block_bots:
+                    # the server answers with a harmless error when the account is already opted out
+                    for _ in range(120):
+                        if player.ps_client.logged_in.is_set():
+                            break
+                        await asyncio.sleep(0.5)
+                    try:
+                        await player.ps_client.send_message("/blockbots")
+                    except Exception:
+                        logger.exception("could not send /blockbots")
+                if watch is not None:
+                    for _ in range(120):
+                        if player.ps_client.logged_in.is_set():
+                            break
+                        await asyncio.sleep(0.5)
+                    await watch.wait_busy(args.avoid_max_wait)
+                if args.max_concurrent == 1:
+                    # one game at a time: a battle the server handed back after a reconnect (or any other still
+                    # running) is finished before the next search, so two never overlap
+                    if not forfeited and not self.games:
+                        await asyncio.sleep(5.0)  # let the server re-send rooms of running battles after login
+                    said_wait = False
+                    while await self.unfinished(player):
+                        if not said_wait:
+                            print("waiting for a battle already in progress before searching", flush=True)
+                            said_wait = True
+                        await asyncio.sleep(1.0)
+                tags_before = set(player.battles)
                 task = asyncio.create_task(player.ladder(chunk))
                 deadline = time.monotonic() + args.game_timeout * chunk
                 reason = None
+                tick = 0; forced = False
                 while not task.done():
                     await asyncio.sleep(1.0)
+                    tick += 1
+                    if args.forfeit_avoided and args.avoid:
+                        for tag, b in list(player.battles.items()):
+                            if tag in tags_before or tag in forfeited or getattr(b, "finished", False):
+                                continue
+                            if _uid(getattr(b, "opponent_username", None) or "") in avoid_ids:
+                                forfeited.add(tag)
+                                print(f"avoid: forfeiting {tag} against {b.opponent_username}", flush=True)
+                                try:
+                                    await player.ps_client.send_message("/forfeit", tag)
+                                except Exception:
+                                    logger.exception("avoid: forfeit failed for %s", tag)
+                    if watch is not None and not forced and tick % 3 == 0 and set(player.battles) == tags_before:
+                        f = await watch.free()
+                        if f and set(player.battles) == tags_before:
+                            try:
+                                await player.ps_client.send_message("/cancelsearch")
+                                print(f"avoid: search cancelled, {','.join(f)} came free", flush=True)
+                                forced = not await watch.wait_busy(args.avoid_max_wait)
+                                if set(player.battles) == tags_before:
+                                    await player.ps_client.search_ladder_game(player._format, player.next_team)
+                                    deadline = time.monotonic() + args.game_timeout * chunk
+                            except Exception:
+                                logger.exception("avoid: cancel/re-search failed")
+                if watch is not None:
+                    for tag, b in player.battles.items():
+                        if tag not in tags_before:
+                            watch.mark_played(getattr(b, "opponent_username", None) or "")
                     self.watchdog(player)
                     if self.disconnected(player):
                         reason = "disconnect"

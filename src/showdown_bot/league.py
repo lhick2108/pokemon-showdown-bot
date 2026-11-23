@@ -92,10 +92,10 @@ EXPLOIT_KEYS = {"opp_model": str, "opp_elo": str, "exploit_delta": float, "explo
 # --search-workers, the bot gets its own pool of that size on that engine)
 ENGINE_KEYS = {"engine": str}
 PRIOR_KEYS = {"prior": str, "prior_opp": str, "c_puct": float, "prior_eps": float, "fpu": float,
-              "prior_human": str, "tok_prior": str, "tok_device": str}
+              "prior_human": str, "tok_prior": str, "tok_device": str, "tok_hist": int, "tok_blend": float}
 PRIOR_FIELDS = {"prior": "prior", "prior_opp": "prior_opp", "c_puct": "c_puct",
                 "prior_eps": "prior_eps", "fpu": "prior_fpu", "prior_human": "prior_human",
-                "tok_prior": "tok_prior", "tok_device": "tok_device"}
+                "tok_prior": "tok_prior", "tok_device": "tok_device", "tok_hist": "tok_hist", "tok_blend": "tok_blend"}
 
 HUMAN_BLEND_KEYS = {"model": str, "w": float, "pick": str, "blend": str, "temp": float, "elo": str}
 
@@ -105,13 +105,20 @@ SPEC_KEYS = {
     # a no-search bot that plays the token transformer's policy head (players.tokenpolicy):
     # argmax unless temp (or pick=sample) is given
     "token-policy": {"model": str, "device": str, "temp": float, "pick": str, "hist": int},
+    # policy-rollout search with a KL anchor (players.rolloutsearch, engine sdb.34+): pick sample|argmax, opp = the
+    # opponent's first reply enumerated over its k most likely actions
+    "rollout-search": {"model": str, "device": str, "worlds": int, "depth": int, "cands": int, "minp": float,
+                       "beta": float, "alpha": float, "opp": int, "pick": str, "rtemp": float, "oppmin": float,
+                       "oppmodel": str, "oppshare": float, "opptemp": float, "tokthreads": int},
     # Jaxcalibur-style net-guided search with the token transformer (players.netsearch, docs/net-search.md)
     "net-search": {"model": str, "device": str, "worlds": int, "time_ms": int, "max_evals": int,
                    "batch": int, "c_puct": float, "depth": int, "fpu": float, "vavg": int,
                    "scrub": int, "pipe": int, "views": int, "mode": str,
                    # 589.68.7: fast forward (CUDA graphs, token compaction), live history rows (1 root / 2 tree),
                    # side-two scrub to what the opponent knows of our team, tokenisation threads
-                   "fast": int, "fp16res": int, "hist": int, "scrub2": int, "tokthreads": int},
+                   "fast": int, "fp16res": int, "hist": int, "scrub2": int, "tokthreads": int,
+                   # sdb.31: shared information-set statistics, regret-matching selection, opponent-search cut-off
+                   "stats": int, "select": int, "cut": float},
     "search": {"evaluator": str, "scale": float, "time_ms": int, "worlds": int,
                "selection": str, "gamma": float, "mode": str,
                "tendency": str, "tkappa": float, "tdelta": float,
@@ -252,7 +259,9 @@ def parse_spec(text: str) -> BotSpec:
                 raise ValueError(f"{key} must be >= 1 in bot spec {raw!r}")
             if key == "views" and parsed not in (1, 2):
                 raise ValueError(f"views must be 1 or 2 in bot spec {raw!r}")
-            if key in ("vavg", "scrub", "fast", "fp16res", "scrub2") and parsed not in (0, 1):
+            if key == "cut" and not 0.0 <= parsed <= 1.0:
+                raise ValueError(f"cut must be in [0, 1] in bot spec {raw!r}")
+            if key in ("vavg", "scrub", "fast", "fp16res", "scrub2", "stats", "select") and parsed not in (0, 1):
                 raise ValueError(f"{key} must be 0 or 1 in bot spec {raw!r}")
             if key == "hist" and parsed not in ((0, 1, 2) if type_name == "net-search" else (0, 1)):
                 raise ValueError(f"hist must be {'0, 1 or 2' if type_name == 'net-search' else '0 or 1'} in bot spec {raw!r}")
@@ -319,6 +328,8 @@ def parse_spec(text: str) -> BotSpec:
                 parsed = parsed.lower()
             params.append((key, parsed.lower() if key in ("selection", "mode", "tendency", "endgame", "pick", "blend") else parsed))
     keys = dict(params)
+    if type_name == "rollout-search" and "model" not in keys:
+        raise ValueError(f"rollout-search spec {raw!r} needs model=<token net .pt>")
     if type_name != "net-search" and "prior" not in keys and "tok_prior" not in keys and any(
             k in keys for k in ("prior_opp", "c_puct", "prior_eps", "fpu", "prior_human")):
         raise ValueError(f"prior_opp / c_puct / prior_eps / fpu / prior_human need prior=<path.ppol> "
@@ -953,10 +964,18 @@ def _make_player(spec: BotSpec, cfg: LeagueConfig, recorder, concurrency: int, s
             if spec.param(key) is not None:
                 kwargs[key] = spec.param(key)
         kwargs["seed"] = cfg.seed * 1000 + salt
+    if spec.type == "rollout-search":
+        kwargs["model"] = spec.param("model")
+        for key in ("device", "worlds", "depth", "cands", "minp", "beta", "alpha", "opp", "pick", "tokthreads",
+                    "rtemp", "oppmin", "oppmodel", "oppshare", "opptemp"):
+            if spec.param(key) is not None:
+                kwargs[key] = spec.param(key)
+        kwargs["seed"] = cfg.seed * 1000 + salt
     if spec.type == "net-search":
         kwargs["model"] = spec.param("model")
         for key in ("device", "worlds", "time_ms", "max_evals", "batch", "c_puct", "depth", "fpu",
-                    "vavg", "scrub", "pipe", "views", "mode", "fast", "fp16res", "hist", "scrub2", "tokthreads"):
+                    "vavg", "scrub", "pipe", "views", "mode", "fast", "fp16res", "hist", "scrub2", "tokthreads",
+                    "stats", "select", "cut"):
             if spec.param(key) is not None:
                 kwargs[key] = spec.param(key)
         kwargs["seed"] = cfg.seed * 1000 + salt
@@ -1521,7 +1540,7 @@ def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     p.add_argument("--bots", help="comma-separated label=type[:key=value...] or plain type. Types: "
                    + ", ".join(sorted(bench.PLAYER_REGISTRY)) + ", foulplay. search keys: "
-                   "evaluator, scale, time_ms, worlds, selection (ucb1|exp3|rm), gamma, mode (mixed|argmax|nash|bayes), npc (matrix pseudocount), bargmax (0|1, bayes picks its best move), tendency (on|off), tkappa, tdelta, endgame (off|safest|nash), eg_alive, eg_side, eg_ms, eg_worlds, eg_cap, opp_model, opp_elo, exploit_delta, exploit_weight, exploit_kappa, exploit_gain (docs/human-policy.md), prior, prior_opp (self|none|human|path), c_puct, prior_eps, fpu, prior_human (docs/policy-prior.md). human keys: model, pick (sample|argmax), temp, elo. token-policy keys: model, device (auto|cpu|cuda), temp, pick, hist (0|1: live history rows); net-search keys: model, device, worlds, time_ms, max_evals, batch, c_puct, depth, fpu, vavg (0|1), scrub (0|1), pipe, views (1|2), mode (argmax|mixed), fast (0|1), fp16res (0|1), hist (0|1|2), scrub2 (0|1), tokthreads (1-4) (docs/net-search.md); search bots also take tok_prior=<token net .pt>, tok_device (docs/token-net.md). humansearch: search keys + model, w (human weight 0..1), pick, blend (geo|mix), temp, elo. e.g. net=search-net:evaluator=m.pev:scale=4:endgame=safest:eg_alive=5:eg_ms=1500")
+                   "evaluator, scale, time_ms, worlds, selection (ucb1|exp3|rm), gamma, mode (mixed|argmax|nash|bayes), npc (matrix pseudocount), bargmax (0|1, bayes picks its best move), tendency (on|off), tkappa, tdelta, endgame (off|safest|nash), eg_alive, eg_side, eg_ms, eg_worlds, eg_cap, opp_model, opp_elo, exploit_delta, exploit_weight, exploit_kappa, exploit_gain (docs/human-policy.md), prior, prior_opp (self|none|human|path), c_puct, prior_eps, fpu, prior_human (docs/policy-prior.md). human keys: model, pick (sample|argmax), temp, elo. token-policy keys: model, device (auto|cpu|cuda), temp, pick, hist (0|1: live history rows); net-search keys: model, device, worlds, time_ms, max_evals, batch, c_puct, depth, fpu, vavg (0|1), scrub (0|1), pipe, views (1|2), mode (argmax|mixed), fast (0|1), fp16res (0|1), hist (0|1|2), scrub2 (0|1), tokthreads (1-4), stats (0|1), select (0|1), cut (0..1) (docs/net-search.md); search bots also take tok_prior=<token net .pt>, tok_device (docs/token-net.md). humansearch: search keys + model, w (human weight 0..1), pick, blend (geo|mix), temp, elo. e.g. net=search-net:evaluator=m.pev:scale=4:endgame=safest:eg_alive=5:eg_ms=1500")
     p.add_argument("--games-per-pair", type=bench._positive_int, default=20)
     p.add_argument("--out", type=Path, help="output dir, e.g. data/league/<run-id>")
     p.add_argument("--rate-only", type=Path, metavar="DIR", help="recompute results from DIR/games.jsonl")
