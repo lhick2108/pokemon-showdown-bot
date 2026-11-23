@@ -53,7 +53,8 @@ def is_val(tag: str, val_frac: float, seed: int) -> bool:
 
 def load_file(args: tuple[str, int, int, int, int]) -> dict[str, Any] | None:
     """Samples of one recording: features (float16), 13-slot visits and legal mask."""
-    path, feat_ver, max_dec, min_visits, seed = args
+    path, feat_ver, max_dec, min_visits, seed = args[:5]
+    human = len(args) > 5 and args[5]
     import poke_engine
     from poke_engine import State
 
@@ -63,7 +64,18 @@ def load_file(args: tuple[str, int, int, int, int]) -> dict[str, Any] | None:
         game = recorder.read_game(path)
     except Exception:
         return None
-    decisions = [d for d in game["decisions"] if d.get("worlds")]
+    if human:
+        # human replay records (docs/human-replays.md): no search; the target is the action the
+        # player chose, one-hot on the hindsight truth state (one pseudo-world per decision)
+        decisions = []
+        for d in game["decisions"]:
+            state = (d.get("truth") or {}).get("state")
+            if state and d.get("chosen") and d.get("action_legal", True) is not False:
+                decisions.append({"worlds": [{"state": state, "total_visits": min_visits,
+                                              "moves": [{"choice": d["chosen"], "visits": 1},
+                                                        {"choice": d["chosen"], "visits": 0}]}]})
+    else:
+        decisions = [d for d in game["decisions"] if d.get("worlds")]
     rng = random.Random(f"{seed}:{path}")
     if max_dec and len(decisions) > max_dec:
         decisions = rng.sample(decisions, max_dec)
@@ -103,8 +115,9 @@ def load_file(args: tuple[str, int, int, int, int]) -> dict[str, Any] | None:
             "states": states}
 
 
-def build(paths: list[Path], feat_ver: int, max_dec: int, min_visits: int, seed: int, workers: int):
-    jobs = [(str(p), feat_ver, max_dec, min_visits, seed) for p in paths]
+def build(paths: list[Path], feat_ver: int, max_dec: int, min_visits: int, seed: int, workers: int,
+          human: bool = False):
+    jobs = [(str(p), feat_ver, max_dec, min_visits, seed, human) for p in paths]
     out = []
     with ProcessPoolExecutor(workers) as ex:
         for i, r in enumerate(ex.map(load_file, jobs, chunksize=8)):
@@ -189,6 +202,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--patience", type=int, default=6)
+    ap.add_argument("--human", action="store_true",
+                    help="human replay records: target = the chosen action (one-hot), state = truth")
+    ap.add_argument("--seat-file", default=None,
+                    help="JSON {battle_id: 'p1'|'p2'}: keep only that seat's record of each listed game "
+                         "(player-style priors); games not listed are dropped")
+    ap.add_argument("--init", default=None, help="warm-start from a .pt state dict saved by an earlier run")
     args = ap.parse_args(argv)
 
     import torch
@@ -196,7 +215,12 @@ def main(argv: list[str] | None = None) -> int:
     t0 = time.time()
     files: list[Path] = []
     for d in args.data:
-        files += sorted(Path(d).glob("*.jsonl.gz"))
+        files += sorted(Path(d).rglob("*.jsonl.gz") if args.human else Path(d).glob("*.jsonl.gz"))
+    if args.human:
+        files = [f for f in files if "policy" not in f.parts]
+    if args.seat_file:
+        seats = json.loads(Path(args.seat_file).read_text())
+        files = [f for f in files if seats.get(battle_tag(f)) == f.name.split("__", 1)[1].split(".")[0]]
     random.Random(args.seed).shuffle(files)
     if args.max_games:
         files = files[: args.max_games]
@@ -204,8 +228,10 @@ def main(argv: list[str] | None = None) -> int:
     va_files = [f for f in files if is_val(battle_tag(f), args.val_frac, args.seed)]
     print(f"{len(files)} records: {len(tr_files)} train, {len(va_files)} val (split by battle)", flush=True)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    tr = to_device(build(tr_files, args.feature_version, args.max_per_game, args.min_visits, args.seed, args.workers), dev)
-    va = to_device(build(va_files, args.feature_version, args.max_per_game, args.min_visits, args.seed, args.workers), dev)
+    tr = to_device(build(tr_files, args.feature_version, args.max_per_game, args.min_visits, args.seed, args.workers,
+                         args.human), dev)
+    va = to_device(build(va_files, args.feature_version, args.max_per_game, args.min_visits, args.seed, args.workers,
+                         args.human), dev)
     print(f"samples: train {tr['n']}, val {va['n']}  ({time.time() - t0:.0f}s)", flush=True)
 
     torch.manual_seed(args.seed)
@@ -227,6 +253,9 @@ def main(argv: list[str] | None = None) -> int:
             return self.l2(hr) + self.v(z).squeeze(-1)
 
     net = Net().to(dev)
+    if args.init:
+        net.load_state_dict(torch.load(args.init, map_location=dev))
+        print(f"warm start from {args.init}", flush=True)
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=args.wd)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.epochs)
 
@@ -279,6 +308,8 @@ def main(argv: list[str] | None = None) -> int:
             if bad >= args.patience:
                 break
     net.load_state_dict(best_state)
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    torch.save(best_state, str(Path(args.out).with_suffix(".pt")))  # for --init warm starts
 
     final = metrics(predict(xva, afva).cpu().numpy(), va["v"], va["m"], afva.cpu().numpy())
     k = min(n, 200_000)

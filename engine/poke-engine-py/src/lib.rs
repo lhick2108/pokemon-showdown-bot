@@ -1456,7 +1456,7 @@ impl PyNetSearch {
     /// `states`: serialized world states (side one = us). `reveal` (optional rows as in
     /// `state_tokens_str`) scrubs the opponent in side one's token view only.
     #[new]
-    #[pyo3(signature = (states, c_puct=2.0, fpu=0.0, depth=4, eps=0.01, seed=0, reveal=None, views=2, reveal2=None, hist=0, hist_cat=None, hist_cont=None, threads=1))]
+    #[pyo3(signature = (states, c_puct=2.0, fpu=0.0, depth=4, eps=0.01, seed=0, reveal=None, views=2, reveal2=None, hist=0, hist_cat=None, hist_cont=None, threads=1, stats=0, select=0, cut=0.0))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         states: Vec<String>,
@@ -1472,7 +1472,13 @@ impl PyNetSearch {
         hist_cat: Option<&[u8]>,
         hist_cont: Option<&[u8]>,
         threads: u8,
+        stats: u8,
+        select: u8,
+        cut: f32,
     ) -> PyResult<PyNetSearch> {
+        if stats > 1 || select > 1 || !(0.0..=1.0).contains(&cut) {
+            return Err(value_err(format!("need stats 0|1, select 0|1, 0 <= cut <= 1 (got {stats}, {select}, {cut})")));
+        }
         if states.is_empty() {
             return Err(value_err("NetSearch needs at least one world".to_string()));
         }
@@ -1485,7 +1491,7 @@ impl PyNetSearch {
         if hist > 2 || !(1..=4).contains(&threads) {
             return Err(value_err(format!("need hist 0, 1 or 2 and 1 <= threads <= 4 (got hist={hist}, threads={threads})")));
         }
-        let params = netsearch::Params { c_puct, fpu, depth, eps, views, hist, threads };
+        let params = netsearch::Params { c_puct, fpu, depth, eps, views, hist, threads, stats, select, cut };
         let mut inner = netsearch::NetSearch::new(worlds, params, reveal_of(reveal), seed);
         inner.set_reveal2(reveal_of(reveal2));
         if hist > 0 {
@@ -1536,11 +1542,14 @@ impl PyNetSearch {
 
     /// Completes the oldest collected batch: float32 little-endian bytes `policy1 [n,13]`,
     /// `policy2 [n,13]` (each side's policy over its own action slots) and `value [n]`
-    /// (P(side one wins)).
-    fn feed(&mut self, py: Python<'_>, policy1: &[u8], policy2: &[u8], value: &[u8]) -> PyResult<()> {
+    /// (P(side one wins)). `pred1 [n,13]` (optional, sdb.31): side two's prediction of side one's action
+    /// from its own view, used by `cut`.
+    #[pyo3(signature = (policy1, policy2, value, pred1=None))]
+    fn feed(&mut self, py: Python<'_>, policy1: &[u8], policy2: &[u8], value: &[u8], pred1: Option<&[u8]>) -> PyResult<()> {
         let (p1, p2, v) = (le_f32(policy1), le_f32(policy2), le_f32(value));
         let n = v.len();
-        if p1.len() != n * N_ACTIONS || p2.len() != n * N_ACTIONS {
+        let pr = pred1.map(le_f32);
+        if p1.len() != n * N_ACTIONS || p2.len() != n * N_ACTIONS || pr.as_ref().is_some_and(|x| x.len() != n * N_ACTIONS) {
             return Err(value_err(format!(
                 "feed shapes: {} values, {} / {} policy entries (need {} each)",
                 n,
@@ -1551,7 +1560,12 @@ impl PyNetSearch {
         }
         let evals: Vec<netsearch::Eval> = (0..n)
             .map(|i| {
-                let mut e = netsearch::Eval { policy1: [0.0; N_ACTIONS], policy2: [0.0; N_ACTIONS], value: v[i] };
+                let mut e = netsearch::Eval { policy1: [0.0; N_ACTIONS], policy2: [0.0; N_ACTIONS], value: v[i], pred1: None };
+                if let Some(x) = &pr {
+                    let mut a = [0.0; N_ACTIONS];
+                    a.copy_from_slice(&x[i * N_ACTIONS..(i + 1) * N_ACTIONS]);
+                    e.pred1 = Some(a);
+                }
                 e.policy1.copy_from_slice(&p1[i * N_ACTIONS..(i + 1) * N_ACTIONS]);
                 e.policy2.copy_from_slice(&p2[i * N_ACTIONS..(i + 1) * N_ACTIONS]);
                 e
@@ -1585,6 +1599,39 @@ impl PyNetSearch {
             .collect()
     }
 
+    /// Root statistics by action slot (sdb.30): `(visits uint32 [n,2,13], q float32 [n,2,13] (mean value from
+    /// that side's view, 0 where unvisited), prior float32 [n,2,13], value float32 [n] (side one's view),
+    /// root visits uint32 [n])`, little endian; index 1 of the second axis is side two.
+    #[allow(clippy::type_complexity)]
+    fn root_arrays<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> (Bound<'py, PyBytes>, Bound<'py, PyBytes>, Bound<'py, PyBytes>, Bound<'py, PyBytes>, Bound<'py, PyBytes>) {
+        let n = self.inner.n_worlds();
+        let na = poke_engine::prior::N_ACTIONS;
+        let mut visits = vec![0u32; n * 2 * na];
+        let mut q = vec![0f32; n * 2 * na];
+        let mut prior = vec![0f32; n * 2 * na];
+        let mut value = vec![0f32; n];
+        let mut total = vec![0u32; n];
+        for w in 0..n {
+            let (s1, s2) = self.inner.root_opts(w);
+            for (side, opts) in [s1, s2].into_iter().enumerate() {
+                for o in opts {
+                    if let Some(slot) = o.slot {
+                        let i = (w * 2 + side) * na + slot as usize;
+                        visits[i] = o.visits;
+                        q[i] = if o.visits > 0 { o.total / o.visits as f32 } else { 0.0 };
+                        prior[i] = o.prior;
+                    }
+                }
+            }
+            value[w] = self.inner.root_value(w);
+            total[w] = self.inner.root_visits(w);
+        }
+        (bytes_of(py, &visits), bytes_of(py, &q), bytes_of(py, &prior), bytes_of(py, &value), bytes_of(py, &total))
+    }
+
     fn stats(&self) -> std::collections::HashMap<String, f64> {
         let s = &self.inner.stats;
         [
@@ -1596,6 +1643,8 @@ impl PyNetSearch {
             ("both_none", s.both_none as f64),
             ("max_depth", s.max_depth as f64),
             ("nodes", s.nodes as f64),
+            ("info_sets", s.info_sets as f64),
+            ("cut_nodes", s.cut_nodes as f64),
             ("tree_ms", s.tree_ns as f64 / 1e6),
             ("tokenise_ms", s.tokenise_ns as f64 / 1e6),
             ("feed_ms", s.feed_ns as f64 / 1e6),
@@ -1687,6 +1736,149 @@ impl PySelfPlayPool {
 
     fn set_threads(&mut self, n: usize) {
         self.inner.set_threads(n);
+    }
+
+    /// A `NetSearch` with one tree per listed game, rooted at the game's true state, token views scrubbed with
+    /// the game's own reveal rows and (`hist` > 0) carrying its own history (sdb.30, search in the self-play loop).
+    #[pyo3(signature = (games, c_puct=2.0, fpu=0.0, depth=4, eps=0.01, seed=0, views=2, hist=1, threads=1))]
+    #[allow(clippy::too_many_arguments)]
+    fn net_search(
+        &self,
+        games: Vec<usize>,
+        c_puct: f32,
+        fpu: f32,
+        depth: u16,
+        eps: f32,
+        seed: u64,
+        views: u8,
+        hist: u8,
+        threads: u8,
+    ) -> PyResult<PyNetSearch> {
+        if !(c_puct.is_finite() && c_puct > 0.0) || !fpu.is_finite() || !(0.0..1.0).contains(&eps) || depth == 0
+            || !(1..=2).contains(&views) || hist > 2 || !(1..=4).contains(&threads)
+        {
+            return Err(value_err(
+                "net_search: need c_puct > 0, finite fpu, 0 <= eps < 1, depth >= 1, views 1|2, hist 0..2, threads 1..4".to_string(),
+            ));
+        }
+        let params = netsearch::Params { c_puct, fpu, depth, eps, views, hist, threads, ..Default::default() };
+        let inner = self.inner.net_search(&games, params, seed).map_err(value_err)?;
+        Ok(PyNetSearch { inner, last_hist: None })
+    }
+
+    /// A `NetSearch` with `worlds` trees per listed decision `(games[i], sides[i])`, each rooted at a world that
+    /// seat could be in (its opponent's hidden team resampled from what the seat has seen); the trees of
+    /// decision `i` are `i * worlds .. (i + 1) * worlds` (sdb.32, search training without hidden information).
+    #[pyo3(signature = (games, sides, worlds, c_puct=2.0, fpu=0.0, depth=4, eps=0.01, seed=0, views=2, hist=1, threads=1, stats=0))]
+    #[allow(clippy::too_many_arguments)]
+    fn net_search_worlds(
+        &self,
+        games: Vec<usize>,
+        sides: Vec<usize>,
+        worlds: usize,
+        c_puct: f32,
+        fpu: f32,
+        depth: u16,
+        eps: f32,
+        seed: u64,
+        views: u8,
+        hist: u8,
+        threads: u8,
+        stats: u8,
+    ) -> PyResult<PyNetSearch> {
+        if !(c_puct.is_finite() && c_puct > 0.0) || !fpu.is_finite() || !(0.0..1.0).contains(&eps) || depth == 0
+            || !(1..=2).contains(&views) || hist > 2 || !(1..=4).contains(&threads) || games.len() != sides.len()
+            || !(1..=64).contains(&worlds) || stats > 1
+        {
+            return Err(value_err(
+                "net_search_worlds: need c_puct > 0, finite fpu, 0 <= eps < 1, depth >= 1, views 1|2, hist 0..2, threads 1..4, worlds 1..64, stats 0|1, one side per game".to_string(),
+            ));
+        }
+        let params = netsearch::Params { c_puct, fpu, depth, eps, views, hist, threads, stats, ..Default::default() };
+        let rows: Vec<(usize, usize)> = games.into_iter().zip(sides).collect();
+        let inner = self.inner.net_search_worlds(&rows, worlds, params, seed).map_err(value_err)?;
+        Ok(PyNetSearch { inner, last_hist: None })
+    }
+
+    /// A rollout pool for policy-rollout search (sdb.33): for decision `i` (`games[i]`, `sides[i]`), `worlds`
+    /// teams the seat's opponent could have, each copied `reps` times with the game's reveal state and history;
+    /// game `(i * worlds + w) * reps + r` is copy `r` of world `w`. Finished games are not replaced (they stop
+    /// producing rows) and action byte 254 retires a game.
+    #[pyo3(signature = (games, sides, worlds, reps, seed=0))]
+    fn fork_rollouts(&self, py: Python<'_>, games: Vec<usize>, sides: Vec<usize>, worlds: usize, reps: usize, seed: u64) -> PyResult<PySelfPlayPool> {
+        if games.len() != sides.len() || !(1..=1024).contains(&worlds) || !(1..=64).contains(&reps) {
+            return Err(value_err("fork_rollouts: need one side per game, worlds 1..1024, reps 1..64".to_string()));
+        }
+        let rows: Vec<(usize, usize)> = games.into_iter().zip(sides).collect();
+        let inner = py.detach(|| self.inner.fork_rollouts(&rows, worlds, reps, seed)).map_err(value_err)?;
+        Ok(PySelfPlayPool { inner })
+    }
+
+    /// A rollout pool for a live battle (sdb.34): `states` are sampled worlds (side one = us), `reveal` what we
+    /// know of the opponent's team, `reveal2` what it knows of ours (rows as in `state_tokens_str`), `hist_cat`
+    /// (int16 [16,4]) / `hist_cont` (float32 [16,5]) our live history rows, `turn` the battle's turn. Game
+    /// `w * reps + r` is copy `r` of world `w`; the pool behaves like one from `fork_rollouts`.
+    #[staticmethod]
+    #[pyo3(signature = (states, reveal, reveal2, hist_cat, hist_cont, turn, reps=1, seed=0, threads=1))]
+    #[allow(clippy::too_many_arguments)]
+    fn from_worlds(
+        py: Python<'_>,
+        states: Vec<String>,
+        reveal: RevealArg,
+        reveal2: RevealArg,
+        hist_cat: &[u8],
+        hist_cont: &[u8],
+        turn: u32,
+        reps: usize,
+        seed: u64,
+        threads: usize,
+    ) -> PyResult<PySelfPlayPool> {
+        let (cl, fl) = (selfplay::N_HIST * selfplay::HIST_CAT_W, selfplay::N_HIST * selfplay::HIST_CONT_W);
+        if states.is_empty() || states.len() > 4096 || !(1..=256).contains(&reps) || hist_cat.len() != cl * 2 || hist_cont.len() != fl * 4 {
+            return Err(value_err(format!(
+                "from_worlds: need 1..4096 states, reps 1..256, hist_cat {} bytes and hist_cont {} bytes",
+                cl * 2,
+                fl * 4
+            )));
+        }
+        let hc: Vec<i16> = hist_cat.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
+        let hf = le_f32(hist_cont);
+        let r1 = reveal_of(reveal).unwrap_or_default();
+        let r2 = reveal_of(reveal2).unwrap_or_default();
+        let inner = py.detach(|| {
+            let games: Vec<selfplay::Game> = states
+                .iter()
+                .enumerate()
+                .map(|(w, s)| selfplay::Game::from_live(State::deserialize(s), turn, &r1, &r2, &hc, &hf, seed ^ w as u64))
+                .collect();
+            selfplay::SelfPlayPool::from_games(games, reps, seed, threads, turn.saturating_add(1000))
+        });
+        Ok(PySelfPlayPool { inner })
+    }
+
+    /// Saves a copy of each listed game as it stands now and returns one id per game (sdb.35).
+    fn snap(&mut self, games: Vec<usize>) -> PyResult<Vec<u64>> {
+        self.inner.snap(&games).map_err(value_err)
+    }
+
+    /// Forgets saved positions.
+    fn drop_snaps(&mut self, ids: Vec<u64>) {
+        self.inner.drop_snaps(&ids)
+    }
+
+    fn bank_len(&self) -> usize {
+        self.inner.bank_len()
+    }
+
+    /// Replaces `games[i]` by a copy of saved position `ids[i]` with a fresh chance seed; call between `step`
+    /// and `observe`. `viewers[i]` 0/1: redraw what that seat has not seen of its opponent's team (-1: keep).
+    #[pyo3(signature = (games, ids, seed=0, viewers=Vec::new()))]
+    fn load(&mut self, games: Vec<usize>, ids: Vec<u64>, seed: u64, viewers: Vec<i8>) -> PyResult<()> {
+        if games.len() != ids.len() {
+            return Err(value_err("load: need one id per game".to_string()));
+        }
+        let pairs: Vec<(usize, u64)> = games.into_iter().zip(ids).collect();
+        self.inner.load(&pairs, &viewers, seed).map_err(value_err)
     }
 
     /// Serialized truth state of one game (debugging, tests).

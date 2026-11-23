@@ -160,8 +160,13 @@ def with_ladder_hooks(
     on_finish: Callable[[Any, Any], None] | None = None,
     save_server_replay: bool = False,
     on_rating: Callable[[Any, str, int], None] | None = None,
+    timer_after_s: float | None = None,
 ) -> type:
-    """Subclass of ``cls`` with a hard per-decision cap and a battle-finished hook."""
+    """Subclass of ``cls`` with a hard per-decision cap and a battle-finished hook.
+
+    ``timer_after_s``: that many seconds after a battle's first message, send ``/timer on`` in its room (once),
+    so a slow or absent opponent runs on the server's battle timer.
+    """
 
     class LadderPlayer(cls):  # type: ignore[valid-type, misc]
         cap_s = move_cap_s
@@ -192,6 +197,11 @@ def with_ladder_hooks(
         async def _handle_battle_message_inner(self, split_messages):
             # keep every |request| (our full real sets) in order, before poke-env consumes it
             self.last_server_msg = time.monotonic()
+            if timer_after_s is not None:
+                try:
+                    self._arm_timer(split_messages)
+                except Exception:
+                    logger.exception("could not schedule the battle timer")
             try:
                 capture_requests(self.__dict__.setdefault("battle_requests", {}), split_messages,
                                  getattr(self, "battles", {}))
@@ -223,6 +233,28 @@ def with_ladder_hooks(
                         logger.exception("default-choice fallback failed")
                     return None
                 raise
+
+        def _arm_timer(self, split_messages):
+            if not split_messages or not split_messages[0]:
+                return
+            tag = split_messages[0][0].lstrip(">")
+            armed = self.__dict__.setdefault("timer_tags", set())
+            if not tag.startswith("battle-") or tag in armed:
+                return
+            armed.add(tag)
+            self.__dict__.setdefault("timer_tasks", set()).add(asyncio.ensure_future(self._timer_on(tag)))
+
+        async def _timer_on(self, tag):
+            try:
+                await asyncio.sleep(timer_after_s)
+                battle = getattr(self, "battles", {}).get(tag)
+                if battle is None or battle.finished:
+                    return
+                await self.ps_client.send_message("/timer on", tag)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("could not turn the battle timer on in %s", tag)
 
         def _note_server_messages(self, split_messages):
             """Make rejected choices visible and remember them for the next decision."""
@@ -544,7 +576,8 @@ class ChallengePolicy:
     ACCEPT_GRACE_S = 30.0  # an accepted challenge counts as "busy" until its battle exists
 
     def __init__(self, battle_format: str = "gen9randombattle",
-                 allow: Sequence[str] | None = None, *, dedupe_s: float = 10.0, clock=None):
+                 allow: Sequence[str] | None = None, *, dedupe_s: float = 10.0, clock=None,
+                 max_games: int = 1, busy_message: str | None = None):
         import time as _time
 
         self.battle_format = battle_format
@@ -552,13 +585,23 @@ class ChallengePolicy:
         self.dedupe_s = dedupe_s
         self._clock = clock or _time.monotonic
         self._seen: dict[tuple[str, str], float] = {}
-        self._accepted_at: float | None = None
+        self.max_games = max(1, int(max_games))  # simultaneous battles (accepted-but-not-started ones count)
+        self.busy_message = busy_message  # sent as a PM with a rejection at the limit
+        self._pending: list[float] = []  # accept times of challenges whose battle has not started yet
         self.last_activity = self._clock()
         self.counts = {"accepted": 0, "rejected": 0}
 
-    def decide(self, user: str, fmt: str, busy: bool) -> tuple[str, str] | None:
-        """``("accept"|"reject", reason)``, or None for a repeat already answered."""
+    @property
+    def _accepted_at(self) -> float | None:
+        return self._pending[-1] if self._pending else None
+
+    def decide(self, user: str, fmt: str, busy: bool | int, playing: bool = False) -> tuple[str, str] | None:
+        """``("accept"|"reject", reason)``, or None for a repeat already answered.
+
+        ``busy`` is the number of battles running (a bool counts as 0/1); ``playing`` says this user is in one of them.
+        """
         now = self._clock()
+        self._pending = [t for t in self._pending if now - t < self.ACCEPT_GRACE_S]
         key = (to_id(user), to_id(fmt))
         self._seen = {k: t for k, t in self._seen.items() if now - t < self.dedupe_s}
         if key in self._seen:
@@ -569,17 +612,20 @@ class ChallengePolicy:
             verdict = ("reject", f"format {fmt or '?'} (only {self.battle_format})")
         elif self.allow is not None and key[0] not in self.allow:
             verdict = ("reject", "user not on the allowlist")
-        elif busy or (self._accepted_at is not None
-                      and now - self._accepted_at < self.ACCEPT_GRACE_S):
-            verdict = ("reject", "a battle is already in progress")
+        elif playing:
+            verdict = ("reject", "already in a battle with this user")
+        elif int(busy) + len(self._pending) >= self.max_games:
+            verdict = ("reject", "a battle is already in progress" if self.max_games == 1
+                       else f"at the limit of {self.max_games} battles")
         else:
-            self._accepted_at = now
+            self._pending.append(now)
             verdict = ("accept", "ok")
         self.counts["accepted" if verdict[0] == "accept" else "rejected"] += 1
         return verdict
 
     def battle_started(self) -> None:
-        self._accepted_at = None
+        if self._pending:
+            self._pending.pop(0)
 
     def touch(self) -> None:
         self.last_activity = self._clock()
@@ -602,8 +648,9 @@ def with_challenge_policy(
         async def _answer(self, user: str, fmt: str) -> None:
             if to_id(user) == to_id(self.username):
                 return
-            busy = any(not b.finished for b in self.battles.values())
-            verdict = policy.decide(user, fmt, busy)
+            running = [b for b in self.battles.values() if not b.finished]
+            playing = any(to_id(getattr(b, "opponent_username", None) or "") == to_id(user) for b in running)
+            verdict = policy.decide(user, fmt, len(running), playing)
             if verdict is None:
                 return
             action, reason = verdict
@@ -616,6 +663,11 @@ def with_challenge_policy(
                 await self.ps_client.accept_challenge(to_id(user), self.next_team)
             else:
                 await self.ps_client.send_message(f"/reject {to_id(user)}")
+                if policy.busy_message and reason.startswith("at the limit"):
+                    try:
+                        await self.ps_client.send_message(f"/pm {to_id(user)}, {policy.busy_message}")
+                    except Exception:
+                        logger.exception("busy message failed")
 
         async def _update_challenges(self, split_message):
             data = json.loads(split_message[2]) if len(split_message) > 2 else {}

@@ -27,6 +27,7 @@ from poke_env.ps_client import (
 
 from showdown_bot.players.human import HumanPolicyPlayer
 from showdown_bot.players.netsearch import NetSearchPlayer
+from showdown_bot.players.rolloutsearch import RolloutSearchPlayer
 from showdown_bot.players.tokenpolicy import TokenPolicyPlayer
 from showdown_bot.players.humansearch import HumanSearchPlayer
 from showdown_bot.players.search import SearchNetPlayer, SearchPlayer
@@ -50,6 +51,8 @@ PLAYER_REGISTRY: dict[str, type[Player]] = {
     "token-policy": TokenPolicyPlayer,
     # Net-guided search with the token transformer (keys: model, device, worlds, time_ms, max_evals, batch, c_puct, depth, fpu, vavg, scrub, mode).
     "net-search": NetSearchPlayer,
+    # Policy-rollout search with the token transformer (keys: model, device, worlds, depth, cands, minp, beta, alpha, opp, pick).
+    "rollout-search": RolloutSearchPlayer,
 }
 
 # "foulplay" is a special opponent name: it is not a poke-env Player subclass.

@@ -406,6 +406,15 @@ def game_samples(
             if total > 0.95 and dropped < 0.05:
                 s["pol_target"][...] = pol / total
                 s["pol_valid"] = 1
+                if _HARD_TARGET:
+                    # imitation of the move actually played (SHOWDOWN_TOKENS_HARD=1), not the visit share
+                    j = slot_of.get(d.get("chosen"))
+                    if j is not None and legal[j]:
+                        s["pol_target"][...] = 0.0
+                        s["pol_target"][j] = 1.0
+                    else:
+                        s["pol_valid"] = 0
+                        stats["chosen_unmapped"] += 1
             else:
                 stats["policy_unmapped"] += 1
         elif kind == "human" and d.get("chosen"):
@@ -497,6 +506,11 @@ def game_samples(
 # ---------------------------------------------------------------------------
 
 
+import os as _os
+
+_HARD_TARGET = _os.environ.get("SHOWDOWN_TOKENS_HARD") == "1"
+
+
 def write_shard(path: Path, samples: Sequence[dict[str, np.ndarray]], fields: dict[str, tuple[str, tuple[int, ...]]]) -> dict[str, Any]:
     path.mkdir(parents=True, exist_ok=True)
     n = len(samples)
@@ -532,7 +546,21 @@ def _read(path: Path) -> dict[str, Any] | None:
         return None
 
 
+def _is_gen7(header: dict[str, Any]) -> bool:
+    """A record of the gen7 search bot playing its argmax (best-gen7 at any world count)."""
+    import os
+
+    c = header.get("config") or {}
+    base = lambda v: os.path.basename(str(v).replace("\\", "/")) if v else None  # noqa: E731
+    return (header.get("player") == "search" and base(c.get("evaluator")) == "gen7-res-root-mlp16.pev"
+            and base(c.get("prior")) == "prior-gen56-h32.ppol" and not c.get("tok_prior") and c.get("mode") == "argmax"
+            and not c.get("evaluator2") and not c.get("opp_model"))
+
+
 def _task(args: tuple) -> dict[str, Any]:
+    import os
+
+    gen7_only = os.environ.get("SHOWDOWN_TOKENS_ONLY") == "gen7"
     out_dir, shard_name, source_idx, kind, groups, opts, max_rows = args
     vocab, fields, lay = Vocab(), _shard_fields(), layout()
     stats: Counter = Counter()
@@ -541,6 +569,9 @@ def _task(args: tuple) -> dict[str, Any]:
     for files in groups:
         games = [g for g in map(_read, files) if g is not None]
         for gi, g in enumerate(games):
+            if gen7_only and not _is_gen7(g["header"]):
+                stats["skipped_not_gen7"] += 1
+                continue
             others = [o for oi, o in enumerate(games) if oi != gi]
             peer = others[0] if len(others) == 1 else None
             split = None

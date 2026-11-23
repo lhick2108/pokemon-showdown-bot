@@ -33,6 +33,9 @@ DEFAULTS = {
     # 589.68.7 (all off = the sdb.24 behaviour): fast forward, fp16 residual stream, history rows (0 padding,
     # 1 root rows for every leaf, 2 root rows + the simulated turns), side-two scrub, tokenisation threads
     "fast": 0, "fp16res": 0, "hist": 0, "scrub2": 0, "tokthreads": 1,
+    # sdb.31 (all off = the sdb.30 search): our statistics shared by the nodes of one information set, regret-matching
+    # selection, the opponent's search cut below an action of ours it could not expect (threshold, 0 = off)
+    "stats": 0, "select": 0, "cut": 0.0,
 }
 
 
@@ -55,7 +58,7 @@ class NetEvaluator:
     """
 
     def __init__(self, net: Any, device: str, vavg: bool = False, views: int = 2, *, fast: bool = False,
-                 fp16res: bool = False, hist: bool = False, batch: int = 256) -> None:
+                 fp16res: bool = False, hist: bool = False, batch: int = 256, pred: bool = False) -> None:
         import torch
 
         from showdown_bot import token_net, tokens
@@ -66,6 +69,8 @@ class NetEvaluator:
         self.vavg = vavg and views == 2
         self.views = views
         self.use_hist = hist
+        # also return side two's prediction of side one's action (its opponent head on its own view; 2 views only)
+        self.pred = pred and views == 2
         lay = tokens.layout()
         self.fields = {k: v for k, v in lay.items() if k in token_net.INPUT_FIELDS}
         self.cat_len = int(self._buffer_len("cat"))
@@ -138,6 +143,8 @@ class NetEvaluator:
             o = self.net(b)
         if v == 2:
             pol = torch.softmax(o["policy"], -1).reshape(n, 2, N_ACT)
+            if self.pred:
+                pol = torch.cat([pol, torch.softmax(o["opp_slot"], -1).reshape(n, 2, N_ACT)], -1)
             val = torch.sigmoid(o["value"]).reshape(n, 2)
         else:
             pol = torch.stack([torch.softmax(o["policy"], -1), torch.softmax(o["opp_slot"], -1)], 1)
@@ -154,7 +161,7 @@ class NetEvaluator:
             if self.views == 1:
                 p = np.stack([out[:, 0, :N_ACT], out[:, 0, N_ACT: 2 * N_ACT]], 1)
             else:
-                p = out[:, :, :N_ACT]
+                p = out[:, :, : 2 * N_ACT]
             v = out[:, :, 2 * N_ACT]
         else:
             pol, val, n = handle
@@ -165,11 +172,14 @@ class NetEvaluator:
         self.calls += 1
         self.leaves += n
         value = 0.5 * (v[:, 0] + 1.0 - v[:, 1]) if self.vavg else v[:, 0]
-        return (
-            np.ascontiguousarray(p[:, 0], dtype="<f4").tobytes(),
-            np.ascontiguousarray(p[:, 1], dtype="<f4").tobytes(),
+        out3 = (
+            np.ascontiguousarray(p[:, 0, :N_ACT], dtype="<f4").tobytes(),
+            np.ascontiguousarray(p[:, 1, :N_ACT], dtype="<f4").tobytes(),
             np.ascontiguousarray(value, dtype="<f4").tobytes(),
         )
+        if self.pred:
+            return (*out3, np.ascontiguousarray(p[:, 1, N_ACT: 2 * N_ACT], dtype="<f4").tobytes())
+        return out3
 
 
 @dataclass
@@ -226,10 +236,10 @@ def drive(
                 flying.append((launch(cat, cont, n) if hist is None else launch(cat, cont, n, hist), n))
                 info.forward_ms += (time.perf_counter() - t1) * 1000.0
             else:
-                p1, p2, v = evaluate(cat, cont, n) if hist is None else evaluate(cat, cont, n, hist)
+                out = evaluate(cat, cont, n) if hist is None else evaluate(cat, cont, n, hist)
                 t2 = time.perf_counter()
                 info.forward_ms += (t2 - t1) * 1000.0
-                ns.feed(p1, p2, v)
+                ns.feed(*out)
                 info.feed_ms += (time.perf_counter() - t2) * 1000.0
                 info.evals += n
                 info.batches += 1
@@ -237,10 +247,10 @@ def drive(
             break
         handle, n = flying.pop(0)
         t1 = time.perf_counter()
-        p1, p2, v = finish(handle)
+        out = finish(handle)
         t2 = time.perf_counter()
         info.forward_ms += (t2 - t1) * 1000.0
-        ns.feed(p1, p2, v)
+        ns.feed(*out)
         info.feed_ms += (time.perf_counter() - t2) * 1000.0
         info.evals += n
         info.batches += 1
@@ -298,13 +308,19 @@ class NetSearcher:
         hist: int = DEFAULTS["hist"],
         scrub2: bool = bool(DEFAULTS["scrub2"]),
         tokthreads: int = DEFAULTS["tokthreads"],
+        stats: int = DEFAULTS["stats"],
+        select: int = DEFAULTS["select"],
+        cut: float = DEFAULTS["cut"],
     ) -> None:
         self.policy_net = policy_net
+        self.stats = int(stats)
+        self.select = int(select)
+        self.cut = float(cut)
         self.hist = int(hist)
         self.scrub2 = bool(scrub2)
         self.tokthreads = int(tokthreads)
         self.evaluator = NetEvaluator(policy_net.net, policy_net.device, vavg=vavg, views=views, fast=fast,
-                                      fp16res=fp16res, hist=self.hist > 0, batch=batch)
+                                      fp16res=fp16res, hist=self.hist > 0, batch=batch, pred=self.cut > 0)
         self.worlds = worlds
         self.time_ms = time_ms
         self.max_evals = max_evals
@@ -335,6 +351,8 @@ class NetSearcher:
             kw["reveal2"] = reveal2
         if self.tokthreads > 1:
             kw["threads"] = self.tokthreads
+        if self.stats or self.select or self.cut > 0:
+            kw.update(stats=self.stats, select=self.select, cut=self.cut)
         return poke_engine.NetSearch(
             list(states), c_puct=self.c_puct, fpu=self.fpu, depth=self.depth, eps=self.eps, views=self.views,
             seed=(self.seed * 1000003 + self.searches) & 0xFFFFFFFF,

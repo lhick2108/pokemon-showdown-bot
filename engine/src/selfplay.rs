@@ -365,6 +365,106 @@ impl TeamData {
         p
     }
 
+    /// Rewrites `side` into one team its opponent could be facing, given what the opponent has seen (`r`): an
+    /// unseen member becomes a fresh species and set drawn like a team slot; a seen member keeps its species,
+    /// its condition and everything revealed, and takes the unrevealed moves, item, ability, tera type and
+    /// stats of a set drawn (by set weight) from those that fit the reveals. A seen member with no fitting
+    /// set (a forme change, a copied move) is left as it is.
+    fn resample_side(&self, side: &mut Side, r: &Reveal, rng: &mut StdRng) {
+        let index = |name: PokemonName| self.species.iter().position(|e| e.name == name);
+        let mut team: Vec<usize> = (0..6).filter(|&k| r.seen[k]).filter_map(|k| index(side.pokemon.pkmn[k].id)).collect();
+        for k in 0..6 {
+            if !r.seen[k] {
+                let sp = self.sample_species(&team, rng, 6);
+                let e = &self.species[sp];
+                let x = rng.random_range(0.0..e.total());
+                let si = e.cum.partition_point(|&c| c <= x).min(e.sets.len() - 1);
+                side.pokemon.pkmn[k] = self.make_pokemon(sp, si);
+                team.push(sp);
+                continue;
+            }
+            let Some(sp) = index(side.pokemon.pkmn[k].id) else { continue };
+            let e = &self.species[sp];
+            let si = {
+                let p = &side.pokemon.pkmn[k];
+                let fits = |s: &SetEntry, strict: bool| {
+                    s.level == p.level
+                        && (0..4).all(|i| !r.mv[k][i] || mv_of(p, i).id == Choices::NONE || s.moves.contains(&mv_of(p, i).id))
+                        && (!strict || !r.item[k] || s.item == p.item)
+                        && (!r.ability[k] || s.ability == p.base_ability)
+                        && (!r.tera[k] || s.tera == p.tera_type)
+                };
+                let weight = |i: usize| e.cum[i] - if i > 0 { e.cum[i - 1] } else { 0.0 };
+                let mut pick = None;
+                // a revealed item may since have been used up or removed: then the item does not constrain the set
+                for strict in [true, false] {
+                    let total: f64 = (0..e.sets.len()).filter(|&i| fits(&e.sets[i], strict)).map(weight).sum();
+                    if total > 0.0 {
+                        let mut x = rng.random_range(0.0..total);
+                        for i in (0..e.sets.len()).filter(|&i| fits(&e.sets[i], strict)) {
+                            pick = Some(i);
+                            x -= weight(i);
+                            if x < 0.0 {
+                                break;
+                            }
+                        }
+                        break;
+                    }
+                }
+                match pick {
+                    Some(i) => i,
+                    None => continue,
+                }
+            };
+            let fresh = self.make_pokemon(sp, si);
+            let q = &mut side.pokemon.pkmn[k];
+            let shown: Vec<Choices> = (0..4).filter(|&i| r.mv[k][i]).map(|i| mv_of(q, i).id).collect();
+            let mut rest = e.sets[si].moves.iter().copied().filter(|m| !shown.contains(m));
+            for i in 0..4 {
+                if r.mv[k][i] {
+                    continue;
+                }
+                let slot = match i {
+                    0 => &mut q.moves.m0,
+                    1 => &mut q.moves.m1,
+                    2 => &mut q.moves.m2,
+                    _ => &mut q.moves.m3,
+                };
+                let disabled = slot.disabled; // a choice lock or the like holds for whatever sits in the slot
+                *slot = match rest.next() {
+                    Some(m) => {
+                        let mp = self.max_pp(m);
+                        Move { id: m, disabled, pp: mp, max_pp: mp, choice: MOVES.get(&m).cloned().unwrap_or_default() }
+                    }
+                    None => Move::default(),
+                };
+            }
+            if !r.item[k] {
+                q.item = fresh.item;
+            }
+            if !r.ability[k] && q.ability == q.base_ability {
+                q.ability = fresh.ability;
+                q.base_ability = fresh.ability;
+            }
+            if !r.tera[k] {
+                q.tera_type = fresh.tera_type;
+            }
+            if fresh.maxhp != q.maxhp && q.maxhp > 0 {
+                let hp = (q.hp as i32 * fresh.maxhp as i32 + q.maxhp as i32 - 1) / q.maxhp as i32;
+                if q.hp > 0 {
+                    q.hp = hp.clamp(1, fresh.maxhp as i32) as i16;
+                }
+                q.maxhp = fresh.maxhp;
+            }
+            q.evs = fresh.evs;
+            q.attack = fresh.attack;
+            q.defense = fresh.defense;
+            q.special_attack = fresh.special_attack;
+            q.special_defense = fresh.special_defense;
+            q.speed = fresh.speed;
+        }
+    }
+
     /// A full starting state (team one = side one, team two = side two) from `rng`.
     pub fn sample_state(&self, rng: &mut StdRng) -> State {
         let mut st = State::default();
@@ -401,6 +501,69 @@ struct Reveal {
     item: [bool; 6],
     ability: [bool; 6],
     tera: [bool; 6],
+}
+
+fn norm_name(s: &str) -> String {
+    s.chars().filter(|c| c.is_ascii_alphanumeric()).map(|c| c.to_ascii_lowercase()).collect()
+}
+
+impl Reveal {
+    /// The reveal state of `side` from rows as `Game::reveal_rows` writes them (matched by species and move
+    /// names the way the token scrub matches them); the active Pokemon is always seen.
+    fn from_rows(side: &Side, rows: &[Revealed]) -> Reveal {
+        let mut r = Reveal::default();
+        let names: Vec<String> = rows.iter().map(|x| norm_name(&x.species)).collect();
+        for k in 0..6 {
+            let p = &side.pokemon.pkmn[k];
+            let name = norm_name(PokemonName::NAMES[p.id as usize]);
+            let Some(i) = names.iter().position(|n| *n == name) else { continue };
+            let row = &rows[i];
+            r.seen[k] = true;
+            r.item[k] = row.item;
+            r.ability[k] = row.ability;
+            r.tera[k] = row.tera;
+            let mv: Vec<String> = row.moves.iter().map(|m| norm_name(m)).collect();
+            for j in 0..4 {
+                let id = mv_of(p, j).id;
+                r.mv[k][j] = id != Choices::NONE && mv.contains(&norm_name(Choices::NAMES[id as usize]));
+            }
+        }
+        r.seen[side.active_index as usize] = true;
+        r
+    }
+}
+
+/// The inverse of `Game::history` for a game at `turn`: entries most recent first.
+fn hist_from_rows(cat: &[i16], cont: &[f32], turn: u32) -> VecDeque<HistEntry> {
+    let mut out = VecDeque::new();
+    if cat.len() < N_HIST * HIST_CAT_W || cont.len() < N_HIST * HIST_CONT_W {
+        return out;
+    }
+    let last = (0..HIST_STEPS).rev().find(|&k| cat[2 * k * HIST_CAT_W] != 0 || cat[(2 * k + 1) * HIST_CAT_W] != 0);
+    let Some(last) = last else { return out };
+    for k in 0..=last {
+        let mut e = HistEntry::default();
+        for n in 0..2 {
+            let row = 2 * k + n;
+            let c = &cat[row * HIST_CAT_W..(row + 1) * HIST_CAT_W];
+            if c[0] == 0 {
+                continue;
+            }
+            let f = &cont[row * HIST_CONT_W..(row + 1) * HIST_CONT_W];
+            let h = HistSide { present: true, kind: c[1] as u8, aid: c[2] as u16, actor: c[3] as u16 };
+            e.turn = turn.saturating_sub((f[0] * 16.0).round() as u32);
+            let (sf, of) = ((f[3] * 6.0).round() as u8, (f[4] * 6.0).round() as u8);
+            if n == 0 {
+                e.own = h;
+                (e.d_own, e.d_opp, e.f_own, e.f_opp) = (f[1], f[2], sf, of);
+            } else {
+                e.opp = h;
+                (e.d_opp, e.d_own, e.f_opp, e.f_own) = (f[1], f[2], sf, of);
+            }
+        }
+        out.push_back(e);
+    }
+    out
 }
 
 #[derive(Clone, Copy, Default)]
@@ -492,6 +655,7 @@ fn announces(a: Abilities) -> bool {
 }
 
 /// The view of one game that observation, history and tests share.
+#[derive(Clone)]
 pub struct Game {
     pub state: State,
     pub turn: u32,
@@ -568,6 +732,33 @@ impl Game {
         g
     }
 
+    /// A game in the middle of a live battle (sdb.34): `state` is one sampled world (side one = us), `about_opp`
+    /// / `about_us` the reveal rows of what we know of the opponent's team and what it knows of ours, and
+    /// `hist_cat` / `hist_cont` our 16 history rows as the live bot feeds them to the net (most recent first,
+    /// own row then opponent row per step). The opponent's history is the mirror image.
+    pub fn from_live(state: State, turn: u32, about_opp: &[Revealed], about_us: &[Revealed], hist_cat: &[i16], hist_cont: &[f32], seed: u64) -> Game {
+        let reveal = [Reveal::from_rows(&state.side_one, about_us), Reveal::from_rows(&state.side_two, about_opp)];
+        let own = hist_from_rows(hist_cat, hist_cont, turn);
+        let opp: VecDeque<HistEntry> = own
+            .iter()
+            .map(|e| HistEntry { turn: e.turn, own: e.opp, opp: e.own, d_own: e.d_opp, d_opp: e.d_own, f_own: e.f_opp, f_opp: e.f_own })
+            .collect();
+        let mut g = Game {
+            state,
+            turn,
+            steps: 0,
+            reveal,
+            hist: [own, opp],
+            rng: StdRng::seed_from_u64(seed),
+            opts: [Vec::new(), Vec::new()],
+            need: [false, false],
+            episode: 0,
+            decisions: [0, 0],
+        };
+        g.refresh_options();
+        g
+    }
+
     fn refresh_options(&mut self) {
         let (o1, o2) = self.state.root_get_all_options();
         self.opts = [o1, o2];
@@ -622,6 +813,25 @@ impl Game {
             });
         }
         rows
+    }
+
+    /// The game's state with `viewer`'s opponent rewritten into a team `viewer` cannot tell from the true one.
+    pub fn sampled_world(&self, viewer: usize, rng: &mut StdRng) -> State {
+        let mut st = self.state.clone();
+        let o = 1 - viewer;
+        let side = if o == 0 { &mut st.side_one } else { &mut st.side_two };
+        TEAM_DATA.resample_side(side, &self.reveal[o], rng);
+        st
+    }
+
+    /// Reveal rows and history of both views, for a net search rooted at this game's true state.
+    pub fn world_ctx(&self) -> crate::netsearch::WorldCtx {
+        let mut h = [crate::netsearch::Hist::default(), crate::netsearch::Hist::default()];
+        for (v, hv) in h.iter_mut().enumerate() {
+            self.history(v, &mut hv.cat, &mut hv.cont);
+        }
+        let [h1, h2] = h;
+        crate::netsearch::WorldCtx::new(self.reveal_rows(0), self.reveal_rows(1), h1, h2)
     }
 
     /// Writes the token buffers of `side` (0 = side one) from its own scrubbed view.
@@ -945,7 +1155,16 @@ pub struct SelfPlayPool {
     turn_cap: u32,
     rows: Vec<Row>,
     pub stats: PoolStats,
+    /// a rollout pool (`fork_rollouts`): finished games stay finished instead of being replaced
+    frozen: bool,
+    done: Vec<bool>,
+    /// saved positions (`snap` / `load`, sdb.35): id -> a copy of a game as it stood at a decision
+    bank: HashMap<u64, Game>,
+    bank_next: u64,
 }
+
+/// The action byte that retires a game of a rollout pool (it gets no further rows).
+pub const RETIRE: u8 = 254;
 
 /// Runs `f(global index, chunk)` over `items` on `threads` scoped threads with dynamic chunking.
 fn par_chunks<T: Send, F: Fn(usize, &mut [T]) + Sync>(items: &mut [T], threads: usize, chunk: usize, f: F) {
@@ -974,15 +1193,192 @@ impl SelfPlayPool {
         for i in 0..n_games {
             games.push(Game::new(seed, i as u64, 0));
         }
-        let mut p = SelfPlayPool { games, seed, threads: threads.max(1), turn_cap, rows: Vec::new(), stats: PoolStats::default() };
+        let mut p = SelfPlayPool { games, seed, threads: threads.max(1), turn_cap, rows: Vec::new(), stats: PoolStats::default(), frozen: false, done: Vec::new(), bank: HashMap::new(), bank_next: 0 };
         let (seed, cap) = (p.seed, p.turn_cap);
         par_chunks(&mut p.games, p.threads, 16, |_, c| {
             for g in c.iter_mut() {
-                let _ = settle(g, cap, seed, 0, &mut StepOut { reward: [0.0; 2], finished: None, illegal: 0, panicked: false });
+                let _ = settle(g, cap, seed, 0, &mut StepOut { reward: [0.0; 2], finished: None, illegal: 0, panicked: false }, true);
             }
         });
         p.rebuild_rows();
         p
+    }
+
+    /// A net search with one tree per listed game, rooted at the game's TRUE state; each tree's token views
+    /// are scrubbed with that game's reveal rows and carry that game's history (sdb.30).
+    pub fn net_search(
+        &self,
+        games: &[usize],
+        params: crate::netsearch::Params,
+        seed: u64,
+    ) -> Result<crate::netsearch::NetSearch, String> {
+        let mut states = Vec::with_capacity(games.len());
+        let mut ctx = Vec::with_capacity(games.len());
+        for &g in games {
+            let game = self.games.get(g).ok_or_else(|| format!("no game {g}"))?;
+            states.push(game.state.clone());
+            ctx.push(game.world_ctx());
+        }
+        if states.is_empty() {
+            return Err("net_search needs at least one game".to_string());
+        }
+        let mut ns = crate::netsearch::NetSearch::new(states, params, None, seed);
+        ns.set_world_ctx(ctx);
+        Ok(ns)
+    }
+
+    /// A net search for the listed decisions `(game, seat)`: `k` trees per decision, each rooted at a world the
+    /// seat could be in (its opponent's hidden team resampled from the seat's reveals, `TeamData::resample_side`),
+    /// in the order of `rows`. The seat's root visits summed over its `k` trees are the search the live bot runs
+    /// over its sampled worlds; nothing of the opponent's true hidden team reaches the trees.
+    pub fn net_search_worlds(
+        &self,
+        rows: &[(usize, usize)],
+        k: usize,
+        params: crate::netsearch::Params,
+        seed: u64,
+    ) -> Result<crate::netsearch::NetSearch, String> {
+        if rows.is_empty() || k == 0 {
+            return Err("net_search_worlds needs at least one decision and one world".to_string());
+        }
+        let mut rng = StdRng::seed_from_u64(seed ^ 0x5EED_0031_u64.wrapping_mul(rows.len() as u64 + 1));
+        let mut states = Vec::with_capacity(rows.len() * k);
+        let mut ctx = Vec::with_capacity(rows.len() * k);
+        for &(g, seat) in rows {
+            if seat > 1 {
+                return Err(format!("no seat {seat}"));
+            }
+            let game = self.games.get(g).ok_or_else(|| format!("no game {g}"))?;
+            let c = game.world_ctx();
+            for _ in 0..k {
+                states.push(game.sampled_world(seat, &mut rng));
+                ctx.push(c.clone());
+            }
+        }
+        let mut ns = crate::netsearch::NetSearch::new(states, params, None, seed);
+        ns.set_world_ctx(ctx);
+        Ok(ns)
+    }
+
+    /// A rollout pool for policy-rollout search (sdb.33): for decision `i` = `rows[i]` (game, seat), `worlds`
+    /// teams the seat's opponent could have are sampled from what the seat has seen, and each is copied `reps`
+    /// times; game `(i * worlds + w) * reps + r` of the new pool is copy `r` of world `w`. Each copy keeps the
+    /// source game's reveal state and history, so both sides observe it exactly as they would the real game.
+    /// The copies of one world share their chance seed. Finished games are not replaced, and the action byte
+    /// `RETIRE` takes a game out.
+    pub fn fork_rollouts(&self, rows: &[(usize, usize)], worlds: usize, reps: usize, seed: u64) -> Result<SelfPlayPool, String> {
+        if rows.is_empty() || worlds == 0 || reps == 0 {
+            return Err("fork_rollouts needs at least one decision, one world and one copy".to_string());
+        }
+        let mut rng = StdRng::seed_from_u64(seed ^ 0x5EED_0033_u64.wrapping_mul(rows.len() as u64 + 1));
+        let mut games = Vec::with_capacity(rows.len() * worlds * reps);
+        for (i, &(g, seat)) in rows.iter().enumerate() {
+            if seat > 1 {
+                return Err(format!("no seat {seat}"));
+            }
+            let game = self.games.get(g).ok_or_else(|| format!("no game {g}"))?;
+            for w in 0..worlds {
+                let mut c = game.clone();
+                c.state = game.sampled_world(seat, &mut rng);
+                c.rng = StdRng::seed_from_u64(mix(seed, (i * worlds + w) as u64, 0x524F_4C4C));
+                c.refresh_options();
+                for _ in 1..reps {
+                    games.push(c.clone());
+                }
+                games.push(c);
+            }
+        }
+        let n = games.len();
+        let mut p = SelfPlayPool { games, seed, threads: self.threads, turn_cap: self.turn_cap, rows: Vec::new(), stats: PoolStats::default(), frozen: true, done: vec![false; n], bank: HashMap::new(), bank_next: 0 };
+        for (g, d) in p.games.iter_mut().zip(p.done.iter_mut()) {
+            if g.is_over() || !(g.need[0] || g.need[1]) {
+                g.need = [false, false];
+                *d = true;
+            }
+        }
+        p.rebuild_rows();
+        Ok(p)
+    }
+
+    /// A rollout pool from explicit games (sdb.34, a live battle's sampled worlds): game `w * reps + r` is copy
+    /// `r` of `games[w]`; the copies of one world share their chance seed. Frozen like `fork_rollouts`.
+    pub fn from_games(worlds: Vec<Game>, reps: usize, seed: u64, threads: usize, turn_cap: u32) -> SelfPlayPool {
+        let reps = reps.max(1);
+        let mut games = Vec::with_capacity(worlds.len() * reps);
+        for (w, mut c) in worlds.into_iter().enumerate() {
+            c.rng = StdRng::seed_from_u64(mix(seed, w as u64, 0x4C49_5645));
+            for _ in 1..reps {
+                games.push(c.clone());
+            }
+            games.push(c);
+        }
+        let n = games.len();
+        let mut p = SelfPlayPool { games, seed, threads: threads.max(1), turn_cap, rows: Vec::new(), stats: PoolStats::default(), frozen: true, done: vec![false; n], bank: HashMap::new(), bank_next: 0 };
+        for (g, d) in p.games.iter_mut().zip(p.done.iter_mut()) {
+            if g.is_over() || !(g.need[0] || g.need[1]) {
+                g.need = [false, false];
+                *d = true;
+            }
+        }
+        p.rebuild_rows();
+        p
+    }
+
+    /// Saves a copy of each listed game as it stands now (sdb.35) and returns one id per game.
+    pub fn snap(&mut self, games: &[usize]) -> Result<Vec<u64>, String> {
+        let mut ids = Vec::with_capacity(games.len());
+        for &g in games {
+            let game = self.games.get(g).ok_or_else(|| format!("snap: no game {}", g))?;
+            self.bank.insert(self.bank_next, game.clone());
+            ids.push(self.bank_next);
+            self.bank_next += 1;
+        }
+        Ok(ids)
+    }
+
+    /// Forgets saved positions (unknown ids are ignored).
+    pub fn drop_snaps(&mut self, ids: &[u64]) {
+        for id in ids {
+            self.bank.remove(id);
+        }
+    }
+
+    pub fn bank_len(&self) -> usize {
+        self.bank.len()
+    }
+
+    /// Replaces game `g` by a copy of saved position `id` for each `(g, id)`: same state, reveal rows and
+    /// history, a fresh chance seed (so a replay of one position rolls differently), and the slot's own episode
+    /// counter (so the game that follows it in the slot is a new one). The rows are rebuilt: call between
+    /// `step` and `observe`. With `viewers[i]` 0 or 1, everything that seat has not seen of its opponent's team
+    /// is drawn again (`sampled_world`): the position looks the same to that seat, but the hidden part is no
+    /// longer the one the saved game happened to have.
+    pub fn load(&mut self, pairs: &[(usize, u64)], viewers: &[i8], seed: u64) -> Result<(), String> {
+        if self.frozen {
+            return Err("load: not available on a rollout pool".to_string());
+        }
+        if !viewers.is_empty() && viewers.len() != pairs.len() {
+            return Err("load: need one viewer per game (or none)".to_string());
+        }
+        for (k, &(g, id)) in pairs.iter().enumerate() {
+            if g >= self.games.len() {
+                return Err(format!("load: no game {}", g));
+            }
+            let mut game = self.bank.get(&id).ok_or_else(|| format!("load: no saved position {}", id))?.clone();
+            let ep = self.games[g].episode;
+            game.episode = ep;
+            game.rng = StdRng::seed_from_u64(mix(self.seed ^ seed, g as u64, ep ^ id.wrapping_mul(0x9E37_79B9)));
+            if let Some(&v) = viewers.get(k) {
+                if v == 0 || v == 1 {
+                    let mut rng = StdRng::seed_from_u64(mix(seed, id, g as u64 ^ 0x5bd1_e995));
+                    game.state = game.sampled_world(v as usize, &mut rng);
+                    game.refresh_options();
+                }
+            }
+            self.games[g] = game;
+        }
+        self.rebuild_rows();
+        Ok(())
     }
 
     pub fn set_threads(&mut self, n: usize) {
@@ -1047,20 +1443,38 @@ impl SelfPlayPool {
             acts[r.game as usize][r.side as usize] = *a;
         }
         let (seed, cap) = (self.seed, self.turn_cap);
+        let frozen = self.frozen;
+        if frozen {
+            for (i, a) in acts.iter().enumerate() {
+                if a[0] == RETIRE || a[1] == RETIRE {
+                    self.done[i] = true;
+                    self.games[i].need = [false, false];
+                }
+            }
+        }
         let mut results: Vec<StepOut> = (0..ng).map(|_| StepOut { reward: [0.0; 2], finished: None, illegal: 0, panicked: false }).collect();
         {
+            let done = &self.done;
             let mut zipped: Vec<(&mut Game, &mut StepOut, [u8; 2], usize)> = self
                 .games
                 .iter_mut()
                 .zip(results.iter_mut())
                 .enumerate()
+                .filter(|(i, _)| !(frozen && done[*i]))
                 .map(|(i, (g, o))| (g, o, acts[i], i))
                 .collect();
             par_chunks(&mut zipped, self.threads, 8, |_, chunk| {
                 for (g, o, a, idx) in chunk.iter_mut() {
-                    play(g, o, *a, cap, seed, *idx as u64);
+                    play(g, o, *a, cap, seed, *idx as u64, !frozen);
                 }
             });
+        }
+        if frozen {
+            for (i, o) in results.iter().enumerate() {
+                if o.finished.is_some() {
+                    self.done[i] = true;
+                }
+            }
         }
         let nrows = self.rows.len();
         let mut reward = vec![0f32; nrows];
@@ -1098,7 +1512,7 @@ impl SelfPlayPool {
 }
 
 /// Plays the joint action of one game (panics are contained: the game is drawn and replaced).
-fn play(g: &mut Game, out: &mut StepOut, a: [u8; 2], cap: u32, seed: u64, idx: u64) {
+fn play(g: &mut Game, out: &mut StepOut, a: [u8; 2], cap: u32, seed: u64, idx: u64, reset: bool) {
     let res = catch_unwind(AssertUnwindSafe(|| {
         let mut c = [MoveChoice::None, MoveChoice::None];
         for s in 0..2 {
@@ -1122,16 +1536,20 @@ fn play(g: &mut Game, out: &mut StepOut, a: [u8; 2], cap: u32, seed: u64, idx: u
     if res.is_err() {
         out.panicked = true;
         out.finished = Some((0, g.turn));
+        if !reset {
+            g.need = [false, false];
+            return;
+        }
         *g = Game::new(seed, idx, g.episode + 1);
-        let _ = settle(g, cap, seed, idx, &mut StepOut { reward: [0.0; 2], finished: None, illegal: 0, panicked: false });
+        let _ = settle(g, cap, seed, idx, &mut StepOut { reward: [0.0; 2], finished: None, illegal: 0, panicked: false }, true);
         return;
     }
-    settle(g, cap, seed, idx, out);
+    settle(g, cap, seed, idx, out, reset);
 }
 
 /// After a step: finish the game if over (or capped) and reset it, then auto-play sides without a
 /// real decision until some side has one.
-fn settle(g: &mut Game, cap: u32, seed: u64, idx: u64, out: &mut StepOut) -> bool {
+fn settle(g: &mut Game, cap: u32, seed: u64, idx: u64, out: &mut StepOut, reset: bool) -> bool {
     let mut guard = 0;
     loop {
         let over = g.is_over();
@@ -1144,6 +1562,10 @@ fn settle(g: &mut Game, cap: u32, seed: u64, idx: u64, out: &mut StepOut) -> boo
                 _ => [0.0, 0.0],
             };
             out.finished = Some((w, g.turn));
+            if !reset {
+                g.need = [false, false];
+                return false;
+            }
             *g = Game::new(seed, idx, g.episode + 1);
             guard = 0;
             continue;
@@ -1157,6 +1579,10 @@ fn settle(g: &mut Game, cap: u32, seed: u64, idx: u64, out: &mut StepOut) -> boo
             out.panicked = true;
             out.finished = Some((0, g.turn));
             out.reward = [0.0, 0.0];
+            if !reset {
+                g.need = [false, false];
+                return false;
+            }
             *g = Game::new(seed, idx, g.episode + 1);
         }
         guard += 1;
@@ -1552,5 +1978,196 @@ mod tests {
             }
         }
         assert!(any, "history stayed empty after three steps");
+    }
+
+    /// sdb.34: a game rebuilt from what a live bot has (state, reveal rows, its own history rows) observes and
+    /// plays exactly like the game it was taken from.
+    #[test]
+    fn a_game_rebuilt_from_its_rows_is_the_same_game() {
+        let mut pool = SelfPlayPool::new(24, 77, 2, 200);
+        let mut rng = StdRng::seed_from_u64(5);
+        for _ in 0..30 {
+            let obs = pool.observe();
+            let acts = random_actions(&obs, &mut rng);
+            pool.step(&acts).unwrap();
+        }
+        let hl = N_HIST * HIST_CAT_W;
+        let fl = N_HIST * HIST_CONT_W;
+        let mut rebuilt = Vec::new();
+        let mut checked = 0;
+        for g in &pool.games {
+            let (mut hc, mut hf) = (vec![0i16; hl], vec![0f32; fl]);
+            g.history(0, &mut hc, &mut hf);
+            let r = Game::from_live(g.state.clone(), g.turn, &g.reveal_rows(0), &g.reveal_rows(1), &hc, &hf, 9);
+            for s in 0..2 {
+                let (mut a, mut b) = (vec![0i16; CAT_LEN], vec![0f32; CONT_LEN]);
+                let (mut c, mut d) = (vec![0i16; CAT_LEN], vec![0f32; CONT_LEN]);
+                g.tokens(s, &mut a, &mut b);
+                r.tokens(s, &mut c, &mut d);
+                assert_eq!(a, c, "tokens of side {s}");
+                assert_eq!(b, d, "token features of side {s}");
+                let (mut h1, mut f1, mut h2, mut f2) = (vec![0i16; hl], vec![0f32; fl], vec![0i16; hl], vec![0f32; fl]);
+                g.history(s, &mut h1, &mut f1);
+                r.history(s, &mut h2, &mut f2);
+                if s == 0 {
+                    assert_eq!(h1, h2, "own history");
+                    assert_eq!(f1, f2, "own history features");
+                }
+                // side two's rebuilt history is the mirror of side one's: equal to the true one whenever every
+                // action of the window was seen by both sides
+                checked += (h1 == h2) as usize;
+            }
+            rebuilt.push(r);
+        }
+        assert!(checked > pool.games.len(), "the mirrored history should usually equal the true one ({checked})");
+        // the rebuilt games keep playing
+        let mut p = SelfPlayPool::from_games(rebuilt, 2, 3, 2, 1000);
+        assert_eq!(p.n_games(), 48);
+        for _ in 0..20 {
+            let obs = p.observe();
+            if obs.rows.is_empty() {
+                break;
+            }
+            let acts = random_actions(&obs, &mut rng);
+            p.step(&acts).unwrap();
+        }
+        assert_eq!(p.stats.panics, 0);
+    }
+
+    #[test]
+    fn a_saved_position_loads_into_another_slot_and_plays_on() {
+        let mut pool = SelfPlayPool::new(12, 77, 2, 200);
+        let mut rng = StdRng::seed_from_u64(4);
+        for _ in 0..25 {
+            let obs = pool.observe();
+            let acts = random_actions(&obs, &mut rng);
+            pool.step(&acts).unwrap();
+        }
+        let ids = pool.snap(&[3, 5]).unwrap();
+        assert_eq!(pool.bank_len(), 2);
+        let (st3, turn3) = (pool.games[3].state.serialize(), pool.games[3].turn);
+        let view = |p: &SelfPlayPool, g: u32| -> Vec<(u8, Vec<i16>, Vec<i16>)> {
+            let o = p.observe();
+            o.rows
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.game == g)
+                .map(|(i, r)| (r.side, o.cat[i * CAT_LEN..(i + 1) * CAT_LEN].to_vec(), o.hist_cat[i * N_HIST * HIST_CAT_W..(i + 1) * N_HIST * HIST_CAT_W].to_vec()))
+                .collect()
+        };
+        let before = view(&pool, 3);
+        assert!(!before.is_empty());
+        for _ in 0..10 {
+            let obs = pool.observe();
+            let acts = random_actions(&obs, &mut rng);
+            pool.step(&acts).unwrap();
+        }
+        let ep = pool.games[9].episode;
+        pool.load(&[(9, ids[0]), (0, ids[0])], &[], 1).unwrap();
+        assert_eq!(pool.games[9].state.serialize(), st3);
+        assert_eq!(pool.games[9].turn, turn3);
+        assert_eq!(pool.games[9].episode, ep);
+        // both seats see exactly what they saw when the position was saved, history included
+        assert_eq!(view(&pool, 9), before);
+        assert_eq!(view(&pool, 0), before);
+        // the two copies get different chance seeds; both play on to the end and the slot then starts a new game
+        let mut differ = false;
+        let mut ended = [false; 2];
+        for _ in 0..400 {
+            let obs = pool.observe();
+            let acts = random_actions(&obs, &mut rng);
+            let r = pool.step(&acts).unwrap();
+            for (g, _, _) in &r.finished {
+                if *g == 9 {
+                    ended[0] = true;
+                }
+                if *g == 0 {
+                    ended[1] = true;
+                }
+            }
+            differ |= !ended[0] && !ended[1] && pool.games[9].state.serialize() != pool.games[0].state.serialize();
+        }
+        assert!(ended[0] && ended[1] && differ);
+        assert!(pool.games[9].episode > ep);
+        assert_eq!(pool.stats.panics, 0);
+        pool.drop_snaps(&ids);
+        assert_eq!(pool.bank_len(), 0);
+        // resampled for seat 0: seat 0 sees the same categorical tokens before the action block, its own team is unchanged
+        let ids = pool.snap(&[4]).unwrap();
+        let own = pool.games[4].state.side_one.serialize();
+        let seen0: Vec<Vec<i16>> = view(&pool, 4).into_iter().filter(|x| x.0 == 0).map(|x| x.1[..tokens::O_ACT_CAT].to_vec()).collect();
+        let mut changed = 0;
+        for k in 0..8u64 {
+            pool.load(&[(6, ids[0])], &[0], 100 + k).unwrap();
+            assert_eq!(pool.games[6].state.side_one.serialize(), own);
+            let now: Vec<Vec<i16>> = view(&pool, 6).into_iter().filter(|x| x.0 == 0).map(|x| x.1[..tokens::O_ACT_CAT].to_vec()).collect();
+            assert_eq!(now, seen0);
+            changed += (pool.games[6].state.side_two.serialize() != pool.games[4].state.side_two.serialize()) as usize;
+        }
+        assert!(changed >= 4, "the hidden part should usually change ({changed})");
+        for _ in 0..60 {
+            let obs = pool.observe();
+            let acts = random_actions(&obs, &mut rng);
+            pool.step(&acts).unwrap();
+        }
+        assert_eq!(pool.stats.panics, 0);
+        pool.drop_snaps(&ids);
+        assert!(pool.load(&[(1, ids[0])], &[], 0).is_err());
+    }
+
+    #[test]
+    fn a_sampled_world_looks_the_same_to_the_viewer_and_hides_the_truth() {
+        let mut pool = SelfPlayPool::new(16, 123, 1, 200);
+        let mut rng = StdRng::seed_from_u64(9);
+        let (mut checked, mut changed, mut unseen_changed, mut unseen) = (0, 0, 0, 0);
+        for step in 0..120 {
+            if step % 6 == 0 {
+                for game in &pool.games {
+                    for viewer in 0..2 {
+                        let w = game.sampled_world(viewer, &mut rng);
+                        let rows = game.reveal_rows(viewer);
+                        let sr = if viewer == 0 { SideReference::SideOne } else { SideReference::SideTwo };
+                        let view = |st: &State| {
+                            let (mut cat, mut cont) = (vec![0i16; CAT_LEN], vec![0f32; CONT_LEN]);
+                            tokens::state_tokens_into(st, sr, Some(&rows), &mut cat, &mut cont);
+                            cat
+                        };
+                        let (a, b) = (view(&game.state), view(&w));
+                        // action features may depend on the opponent's hidden set (damage against its real
+                        // stats); the categorical tokens before the action block must match exactly
+                        assert_eq!(a[..tokens::O_ACT_CAT], b[..tokens::O_ACT_CAT], "step {step} viewer {viewer}");
+                        let (own_t, own_w, opp_t, opp_w) = if viewer == 0 {
+                            (&game.state.side_one, &w.side_one, &game.state.side_two, &w.side_two)
+                        } else {
+                            (&game.state.side_two, &w.side_two, &game.state.side_one, &w.side_one)
+                        };
+                        assert_eq!(own_t.serialize(), own_w.serialize());
+                        checked += 1;
+                        changed += (opp_t.serialize() != opp_w.serialize()) as usize;
+                        for k in 0..6 {
+                            if !game.reveal[1 - viewer].seen[k] {
+                                unseen += 1;
+                                unseen_changed += (opp_t.pokemon.pkmn[k].id != opp_w.pokemon.pkmn[k].id) as usize;
+                            } else {
+                                assert_eq!(opp_t.pokemon.pkmn[k].id, opp_w.pokemon.pkmn[k].id);
+                                assert_eq!(opp_t.pokemon.pkmn[k].status, opp_w.pokemon.pkmn[k].status);
+                                assert_eq!(opp_t.pokemon.pkmn[k].hp > 0, opp_w.pokemon.pkmn[k].hp > 0);
+                            }
+                        }
+                        let mut ids: Vec<String> = (0..6).map(|k| format!("{:?}", opp_w.pokemon.pkmn[k].id)).collect();
+                        ids.sort();
+                        ids.dedup();
+                        assert_eq!(ids.len(), 6, "a species twice on the sampled team");
+                    }
+                }
+            }
+            let obs = pool.observe();
+            let acts = random_actions(&obs, &mut rng);
+            pool.step(&acts).unwrap();
+        }
+        assert!(checked > 100 && changed * 10 > checked * 9, "{} of {} worlds differ from the truth", changed, checked);
+        assert!(unseen > 100 && unseen_changed * 10 > unseen * 9, "{} of {} unseen members replaced", unseen_changed, unseen);
+        let ns = pool.net_search_worlds(&[(0, 0), (0, 1), (1, 1)], 3, crate::netsearch::Params::default(), 5).unwrap();
+        assert_eq!(ns.n_worlds(), 9);
     }
 }

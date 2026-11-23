@@ -97,7 +97,7 @@ import os
 import random
 import secrets
 import sys
-from collections import Counter
+from collections import Counter, OrderedDict
 from concurrent.futures import Executor, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 import time
@@ -241,6 +241,12 @@ class SearchConfig:
     # unset, only the root uses PUCT (interior nodes and the opponent keep UCB1 unless prior_opp is a path).
     tok_prior: str | None = None
     tok_device: str = "auto"  # auto | cpu | cuda
+    # 1: feed the net the live event history rows (history_tokens.BattleHistory) instead of padding rows;
+    # nets trained with real history (PPO self-play) need it, tok-d256-style nets were tested with padding
+    tok_hist: int = 0
+    # final-move blend with the net: p ~ search^(1-w) * net^w over the legal choices (0 = off). The root prior
+    # washes out at ~500k iterations per world; this is where the net can still change the move played.
+    tok_blend: float = 0.0
     nash_pseudocount: float = nash_module.DEFAULT_PSEUDOCOUNT  # mode="nash": cell shrinkage c
     nash_floor: float = DEFAULT_NASH_FLOOR  # mode="nash": drop actions below this share
     bayes_argmax: bool = False  # mode="bayes": play the strategy's best move instead of sampling it
@@ -977,6 +983,12 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
         self._tok_root: dict[str, float] | None = None
         self.tok_net = None
         self.tok_prior_errors = 0
+        self.tok_blend_decisions = 0
+        self.tok_blend_changed = 0
+        # live event history for the token net (TokenPolicyPlayer / NetSearchPlayer set hist_mode themselves)
+        self.hist_mode = int(self.config.tok_hist) if self.config.tok_prior is not None else 0
+        self._histories: "OrderedDict[str, Any]" = OrderedDict()
+        self._vocab: Any = None
         if self.config.prior is not None or self.config.tok_prior is not None:
             self._validate_prior()
         if not (math.isfinite(self.config.material) and 0 <= self.config.material < 1):
@@ -1670,10 +1682,19 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             if order is not None:
                 legal_policy[choice] = mass
                 orders[choice] = order
+        if self.config.tok_blend > 0 and self._tok_root and legal_policy:
+            w, top = self.config.tok_blend, max(legal_policy, key=legal_policy.__getitem__)
+            total = sum(max(v, 0.0) for v in legal_policy.values()) or 1.0
+            legal_policy = {c: max(v / total, 1e-3) ** (1 - w) * max(self._tok_root.get(c, 0.0), 1e-3) ** w
+                            for c, v in legal_policy.items()}
+            self.tok_blend_decisions += 1
+            self.tok_blend_changed += max(legal_policy, key=legal_policy.__getitem__) != top
         choice = select_choice(
             legal_policy, mode or self.config.mode, self._rng, self.config.mixed_threshold
         )
         self.last_choice = choice
+        if self.tok_net is not None and self.hist_mode:
+            self._hist_done(battle, choice)
         if choice is not None and getattr(self, "_tendency_context", None) is not None:
             if self._tendency_context.cond_priority and choice.removesuffix("-tera") in tendency_module.PRIORITY_CONDITIONAL:
                 self.cond_used += 1
@@ -1803,6 +1824,56 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             logger.exception("ko_tiebreak failed")
             return policy, None
 
+    # ------------------------------------------------------------------ live history
+    def _history(self, tag: str, create: bool = True) -> Any:
+        h = self._histories.get(tag)
+        if h is None and create:
+            from showdown_bot import history_tokens, tokens
+
+            if self._vocab is None:
+                self._vocab = tokens.Vocab()
+            h = self._histories[tag] = history_tokens.BattleHistory(self._vocab)
+            while len(self._histories) > 8:
+                self._histories.popitem(last=False)
+        return h
+
+    def _tracks_events(self) -> bool:
+        """Subclasses that need the event bookkeeping (history, side-two scrub) override."""
+        return self.hist_mode > 0
+
+    async def _handle_battle_message(self, split_messages: list[list[str]]) -> Any:
+        if self._tracks_events():
+            try:
+                from showdown_bot.sets import _real_battle_tag
+
+                tag = _real_battle_tag(split_messages)
+                if tag is not None:
+                    battle = getattr(self, "_battles", {}).get(tag)
+                    self._history(tag).observe(split_messages[1:], getattr(battle, "player_role", None))
+            except Exception:  # bookkeeping must never break the battle loop
+                logger.debug("history tracking failed", exc_info=True)
+        return await super()._handle_battle_message(split_messages)
+
+    def _live_hist(self, battle: Any, state0: str, reveal: Any) -> Any:
+        """The 16 history rows of this decision ``(hist_cat, hist_cont)`` (registers the decision)."""
+        import poke_engine
+
+        from showdown_bot import tokens
+
+        cat, cont, _names = poke_engine.state_tokens_str(state0, 1, reveal, False)
+        bufs = tokens.split_buffers(cat, cont, tokens.layout())
+        return self._history(battle.battle_tag).begin(int(battle.turn), bufs)
+
+    def _hist_done(self, battle: Any, choice: str | None) -> None:
+        h = self._history(battle.battle_tag, create=False)
+        if h is not None:
+            h.chosen(choice)
+
+    def _hist_abandon(self, battle: Any) -> None:
+        h = self._history(battle.battle_tag, create=False)
+        if h is not None:
+            h.abandon()
+
     def _prior_kwargs(self) -> dict[str, Any]:
         cfg = self.config
         if cfg.prior is None and cfg.tok_prior is None:
@@ -1825,7 +1896,8 @@ class SearchPlayer(OpponentModelPlayerMixin, Player):
             from showdown_bot import tokens
 
             reveal = tokens.reveal_rows(_opp_facts(battle, trackers))
-            return self.tok_net.distribution(state_strings, reveal) or None
+            hist = self._live_hist(battle, state_strings[0], reveal) if self.hist_mode else None
+            return self.tok_net.distribution(state_strings, reveal, hist) or None
         except Exception:  # the prior must never cost a decision
             self.tok_prior_errors += 1
             logger.exception("token root prior failed in %s", battle.battle_tag)

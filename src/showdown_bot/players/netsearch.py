@@ -74,6 +74,9 @@ class NetSearchPlayer(TokenPolicyPlayer):
         hist: int = ns.DEFAULTS["hist"],
         scrub2: int = ns.DEFAULTS["scrub2"],
         tokthreads: int = ns.DEFAULTS["tokthreads"],
+        stats: int = ns.DEFAULTS["stats"],
+        select: int = ns.DEFAULTS["select"],
+        cut: float = ns.DEFAULTS["cut"],
         **kwargs: Any,
     ):
         # the token-policy fallback uses the live rows too whenever the search does
@@ -88,6 +91,7 @@ class NetSearchPlayer(TokenPolicyPlayer):
             self.policy_net, worlds=worlds, time_ms=time_ms, max_evals=max_evals, batch=batch,
             c_puct=c_puct, depth=depth, fpu=fpu, vavg=bool(vavg), scrub=bool(scrub), pipe=pipe, views=views, seed=seed,
             fast=bool(fast), fp16res=bool(fp16res), hist=int(hist), scrub2=bool(scrub2), tokthreads=int(tokthreads),
+            stats=int(stats), select=int(select), cut=float(cut),
         )
         self.search_hist = int(hist)
         self.scrub2 = bool(scrub2)
@@ -119,12 +123,18 @@ class NetSearchPlayer(TokenPolicyPlayer):
             policy, info = await loop.run_in_executor(
                 _pool(), functools.partial(self.searcher.search, states, reveal, hist=hist, reveal2=reveal2))
             orders: dict[str, BattleOrder] = {}
+            raw_policy = dict(policy)
             for choice in policy:
                 order = built.choice_to_order(choice, battle)
                 if order is not None:
                     orders[choice] = order
             policy = tp.normalise(list(orders), [policy[c] for c in orders])
             if not policy:
+                # rare (1 decision in ~4,000 on the local server): keep what is needed to reproduce it
+                logger.error("no legal option: turn=%s search=%s moves=%s switches=%s can_tera=%s force_switch=%s state=%s",
+                             getattr(battle, "turn", "?"), raw_policy, [m.id for m in battle.available_moves],
+                             [m.species for m in battle.available_switches], getattr(battle, "can_tera", None),
+                             getattr(battle, "force_switch", None), states[0])
                 raise RuntimeError("net search produced no legal option")
             choice = tp.pick(policy, None if self.mode == "argmax" else 1.0, self._pick_rng)
             drive = info["drive"]
