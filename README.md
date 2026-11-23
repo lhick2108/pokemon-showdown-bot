@@ -45,7 +45,7 @@ This is research code from a six-week project, not a packaged tool. It has not b
 - Prebuilt engine wheels for Windows / CPython 3.12 are in `engine/wheels/` up to build `sdb.29`, which is enough for
   the search bots. System B needs build `sdb.34` or later, built from source with
   `scripts/build_engine_wheel.ps1` (needs Rust and the MSVC build tools).
-- A local Pokémon Showdown server for testing: `scripts/start_server.ps1` (see `docs/league.md`).
+- A local Pokémon Showdown server for testing, started with `scripts/start_server.ps1`.
 
 ## Layout
 
